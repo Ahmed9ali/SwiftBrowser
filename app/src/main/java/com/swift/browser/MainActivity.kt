@@ -471,7 +471,7 @@ private fun SwiftBrowserApp() {
                     update = { webViewRef = it }
                 )
 
-                AnimatedVisibility(
+                androidx.compose.animation.AnimatedVisibility(
                     visible = isHome && !showTabs && address != "swift://bookmarks" && address != "swift://history",
                     enter = fadeIn(tween(180)) + slideInVertically(initialOffsetY = { it / 18 }),
                     exit = fadeOut(tween(120)),
@@ -487,7 +487,7 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                AnimatedVisibility(
+                androidx.compose.animation.AnimatedVisibility(
                     visible = address == "swift://bookmarks" || address == "swift://history",
                     enter = fadeIn(tween(150)),
                     exit = fadeOut(tween(100)),
@@ -503,7 +503,7 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                AnimatedVisibility(
+                androidx.compose.animation.AnimatedVisibility(
                     visible = showSuggestions && address.isNotBlank(),
                     enter = fadeIn(tween(100)),
                     exit = fadeOut(tween(80)),
@@ -535,7 +535,7 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
-                AnimatedVisibility(
+                androidx.compose.animation.AnimatedVisibility(
                     visible = showTabs,
                     enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { it / 12 }),
                     exit = fadeOut(tween(100)) + slideOutVertically(targetOffsetY = { it / 12 }),
@@ -550,7 +550,7 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                AnimatedVisibility(
+                androidx.compose.animation.AnimatedVisibility(
                     visible = showShield,
                     enter = fadeIn(tween(130)) + slideInVertically(initialOffsetY = { it / 3 }),
                     exit = fadeOut(tween(100)) + slideOutVertically(targetOffsetY = { it / 3 }),
