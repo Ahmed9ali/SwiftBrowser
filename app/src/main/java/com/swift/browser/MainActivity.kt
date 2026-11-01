@@ -22,7 +22,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -203,7 +202,6 @@ private fun SwiftBrowserApp() {
         onBackground = TextMain, onSurface = TextMain
     )) {
         Column(Modifier.fillMaxSize().background(Bg)) {
-            // Browser top bar and interactive address field.
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -291,7 +289,6 @@ private fun SwiftBrowserApp() {
                 }
             }
 
-            // Small protection strip opens the detailed shield dashboard.
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 1.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -402,12 +399,7 @@ private fun SwiftBrowserApp() {
                     update = { webViewRef = it }
                 )
 
-                AnimatedVisibility(
-                    visible = isHome && !showTabs && address != "swift://bookmarks" && address != "swift://history",
-                    enter = fadeIn(tween(180)) + slideInVertically(initialOffsetY = { it / 18 }),
-                    exit = fadeOut(tween(120)),
-                    modifier = Modifier.fillMaxSize()
-                ) {
+                if (isHome && !showTabs && address != "swift://bookmarks" && address != "swift://history") {
                     HomeScreen(
                         onSearch = { load(it) },
                         onOpen = { load(it) },
@@ -418,12 +410,7 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                AnimatedVisibility(
-                    visible = address == "swift://bookmarks" || address == "swift://history",
-                    enter = fadeIn(tween(150)),
-                    exit = fadeOut(tween(100)),
-                    modifier = Modifier.fillMaxSize()
-                ) {
+                if (address == "swift://bookmarks" || address == "swift://history") {
                     val isBookmarks = address == "swift://bookmarks"
                     LinkLibraryPanel(
                         title = if (isBookmarks) "Bookmarks" else "History",
@@ -434,12 +421,7 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                AnimatedVisibility(
-                    visible = showSuggestions && address.isNotBlank(),
-                    enter = fadeIn(tween(100)),
-                    exit = fadeOut(tween(80)),
-                    modifier = Modifier.align(Alignment.TopCenter)
-                ) {
+                if (showSuggestions && address.isNotBlank()) {
                     val suggestions = (store.bookmarks() + store.history())
                         .distinctBy { it.second }
                         .filter { it.first.contains(address, true) || it.second.contains(address, true) }
@@ -464,12 +446,7 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
-                AnimatedVisibility(
-                    visible = showTabs,
-                    enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { it / 12 }),
-                    exit = fadeOut(tween(100)) + slideOutVertically(targetOffsetY = { it / 12 }),
-                    modifier = Modifier.fillMaxSize()
-                ) {
+                if (showTabs) {
                     TabSwitcher(
                         tabs = tabs.toList(),
                         activeId = activeId,
@@ -479,12 +456,7 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                AnimatedVisibility(
-                    visible = showShield,
-                    enter = fadeIn(tween(130)) + slideInVertically(initialOffsetY = { it / 3 }),
-                    exit = fadeOut(tween(100)) + slideOutVertically(targetOffsetY = { it / 3 }),
-                    modifier = Modifier.align(Alignment.BottomCenter)
-                ) {
+                if (showShield) {
                     ShieldDashboard(
                         enabled = blockingEnabled,
                         blockedCount = blockedCount,
@@ -502,7 +474,6 @@ private fun SwiftBrowserApp() {
                 }
             }
 
-            // Brave-inspired bottom toolbar with clear touch targets.
             Row(
                 Modifier.fillMaxWidth().background(Surface).padding(horizontal = 8.dp, vertical = 7.dp),
                 horizontalArrangement = Arrangement.SpaceAround,
