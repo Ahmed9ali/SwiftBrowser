@@ -1,5 +1,6 @@
 package com.swift.browser
 
+import androidx.compose.foundation.verticalScroll
 import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.Context
@@ -347,7 +348,7 @@ private fun SwiftBrowserApp() {
                             webChromeClient = object : WebChromeClient() {
                                 override fun onReceivedTitle(view: WebView?, title: String?) {
                                     pageTitle = title ?: "Swift Browser"
-                                    updateActiveTab(pageTitle = pageTitle)
+                                    updateActiveTab(title = pageTitle)
                                 }
                             }
                             webViewClient = object : WebViewClient() {
