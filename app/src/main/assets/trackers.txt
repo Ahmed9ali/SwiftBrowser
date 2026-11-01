@@ -1,0 +1,14 @@
+# Swift Browser conservative tracker host list
+doubleclick.net
+googlesyndication.com
+google-analytics.com
+googletagmanager.com
+facebook.net
+connect.facebook.net
+adnxs.com
+adsrvr.org
+adform.net
+scorecardresearch.com
+hotjar.com
+mixpanel.com
+segment.io
