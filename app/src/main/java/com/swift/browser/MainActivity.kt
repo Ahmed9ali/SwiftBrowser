@@ -1,11 +1,11 @@
 package com.swift.browser
 
-import androidx.compose.foundation.verticalScroll
 import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
@@ -33,7 +33,6 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -43,6 +42,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -61,8 +61,9 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import java.util.Locale
+import java.io.ByteArrayInputStream
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 private val Bg = Color(0xFF101114)
 private val Surface = Color(0xFF1A1C20)
@@ -90,6 +91,7 @@ private fun SwiftBrowserApp() {
     val store = remember { BrowserStore(context) }
     val blocker = remember { TrackerBlocker(context) }
     val idCounter = remember { AtomicLong(2) }
+    val firstPartyUrl = remember { AtomicReference("") }
     val tabs = remember { mutableStateListOf(BrowserTab(1)) }
     var activeId by remember { mutableLongStateOf(1L) }
     var address by remember { mutableStateOf("") }
@@ -127,14 +129,18 @@ private fun SwiftBrowserApp() {
 
     fun load(input: String) {
         val value = input.trim()
-        if (value == "swift://home") {
-            pageUrl = "swift://home"
+
+        if (value.startsWith("swift://")) {
+            pageUrl = value
             address = ""
-            pageTitle = "New tab"
+            pageTitle = if (value == "swift://home") "New tab" else "Swift Browser"
             blockedCount = 0
-            updateActiveTab("swift://home", "New tab", 0)
+            updateActiveTab(pageUrl, pageTitle, 0)
+            showSuggestions = false
+            showTabs = false
             return
         }
+
         val url = normalize(value)
         pageUrl = url
         address = url
@@ -198,10 +204,12 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    MaterialTheme(colorScheme = darkColorScheme(
-        primary = Accent, background = Bg, surface = Surface,
-        onBackground = TextMain, onSurface = TextMain
-    )) {
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            primary = Accent, background = Bg, surface = Surface,
+            onBackground = TextMain, onSurface = TextMain
+        )
+    ) {
         Column(Modifier.fillMaxSize().background(Bg)) {
             // Browser top bar and interactive address field.
             Row(
@@ -240,15 +248,17 @@ private fun SwiftBrowserApp() {
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
                         keyboardActions = KeyboardActions(onGo = { load(address) }),
                         decorationBox = { inner ->
-                            if (address.isEmpty()) Text(
-                                if (isHome) "Search or enter address" else "Search or enter address",
-                                color = TextMuted, fontSize = 13.sp
-                            )
+                            if (address.isEmpty()) {
+                                Text("Search or enter address", color = TextMuted, fontSize = 13.sp)
+                            }
                             inner()
                         }
                     )
                     if (address.isNotEmpty()) {
-                        IconButton(onClick = { address = ""; showSuggestions = false }, modifier = Modifier.size(31.dp)) {
+                        IconButton(
+                            onClick = { address = ""; showSuggestions = false },
+                            modifier = Modifier.size(31.dp)
+                        ) {
                             Icon(Icons.Default.Close, "Clear address", tint = TextMuted, modifier = Modifier.size(17.dp))
                         }
                     } else if (!isHome) {
@@ -274,10 +284,23 @@ private fun SwiftBrowserApp() {
                     IconButton(onClick = { showMenu = true }, modifier = Modifier.size(38.dp)) {
                         Icon(Icons.Default.MoreVert, "Menu", tint = TextMain)
                     }
-                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false },
-                        modifier = Modifier.background(Surface)) {
-                        BrowserMenuItem("Bookmarks", Icons.Default.Bookmark) { showMenu = false; showTabs = false; showShield = false; address = "swift://bookmarks"; showSuggestions = false; }
-                        BrowserMenuItem("History", Icons.Default.History) { showMenu = false; address = "swift://history"; showSuggestions = false }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false },
+                        modifier = Modifier.background(Surface)
+                    ) {
+                        BrowserMenuItem("Bookmarks", Icons.Default.Bookmark) {
+                            showMenu = false
+                            showTabs = false
+                            showShield = false
+                            address = "swift://bookmarks"
+                            showSuggestions = false
+                        }
+                        BrowserMenuItem("History", Icons.Default.History) {
+                            showMenu = false
+                            address = "swift://history"
+                            showSuggestions = false
+                        }
                         BrowserMenuItem("Downloads", Icons.Default.Download) {
                             showMenu = false
                             runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
@@ -286,7 +309,10 @@ private fun SwiftBrowserApp() {
                             showMenu = false
                             sharePage(context, pageUrl)
                         }
-                        BrowserMenuItem("Privacy dashboard", Icons.Default.Shield) { showMenu = false; showShield = true }
+                        BrowserMenuItem("Privacy dashboard", Icons.Default.Shield) {
+                            showMenu = false
+                            showShield = true
+                        }
                     }
                 }
             }
@@ -301,10 +327,16 @@ private fun SwiftBrowserApp() {
                         .clickable { showShield = true }.padding(horizontal = 5.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Default.Shield, null, tint = if (blockingEnabled) Accent else TextMuted, modifier = Modifier.size(15.dp))
+                    Icon(
+                        Icons.Default.Shield, null,
+                        tint = if (blockingEnabled) Accent else TextMuted,
+                        modifier = Modifier.size(15.dp)
+                    )
                     Spacer(Modifier.width(6.dp))
-                    Text(if (blockingEnabled) "$blockedCount blocked on this page" else "Shields paused",
-                        color = TextMuted, fontSize = 11.sp)
+                    Text(
+                        if (blockingEnabled) "$blockedCount blocked on this page" else "Shields paused",
+                        color = TextMuted, fontSize = 11.sp
+                    )
                     Spacer(Modifier.weight(1f))
                     Text("SHIELDS", color = Accent, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                     Icon(Icons.Default.ChevronRight, null, tint = TextMuted, modifier = Modifier.size(15.dp))
@@ -315,7 +347,11 @@ private fun SwiftBrowserApp() {
                             if (isBookmarked) store.removeBookmark(pageUrl)
                             else store.addBookmark(pageTitle, pageUrl)
                             bookmarkRefresh++
-                            Toast.makeText(context, if (isBookmarked) "Bookmark removed" else "Bookmark saved", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(
+                                context,
+                                if (isBookmarked) "Bookmark removed" else "Bookmark saved",
+                                Toast.LENGTH_SHORT
+                            ).show()
                         },
                         modifier = Modifier.size(32.dp)
                     ) {
@@ -331,7 +367,9 @@ private fun SwiftBrowserApp() {
 
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 AndroidView(
-                    modifier = Modifier.fillMaxSize().alpha(if (isHome || showTabs || address == "swift://bookmarks" || address == "swift://history") 0f else 1f),
+                    modifier = Modifier.fillMaxSize().alpha(
+                        if (isHome || showTabs || address == "swift://bookmarks" || address == "swift://history") 0f else 1f
+                    ),
                     factory = { ctx ->
                         WebView(ctx).apply {
                             settings.javaScriptEnabled = true
@@ -342,38 +380,65 @@ private fun SwiftBrowserApp() {
                             settings.allowFileAccess = false
                             settings.allowContentAccess = false
                             settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                            settings.safeBrowsingEnabled = true
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                settings.safeBrowsingEnabled = true
+                            }
                             settings.mediaPlaybackRequiresUserGesture = true
                             CookieManager.getInstance().setAcceptCookie(true)
+
                             webChromeClient = object : WebChromeClient() {
                                 override fun onReceivedTitle(view: WebView?, title: String?) {
                                     pageTitle = title ?: "Swift Browser"
                                     updateActiveTab(title = pageTitle)
                                 }
                             }
+
                             webViewClient = object : WebViewClient() {
-                                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                                override fun shouldOverrideUrlLoading(
+                                    view: WebView?,
+                                    request: WebResourceRequest?
+                                ): Boolean {
                                     val uri = request?.url ?: return false
                                     return uri.scheme !in listOf("http", "https")
                                 }
-                                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+
+                                override fun shouldInterceptRequest(
+                                    view: WebView?,
+                                    request: WebResourceRequest?
+                                ): WebResourceResponse? {
                                     val req = request ?: return null
-                                    if (currentBlockingEnabled && blocker.shouldBlock(req.url.toString(), view?.url)) {
+                                    val url = req.url.toString()
+
+                                    if (currentBlockingEnabled && blocker.shouldBlock(url, firstPartyUrl.get())) {
                                         Handler(Looper.getMainLooper()).post {
                                             blockedCount++
                                             updateActiveTab(count = blockedCount)
                                         }
-                                        return WebResourceResponse("text/plain", "utf-8", 204, "Blocked", emptyMap(), null)
+                                        return WebResourceResponse(
+                                            "text/plain",
+                                            "utf-8",
+                                            204,
+                                            "Blocked",
+                                            emptyMap(),
+                                            ByteArrayInputStream(ByteArray(0))
+                                        )
                                     }
                                     return null
                                 }
-                                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+
+                                override fun onPageStarted(
+                                    view: WebView?,
+                                    url: String?,
+                                    favicon: android.graphics.Bitmap?
+                                ) {
                                     if (url != null) {
+                                        firstPartyUrl.set(url)
                                         pageUrl = url
                                         address = url
                                         showSuggestions = false
                                     }
                                 }
+
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     pageUrl = url ?: pageUrl
                                     address = pageUrl
@@ -382,6 +447,7 @@ private fun SwiftBrowserApp() {
                                     refreshNavigation()
                                 }
                             }
+
                             setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, _ ->
                                 runCatching {
                                     val filename = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
@@ -393,8 +459,11 @@ private fun SwiftBrowserApp() {
                                         .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
                                     (ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
                                     Toast.makeText(ctx, "Download started", Toast.LENGTH_SHORT).show()
-                                }.onFailure { Toast.makeText(ctx, "Download failed", Toast.LENGTH_SHORT).show() }
+                                }.onFailure {
+                                    Toast.makeText(ctx, "Download failed", Toast.LENGTH_SHORT).show()
+                                }
                             }
+
                             webViewRef = this
                             if (!isHome && pageUrl.startsWith("http")) loadUrl(pageUrl)
                         }
@@ -450,8 +519,10 @@ private fun SwiftBrowserApp() {
                                 .clip(RoundedCornerShape(16.dp)).background(Surface).padding(8.dp)
                         ) {
                             suggestions.forEach { (title, url) ->
-                                Row(Modifier.fillMaxWidth().clickable { load(url) }.padding(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically) {
+                                Row(
+                                    Modifier.fillMaxWidth().clickable { load(url) }.padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
                                     Icon(Icons.Default.History, null, tint = TextMuted, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(10.dp))
                                     Column {
@@ -502,7 +573,7 @@ private fun SwiftBrowserApp() {
                 }
             }
 
-            // Brave-inspired bottom toolbar with clear touch targets.
+            // Bottom toolbar with clear touch targets.
             Row(
                 Modifier.fillMaxWidth().background(Surface).padding(horizontal = 8.dp, vertical = 7.dp),
                 horizontalArrangement = Arrangement.SpaceAround,
@@ -580,7 +651,7 @@ private fun HomeScreen(
             Triple("GitHub", "github.com", "https://github.com")
         )
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            shortcuts.forEach { (name, host, url) ->
+            shortcuts.forEach { (name, _, url) ->
                 Column(
                     Modifier.weight(1f).clip(RoundedCornerShape(15.dp)).background(Surface)
                         .clickable { onOpen(url) }.padding(vertical = 13.dp),
@@ -621,7 +692,11 @@ private fun HomeScreen(
             }
         }
         Spacer(Modifier.height(18.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Icon(Icons.Default.Shield, null, tint = Green, modifier = Modifier.size(13.dp))
             Spacer(Modifier.width(5.dp))
             Text("Private by design • Lightweight by default", color = TextMuted, fontSize = 10.sp)
@@ -631,8 +706,10 @@ private fun HomeScreen(
 
 @Composable
 private fun EmptyHomeCard(icon: ImageVector, title: String, subtitle: String) {
-    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Surface).padding(13.dp),
-        verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Surface).padding(13.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
         Icon(icon, null, tint = TextMuted, modifier = Modifier.size(22.dp))
         Spacer(Modifier.width(12.dp))
         Column {
@@ -715,8 +792,10 @@ private fun ShieldDashboard(
             Switch(checked = privateMode, onCheckedChange = onPrivateChange)
         }
         Spacer(Modifier.height(6.dp))
-        Text("Note: filtering is a lightweight host list, not full EasyList or uBlock-level protection.",
-            color = TextMuted, fontSize = 10.sp)
+        Text(
+            "Note: filtering is a lightweight host list, not full EasyList or uBlock-level protection.",
+            color = TextMuted, fontSize = 10.sp
+        )
     }
 }
 
@@ -740,10 +819,18 @@ private fun TabSwitcher(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Tabs", color = TextMain, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-                Text("${tabs.size} open ${if (tabs.size == 1) "tab" else "tabs"}", color = TextMuted, fontSize = 12.sp)
+                Text(
+                    "${tabs.size} open ${if (tabs.size == 1) "tab" else "tabs"}",
+                    color = TextMuted, fontSize = 12.sp
+                )
             }
-            FilledTonalButton(onClick = onNew, colors = ButtonDefaults.filledTonalButtonColors(containerColor = AccentSoft, contentColor = Accent)) {
-                Icon(Icons.Default.Add, null); Spacer(Modifier.width(5.dp)); Text("New tab")
+            FilledTonalButton(
+                onClick = onNew,
+                colors = ButtonDefaults.filledTonalButtonColors(containerColor = AccentSoft, contentColor = Accent)
+            ) {
+                Icon(Icons.Default.Add, null)
+                Spacer(Modifier.width(5.dp))
+                Text("New tab")
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -763,13 +850,18 @@ private fun TabSwitcher(
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(Modifier.size(29.dp).clip(RoundedCornerShape(9.dp)).background(Surface3), contentAlignment = Alignment.Center) {
-                                Icon(if (tab.url == "swift://home") Icons.Default.Home else Icons.Default.Language,
-                                    null, tint = Accent, modifier = Modifier.size(16.dp))
+                                Icon(
+                                    if (tab.url == "swift://home") Icons.Default.Home else Icons.Default.Language,
+                                    null, tint = Accent, modifier = Modifier.size(16.dp)
+                                )
                             }
                             Spacer(Modifier.width(10.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(tab.title, color = TextMain, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                                Text(if (tab.url == "swift://home") "New tab" else tab.url, color = TextMuted, fontSize = 10.sp, maxLines = 1)
+                                Text(
+                                    if (tab.url == "swift://home") "New tab" else tab.url,
+                                    color = TextMuted, fontSize = 10.sp, maxLines = 1
+                                )
                             }
                             if (selected) Text("ACTIVE", color = Accent, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                             IconButton(onClick = { onClose(tab) }, modifier = Modifier.size(32.dp)) {
@@ -850,8 +942,11 @@ private fun ToolbarButton(
             .padding(horizontal = 8.dp, vertical = 4.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Icon(icon, contentDescription = label, tint = if (enabled) (if (selected) Accent else TextMain) else TextMuted.copy(alpha = .35f),
-            modifier = Modifier.size(21.dp))
+        Icon(
+            icon, contentDescription = label,
+            tint = if (enabled) (if (selected) Accent else TextMain) else TextMuted.copy(alpha = .35f),
+            modifier = Modifier.size(21.dp)
+        )
         Text(label, color = if (selected) Accent else TextMuted, fontSize = 9.sp, maxLines = 1)
     }
 }
