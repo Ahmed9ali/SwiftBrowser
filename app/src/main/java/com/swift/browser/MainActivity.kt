@@ -88,6 +88,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun SwiftBrowserApp() {
     val context = LocalContext.current
+    val addressFocusRequester = remember {androidx.compose.ui.focus.FocusRequester()}
+    val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     val store = remember { BrowserStore(context) }
     val blocker = remember { TrackerBlocker(context) }
     val idCounter = remember { AtomicLong(2) }
@@ -120,11 +122,29 @@ private fun SwiftBrowserApp() {
 
     fun normalize(input: String): String {
         val value = input.trim()
-        if (value.isEmpty()) return "https://search.brave.com"
-        if (value.contains(" ") || (!value.contains(".") && !value.startsWith("http"))) {
-            return "https://search.brave.com/search?q=" + Uri.encode(value)
+
+        if (value.isEmpty()) {
+            return "https://www.google.com"
         }
-        return if (value.startsWith("http://") || value.startsWith("https://")) value else "https://$value"
+
+        // Search queries go to Google
+        if (value.contains(" ") ||
+            (!value.contains(".") &&
+            !value.startsWith("http://") &&
+            !value.startsWith("https://"))
+        ) {
+            return "https://www.google.com/search?q=" + Uri.encode(value)
+        }
+
+        // Direct website navigation
+        return if (
+            value.startsWith("http://") ||
+            value.startsWith("https://")
+        ) {
+            value
+        } else {
+            "https://$value"
+        }
     }
 
     fun load(input: String) {
@@ -210,7 +230,13 @@ private fun SwiftBrowserApp() {
             onBackground = TextMain, onSurface = TextMain
         )
     ) {
-        Column(Modifier.fillMaxSize().background(Bg)) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .background(Bg)
+                .statusBarsPadding()
+                .navigationBarsPadding()
+        ) {
             // Browser top bar and interactive address field.
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
@@ -242,7 +268,9 @@ private fun SwiftBrowserApp() {
                             address = it
                             showSuggestions = it.isNotBlank()
                         },
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier
+                            .weight(1f)
+                            .focusRequester(addressFocusRequester),
                         singleLine = true,
                         textStyle = TextStyle(color = TextMain, fontSize = 14.sp),
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
@@ -574,23 +602,65 @@ private fun SwiftBrowserApp() {
             }
 
             // Bottom toolbar with clear touch targets.
+            // Brave-style bottom navigation
             Row(
-                Modifier.fillMaxWidth().background(Surface).padding(horizontal = 8.dp, vertical = 7.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .background(Surface)
+                    .padding(horizontal = 12.dp, vertical = 9.dp),
                 horizontalArrangement = Arrangement.SpaceAround,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                ToolbarButton(Icons.Default.ArrowBack, "Back", canGoBack && !isHome) {
-                    webViewRef?.goBack(); refreshNavigation()
+
+                // HOME
+                ToolbarButton(
+                    Icons.Default.Home,
+                    "Home",
+                    selected = isHome
+                ) {
+                    load("swift://home")
                 }
-                ToolbarButton(Icons.Default.ArrowForward, "Forward", canGoForward && !isHome) {
-                    webViewRef?.goForward(); refreshNavigation()
+
+                // BOOKMARKS
+                ToolbarButton(
+                    Icons.Default.BookmarkBorder,
+                    "Bookmarks",
+                    selected = address == "swift://bookmarks"
+                ) {
+                    address = "swift://bookmarks"
+                    showTabs = false
+                    showSuggestions = false
                 }
-                ToolbarButton(Icons.Default.Home, "Home") { load("swift://home") }
-                ToolbarButton(Icons.Default.Refresh, "Reload", !isHome) { webViewRef?.reload() }
-                ToolbarButton(Icons.Default.Add, "New tab") { newTab() }
-                ToolbarButton(Icons.Default.Tab, "${tabs.size} tabs", selected = showTabs) {
+
+                // SEARCH
+                ToolbarButton(
+                    Icons.Default.Search,
+                    "Search"
+                ) {
+                    address = ""
+                    showSuggestions = false
+                    addressFocusRequester.requestFocus()
+                    keyboardController?.show()
+                }
+
+                // TABS
+                ToolbarButton(
+                    Icons.Default.Tab,
+                    "${tabs.size} tabs",
+                    selected = showTabs
+                ) {
                     showTabs = !showTabs
                     showShield = false
+                    showSuggestions = false
+                }
+
+                // SETTINGS
+                ToolbarButton(
+                    Icons.Default.MoreVert,
+                    "Settings",
+                    selected = showMenu
+                ) {
+                    showMenu = true
                 }
             }
         }
@@ -607,99 +677,223 @@ private fun HomeScreen(
     onShowHistory: () -> Unit
 ) {
     Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).background(
-            Brush.verticalGradient(listOf(Color(0xFF17191E), Bg, Bg))
-        ).padding(horizontal = 20.dp).padding(top = 24.dp)
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .background(
+                Brush.verticalGradient(
+                    listOf(
+                        Color(0xFF17191E),
+                        Bg,
+                        Bg
+                    )
+                )
+            )
+            .padding(horizontal = 20.dp)
+            .padding(top = 28.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("GOOD TO SEE YOU", color = TextMuted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
-                Text("Browse freely.", color = TextMain, fontSize = 29.sp, fontWeight = FontWeight.Bold)
-                Text("A faster, quieter web starts here.", color = TextMuted, fontSize = 13.sp)
-            }
-            Box(
-                Modifier.size(48.dp).clip(RoundedCornerShape(17.dp))
-                    .background(Brush.linearGradient(listOf(Accent, Color(0xFFB83F25)))),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(Icons.Default.Shield, null, tint = Color.White, modifier = Modifier.size(26.dp))
-            }
-        }
 
-        Spacer(Modifier.height(24.dp))
+        // Welcome section
         Row(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(17.dp)).background(Surface2)
-                .clickable { onSearch("https://search.brave.com") }.padding(15.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(Icons.Default.Search, null, tint = TextMuted)
-            Spacer(Modifier.width(10.dp))
-            Text("Search the web privately", color = TextMuted, fontSize = 14.sp)
-            Spacer(Modifier.weight(1f))
-            Icon(Icons.Default.ArrowForward, null, tint = TextMuted, modifier = Modifier.size(18.dp))
+            Column(
+                Modifier.weight(1f)
+            ) {
+                Text(
+                    "GOOD TO SEE YOU",
+                    color = TextMuted,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.5.sp
+                )
+
+                Text(
+                    "Browse freely.",
+                    color = TextMain,
+                    fontSize = 29.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Text(
+                    "A faster, quieter web starts here.",
+                    color = TextMuted,
+                    fontSize = 13.sp
+                )
+            }
+
+            Box(
+                Modifier
+                    .size(52.dp)
+                    .clip(RoundedCornerShape(17.dp))
+                    .background(
+                        Brush.linearGradient(
+                            listOf(
+                                Accent,
+                                Color(0xFFB83F25)
+                            )
+                        )
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.Shield,
+                    null,
+                    tint = Color.White,
+                    modifier = Modifier.size(28.dp)
+                )
+            }
         }
 
-        Spacer(Modifier.height(25.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Quick access", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            TextButton(onClick = onShowBookmarks) { Text("Edit", color = Accent, fontSize = 12.sp) }
+        Spacer(Modifier.height(30.dp))
+
+        // Google search shortcut
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .height(66.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(Surface2)
+                .clickable {
+                    onSearch("https://www.google.com")
+                }
+                .padding(horizontal = 17.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Default.Search,
+                null,
+                tint = TextMuted,
+                modifier = Modifier.size(24.dp)
+            )
+
+            Spacer(Modifier.width(13.dp))
+
+            Text(
+                "Search the web privately",
+                color = TextMuted,
+                fontSize = 15.sp,
+                modifier = Modifier.weight(1f)
+            )
+
+            Icon(
+                Icons.Default.ArrowForward,
+                null,
+                tint = TextMuted
+            )
         }
+
+        Spacer(Modifier.height(30.dp))
+
+        // Quick access
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "Quick access",
+                color = TextMain,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+
+            TextButton(
+                onClick = onShowBookmarks
+            ) {
+                Text(
+                    "Edit",
+                    color = Accent
+                )
+            }
+        }
+
         val shortcuts = listOf(
-            Triple("Brave", "search.brave.com", "https://search.brave.com"),
-            Triple("YouTube", "youtube.com", "https://youtube.com"),
-            Triple("Wikipedia", "wikipedia.org", "https://wikipedia.org"),
-            Triple("GitHub", "github.com", "https://github.com")
+            Triple("Brave", "B", "https://search.brave.com"),
+            Triple("YouTube", "Y", "https://youtube.com"),
+            Triple("Wikipedia", "W", "https://wikipedia.org"),
+            Triple("GitHub", "G", "https://github.com")
         )
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            shortcuts.forEach { (name, _, url) ->
+
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            shortcuts.forEach { (name, letter, url) ->
+
                 Column(
-                    Modifier.weight(1f).clip(RoundedCornerShape(15.dp)).background(Surface)
-                        .clickable { onOpen(url) }.padding(vertical = 13.dp),
+                    Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(17.dp))
+                        .background(Surface)
+                        .clickable {
+                            onOpen(url)
+                        }
+                        .padding(vertical = 16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Box(Modifier.size(37.dp).clip(CircleShape).background(Surface3), contentAlignment = Alignment.Center) {
-                        Text(name.take(1), color = Accent, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+
+                    Box(
+                        Modifier
+                            .size(43.dp)
+                            .clip(CircleShape)
+                            .background(Surface3),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            letter,
+                            color = Accent,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
-                    Spacer(Modifier.height(7.dp))
-                    Text(name, color = TextMain, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+
+                    Spacer(Modifier.height(9.dp))
+
+                    Text(
+                        name,
+                        color = TextMain,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
                 }
             }
         }
 
         Spacer(Modifier.height(25.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Your bookmarks", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            TextButton(onClick = onShowBookmarks) { Text("See all", color = Accent, fontSize = 12.sp) }
-        }
-        if (bookmarks.isEmpty()) {
-            EmptyHomeCard(Icons.Default.BookmarkBorder, "Your favorite sites live here", "Bookmark a page to add it to quick access.")
-        } else {
-            bookmarks.take(3).forEach { (title, url) ->
-                HomeLinkRow(title.ifBlank { url }, url, Icons.Default.Bookmark, onOpen)
-            }
-        }
 
-        Spacer(Modifier.height(18.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Recently visited", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            TextButton(onClick = onShowHistory) { Text("History", color = Accent, fontSize = 12.sp) }
-        }
-        if (recent.isEmpty()) {
-            EmptyHomeCard(Icons.Default.Explore, "Nothing here yet", "Your recent pages will appear after you browse.")
-        } else {
-            recent.take(3).forEach { (title, url) ->
-                HomeLinkRow(title.ifBlank { url }, url, Icons.Default.History, onOpen)
-            }
-        }
-        Spacer(Modifier.height(18.dp))
+        // Privacy information
         Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.Center,
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(Surface)
+                .clickable { onShowHistory() }
+                .padding(15.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(Icons.Default.Shield, null, tint = Green, modifier = Modifier.size(13.dp))
-            Spacer(Modifier.width(5.dp))
-            Text("Private by design • Lightweight by default", color = TextMuted, fontSize = 10.sp)
+            Icon(
+                Icons.Default.Shield,
+                null,
+                tint = Accent,
+                modifier = Modifier.size(23.dp)
+            )
+
+            Spacer(Modifier.width(12.dp))
+
+            Column {
+                Text(
+                    "Private browsing",
+                    color = TextMain,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Text(
+                    "Browse with tracker protection enabled.",
+                    color = TextMuted,
+                    fontSize = 11.sp
+                )
+            }
         }
     }
 }
@@ -815,7 +1009,7 @@ private fun TabSwitcher(
     onClose: (BrowserTab) -> Unit,
     onNew: () -> Unit
 ) {
-    Column(Modifier.fillMaxSize().background(Bg).padding(horizontal = 17.dp, vertical = 13.dp)) {
+    Column(Modifier.fillMaxSize().background(Bg).clickable{}.padding(horizontal = 17.dp, vertical = 13.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Tabs", color = TextMain, fontSize = 25.sp, fontWeight = FontWeight.Bold)
