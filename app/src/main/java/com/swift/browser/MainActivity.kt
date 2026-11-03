@@ -2241,7 +2241,7 @@ private fun hostOf(url: String): String =
 // Query of a Brave Search results URL, or null for any other URL.
 private fun searchQueryOf(url: String): String? {
     val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
-    if (uri.host != "search.google.com" || uri.path?.startsWith("/search") != true) return null
+    if (uri.host != "search.brave.com" || uri.path?.startsWith("/search") != true) return null
     return uri.getQueryParameter("q")
 }
 
