@@ -299,6 +299,29 @@ private fun SwiftBrowserApp() {
         }
     }
 
+    // Group-icon action: collect every loose tab into one group.
+    fun groupAllTabs() {
+        val loose = tabs.filter { tabGroups[it.id] == null }
+        if (loose.size < 2) {
+            Toast.makeText(context, "Nothing to group", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val gid = groupCounter++
+        loose.forEach { tabGroups[it.id] = gid }
+        Toast.makeText(context, "Grouped ${loose.size} tabs", Toast.LENGTH_SHORT).show()
+    }
+
+    // Delete-all action: closes every tab and lands on a fresh home tab.
+    fun closeAllTabs() {
+        tabs.clear()
+        tabGroups.clear()
+        val fresh = BrowserTab(idCounter.getAndIncrement())
+        tabs.add(fresh)
+        selectTab(fresh)
+        showTabs = false
+        Toast.makeText(context, "All tabs closed", Toast.LENGTH_SHORT).show()
+    }
+
     fun refreshNavigation() {
         canGoBack = webViewRef?.canGoBack() == true
         canGoForward = webViewRef?.canGoForward() == true
@@ -312,6 +335,50 @@ private fun SwiftBrowserApp() {
             else -> {
                 webViewRef?.goBack()
                 refreshNavigation()
+            }
+        }
+    }
+
+    // Settings menu, shared by the normal bottom bar and the tab-overview bar.
+    @Composable
+    fun SettingsMenuBox() {
+        Box {
+            ToolbarButton(
+                Icons.Default.Settings,
+                "Settings",
+                selected = showMenu
+            ) {
+                showMenu = true
+            }
+            DropdownMenu(
+                expanded = showMenu,
+                onDismissRequest = { showMenu = false },
+                modifier = Modifier.background(Surface)
+            ) {
+                BrowserMenuItem("Bookmarks", Icons.Default.Bookmark) {
+                    showMenu = false
+                    showTabs = false
+                    showShield = false
+                    address = "swift://bookmarks"
+                    showSuggestions = false
+                }
+                BrowserMenuItem("History", Icons.Default.History) {
+                    showMenu = false
+                    address = "swift://history"
+                    showSuggestions = false
+                }
+                BrowserMenuItem("Downloads", Icons.Default.Download) {
+                    showMenu = false
+                    runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
+                }
+                BrowserMenuItem("Share page", Icons.Default.Share) {
+                    showMenu = false
+                    sharePage(context, pageUrl)
+                }
+                BrowserMenuItem("Privacy dashboard", Icons.Default.Shield) {
+                    showMenu = false
+                    showShield = true
+                }
             }
         }
     }
@@ -337,7 +404,8 @@ private fun SwiftBrowserApp() {
             ) {
                 Row(
                     Modifier.weight(1f).height(46.dp).clip(RoundedCornerShape(24.dp))
-                        .background(Surface2).padding(start = 8.dp, end = 5.dp),
+                        .background(if (addressFocused) Surface3 else Surface2)
+                        .padding(start = 8.dp, end = 5.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     // App logo inside the search bar.
@@ -582,14 +650,16 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                // Dim scrim behind the suggestions sheet while typing.
+                // Tapping the search bar dims everything below it — on every
+                // screen (home, results, tabs) and every Android version.
+                // The wallpaper blur on home adds on top of this.
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = showSuggestions && address.isNotBlank(),
-                    enter = fadeIn(tween(100)),
-                    exit = fadeOut(tween(80)),
+                    visible = addressFocused,
+                    enter = fadeIn(tween(120)),
+                    exit = fadeOut(tween(100)),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    Box(Modifier.fillMaxSize().background(Color(0x42000000)))
+                    Box(Modifier.fillMaxSize().background(Color(0x73000000)))
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
@@ -654,7 +724,9 @@ private fun SwiftBrowserApp() {
                         onClose = { closeTab(it) },
                         onNew = { newTab() },
                         onGroup = { source, target -> handleGroupDrop(source, target) },
-                        onDropOutside = { handleDropOutside(it) }
+                        onDropOutside = { handleDropOutside(it) },
+                        onGroupAll = { groupAllTabs() },
+                        onCloseAll = { closeAllTabs() }
                     )
                 }
 
@@ -681,8 +753,30 @@ private fun SwiftBrowserApp() {
                 }
             }
 
-            // Bottom toolbar with clear touch targets.
-            // Brave-style bottom navigation
+            // Bottom bar — Brave-style. In the tab overview it becomes the
+            // overview bar: "+" centered, settings at the right.
+            if (showTabs) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(Surface)
+                        .padding(horizontal = 12.dp, vertical = 9.dp)
+                ) {
+                    IconButton(
+                        onClick = { newTab() },
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(46.dp)
+                            .clip(CircleShape)
+                            .background(Accent)
+                    ) {
+                        Icon(Icons.Default.Add, "New tab", tint = Color.White, modifier = Modifier.size(24.dp))
+                    }
+                    Box(Modifier.align(Alignment.CenterEnd)) {
+                        SettingsMenuBox()
+                    }
+                }
+            } else {
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -732,48 +826,13 @@ private fun SwiftBrowserApp() {
                     showTabs = !showTabs
                     showShield = false
                     showSuggestions = false
+                    keyboardController?.hide()
+                    focusManager.clearFocus()
                 }
 
                 // SETTINGS (menu lives here now, not in the top bar)
-                Box {
-                    ToolbarButton(
-                        Icons.Default.Settings,
-                        "Settings",
-                        selected = showMenu
-                    ) {
-                        showMenu = true
-                    }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false },
-                        modifier = Modifier.background(Surface)
-                    ) {
-                        BrowserMenuItem("Bookmarks", Icons.Default.Bookmark) {
-                            showMenu = false
-                            showTabs = false
-                            showShield = false
-                            address = "swift://bookmarks"
-                            showSuggestions = false
-                        }
-                        BrowserMenuItem("History", Icons.Default.History) {
-                            showMenu = false
-                            address = "swift://history"
-                            showSuggestions = false
-                        }
-                        BrowserMenuItem("Downloads", Icons.Default.Download) {
-                            showMenu = false
-                            runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
-                        }
-                        BrowserMenuItem("Share page", Icons.Default.Share) {
-                            showMenu = false
-                            sharePage(context, pageUrl)
-                        }
-                        BrowserMenuItem("Privacy dashboard", Icons.Default.Shield) {
-                            showMenu = false
-                            showShield = true
-                        }
-                    }
-                }
+                SettingsMenuBox()
+            }
             }
         }
     }
@@ -1198,7 +1257,9 @@ private fun TabSwitcher(
     onClose: (BrowserTab) -> Unit,
     onNew: () -> Unit,
     onGroup: (Long, Long) -> Unit,
-    onDropOutside: (Long) -> Unit
+    onDropOutside: (Long) -> Unit,
+    onGroupAll: () -> Unit,
+    onCloseAll: () -> Unit
 ) {
     var query by remember { mutableStateOf("") }
     var dragKey by remember { mutableStateOf<Long?>(null) }
@@ -1250,41 +1311,42 @@ private fun TabSwitcher(
     }
 
     Column(Modifier.fillMaxSize().background(Bg)) {
-        // Header
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 17.dp, vertical = 13.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(Modifier.weight(1f)) {
+        // Header — Brave-style: "Tabs" left, group icon middle, delete-all right.
+        Box(Modifier.fillMaxWidth().padding(horizontal = 17.dp, vertical = 13.dp)) {
+            Column(Modifier.align(Alignment.CenterStart)) {
                 Text("Tabs", color = TextMain, fontSize = 25.sp, fontWeight = FontWeight.Bold)
                 Text(
                     "${tabs.size} open ${if (tabs.size == 1) "tab" else "tabs"}",
                     color = TextMuted, fontSize = 12.sp
                 )
             }
-            FilledTonalButton(
-                onClick = onNew,
-                colors = ButtonDefaults.filledTonalButtonColors(containerColor = AccentSoft, contentColor = Accent)
+            IconButton(
+                onClick = onGroupAll,
+                modifier = Modifier.align(Alignment.Center).size(40.dp)
             ) {
-                Icon(Icons.Default.Add, null)
-                Spacer(Modifier.width(5.dp))
-                Text("New tab")
+                Icon(Icons.Default.AutoAwesomeFolder, "Group tabs", tint = TextMain, modifier = Modifier.size(22.dp))
+            }
+            IconButton(
+                onClick = onCloseAll,
+                modifier = Modifier.align(Alignment.CenterEnd).size(40.dp)
+            ) {
+                Icon(Icons.Default.DeleteSweep, "Close all tabs", tint = TextMuted, modifier = Modifier.size(22.dp))
             }
         }
 
-        // Brave-style "Search your tabs" bar
+        // "Search your tabs" — filters the OPEN TABS only, never searches the web.
         Row(
             Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 17.dp)
                 .padding(bottom = 12.dp)
                 .height(46.dp)
-                .clip(RoundedCornerShape(23.dp))
+                .clip(RoundedCornerShape(24.dp))
                 .background(Surface2)
                 .padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(Icons.Default.Search, null, tint = TextMuted, modifier = Modifier.size(18.dp))
+            Icon(Icons.Default.Tab, null, tint = TextMuted, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(9.dp))
             BasicTextField(
                 value = query,
@@ -1506,29 +1568,6 @@ private fun TabSwitcher(
                                 }
                             }
                         }
-                    }
-                }
-
-                item(key = NEW_TAB_KEY) {
-                    Column(
-                        Modifier
-                            .fillMaxWidth()
-                            .height(160.dp)
-                            .onGloballyPositioned { cardBounds[NEW_TAB_KEY] = it.boundsInRoot() }
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(Surface.copy(alpha = 0.45f))
-                            .clickable(onClick = onNew),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
-                    ) {
-                        Box(
-                            Modifier.size(46.dp).clip(CircleShape).background(Surface3),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Default.Add, "New tab", tint = Accent, modifier = Modifier.size(24.dp))
-                        }
-                        Spacer(Modifier.height(9.dp))
-                        Text("New tab", color = TextMuted, fontSize = 11.sp)
                     }
                 }
             }
