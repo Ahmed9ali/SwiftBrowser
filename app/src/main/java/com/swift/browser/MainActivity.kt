@@ -112,6 +112,10 @@ private val TextMain = Color(0xFFF4F4F5)
 private val TextMuted = Color(0xFF9A9DA5)
 private val Green = Color(0xFF65C98A)
 
+// Per-tab favicons and page thumbnails (shown in tab cards and the group bar).
+private val FaviconStore = mutableStateMapOf<Long, Bitmap>()
+private val ThumbStore = mutableStateMapOf<Long, Bitmap>()
+
 // Tab groups (Brave-style drag-to-group). Group ids live far above tab ids.
 private const val GROUP_ID_BASE = 1_000_000L
 private const val NEW_TAB_KEY = -1L
@@ -145,7 +149,7 @@ private fun SwiftBrowserApp() {
     val store = remember { BrowserStore(context) }
     val blocker = remember { TrackerBlocker(context) }
     val idCounter = remember { AtomicLong(2) }
-    val firstPartyUrl = remember { AtomicReference("") }
+    val firstParty = remember { java.util.concurrent.ConcurrentHashMap<Long, String>() }
     val tabs = remember { mutableStateListOf(BrowserTab(1)) }
     var activeId by remember { mutableLongStateOf(1L) }
     var address by remember { mutableStateOf("") }
@@ -164,7 +168,11 @@ private fun SwiftBrowserApp() {
     val groupUpdated = remember { mutableStateMapOf<Long, Long>() }
     var pendingOpenGroup by remember { mutableStateOf<Long?>(null) }
     var groupCounter by remember { mutableLongStateOf(GROUP_ID_BASE + 1) }
-    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    // One WebView per tab: pages, history and network errors never leak between tabs.
+    val webViews = remember { HashMap<Long, WebView>() }
+    remember { FaviconStore.clear(); ThumbStore.clear(); 0 }
+    var loadProgress by remember { mutableIntStateOf(100) }
+    var totalBlocked by remember { mutableIntStateOf(0) }
     var canGoBack by remember { mutableStateOf(false) }
     var canGoForward by remember { mutableStateOf(false) }
     val currentBlockingEnabled by rememberUpdatedState(blockingEnabled)
@@ -172,6 +180,33 @@ private fun SwiftBrowserApp() {
     val isHome = pageUrl == "swift://home"
     var bookmarkRefresh by remember { mutableIntStateOf(0) }
     val isBookmarked = remember(pageUrl, bookmarkRefresh) { store.isBookmarked(pageUrl) }
+
+    fun activeWebView(): WebView? = webViews[activeId]
+
+    fun updateTabById(id: Long, url: String? = null, title: String? = null, count: Int? = null) {
+        val i = tabs.indexOfFirst { it.id == id }
+        if (i >= 0) {
+            val t = tabs[i]
+            tabs[i] = t.copy(url = url ?: t.url, title = title ?: t.title, blockedCount = count ?: t.blockedCount)
+        }
+    }
+
+    // Snapshot of a tab's page, shown on its card in the tab overview.
+    fun captureThumb(id: Long) {
+        val wv = webViews[id] ?: return
+        val tab = tabs.firstOrNull { it.id == id } ?: return
+        if (tab.url == "swift://home" || wv.width <= 0 || wv.height <= 0) return
+        runCatching {
+            val w = 360
+            val scale = w / wv.width.toFloat()
+            val h = (wv.height * scale).toInt().coerceAtLeast(1)
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val c = android.graphics.Canvas(bmp)
+            c.scale(scale, scale)
+            wv.draw(c)
+            ThumbStore[id] = bmp
+        }
+    }
 
     fun updateActiveTab(url: String = pageUrl, title: String = pageTitle, count: Int = blockedCount) {
         val index = tabs.indexOfFirst { it.id == activeId }
@@ -221,6 +256,9 @@ private fun SwiftBrowserApp() {
             pageTitle = if (value == "swift://home") "New tab" else "Swift Browser"
             blockedCount = 0
             updateActiveTab(pageUrl, pageTitle, 0)
+            // Blank the tab's WebView so no old page can show through later.
+            activeWebView()?.let { it.loadUrl("about:blank"); it.clearHistory() }
+            loadProgress = 100
             showSuggestions = false
             showTabs = false
             keyboardController?.hide()
@@ -234,7 +272,8 @@ private fun SwiftBrowserApp() {
         blockedCount = 0
         pageTitle = url
         updateActiveTab(url, pageTitle, 0)
-        webViewRef?.loadUrl(url)
+        loadProgress = 5
+        activeWebView()?.loadUrl(url)
         showSuggestions = false
         showTabs = false
         // Hide the keyboard so the loaded page / search results are
@@ -268,13 +307,17 @@ private fun SwiftBrowserApp() {
         pageTitle = tab.title
         blockedCount = tab.blockedCount
         showTabs = false
-        if (tab.url != "swift://home") webViewRef?.loadUrl(tab.url)
+        loadProgress = 100
+        canGoBack = webViews[tab.id]?.canGoBack() == true
     }
 
     fun closeTab(tab: BrowserTab, fromOverview: Boolean = true) {
         if (tabs.size == 1) {
             tabs[0] = BrowserTab(tab.id)
             tabGroups.clear()
+            webViews[tab.id]?.let { it.loadUrl("about:blank"); it.clearHistory() }
+            ThumbStore.remove(tab.id)
+            FaviconStore.remove(tab.id)
             selectTab(tabs[0])
             return
         }
@@ -353,17 +396,148 @@ private fun SwiftBrowserApp() {
     }
 
     fun refreshNavigation() {
-        canGoBack = webViewRef?.canGoBack() == true
-        canGoForward = webViewRef?.canGoForward() == true
+        canGoBack = activeWebView()?.canGoBack() == true
+        canGoForward = activeWebView()?.canGoForward() == true
     }
 
-    BackHandler(enabled = showShield || showTabs || showSuggestions || (webViewRef?.canGoBack() == true)) {
+    // Builds the WebView for one tab. Callbacks only touch the shared UI state
+    // when this tab is the active one; otherwise they update just this tab.
+    fun createWebView(ctx: Context, tabId: Long): WebView {
+        return WebView(ctx).apply {
+            // Dark background so a not-yet-painted page never flashes white.
+            setBackgroundColor(android.graphics.Color.rgb(16, 17, 20))
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.loadsImagesAutomatically = true
+            settings.javaScriptCanOpenWindowsAutomatically = false
+            settings.setSupportMultipleWindows(false)
+            settings.allowFileAccess = false
+            settings.allowContentAccess = false
+            settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                settings.safeBrowsingEnabled = true
+            }
+            settings.mediaPlaybackRequiresUserGesture = true
+            CookieManager.getInstance().setAcceptCookie(true)
+
+            webChromeClient = object : WebChromeClient() {
+                override fun onReceivedTitle(view: WebView?, title: String?) {
+                    val t = title ?: return
+                    if (view?.url?.startsWith("about:") == true) return
+                    updateTabById(tabId, title = t)
+                    if (tabId == activeId) pageTitle = t
+                }
+
+                override fun onReceivedIcon(view: WebView?, icon: Bitmap?) {
+                    if (icon != null) FaviconStore[tabId] = icon
+                }
+
+                override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                    if (tabId == activeId && view?.url?.startsWith("about:") != true) {
+                        loadProgress = newProgress
+                    }
+                }
+            }
+
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): Boolean {
+                    val uri = request?.url ?: return false
+                    return uri.scheme !in listOf("http", "https")
+                }
+
+                override fun shouldInterceptRequest(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): WebResourceResponse? {
+                    val req = request ?: return null
+                    val url = req.url.toString()
+
+                    if (currentBlockingEnabled && blocker.shouldBlock(url, firstParty[tabId] ?: "")) {
+                        Handler(Looper.getMainLooper()).post {
+                            totalBlocked++
+                            val i = tabs.indexOfFirst { it.id == tabId }
+                            if (i >= 0) {
+                                val c = tabs[i].blockedCount + 1
+                                tabs[i] = tabs[i].copy(blockedCount = c)
+                                if (tabId == activeId) blockedCount = c
+                            }
+                        }
+                        return WebResourceResponse(
+                            "text/plain",
+                            "utf-8",
+                            204,
+                            "Blocked",
+                            emptyMap(),
+                            ByteArrayInputStream(ByteArray(0))
+                        )
+                    }
+                    return null
+                }
+
+                override fun onPageStarted(
+                    view: WebView?,
+                    url: String?,
+                    favicon: android.graphics.Bitmap?
+                ) {
+                    if (url == null || url.startsWith("about:")) return
+                    firstParty[tabId] = url
+                    val oldHost = hostOf(tabs.firstOrNull { it.id == tabId }?.url ?: "")
+                    if (hostOf(url) != oldHost) FaviconStore.remove(tabId)
+                    updateTabById(tabId, url = url)
+                    if (tabId == activeId) {
+                        pageUrl = url
+                        address = url
+                        showSuggestions = false
+                    }
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    if (url == null || url.startsWith("about:")) return
+                    updateTabById(tabId, url = url)
+                    val title = tabs.firstOrNull { it.id == tabId }?.title ?: url
+                    if (tabId == activeId) {
+                        pageUrl = url
+                        address = url
+                        loadProgress = 100
+                        refreshNavigation()
+                    }
+                    if (!currentPrivateMode) store.addHistory(title, url)
+                    Handler(Looper.getMainLooper()).postDelayed({ captureThumb(tabId) }, 700)
+                }
+            }
+
+            setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, _ ->
+                runCatching {
+                    val filename = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
+                    val request = DownloadManager.Request(Uri.parse(downloadUrl))
+                        .setMimeType(mimeType)
+                        .addRequestHeader("User-Agent", userAgent)
+                        .setTitle(filename)
+                        .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                        .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
+                    (ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+                    Toast.makeText(ctx, "Download started", Toast.LENGTH_SHORT).show()
+                }.onFailure {
+                    Toast.makeText(ctx, "Download failed", Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            webViews[tabId] = this
+            val t = tabs.firstOrNull { it.id == tabId }
+            if (t != null && t.url.startsWith("http")) loadUrl(t.url)
+        }
+    }
+
+    BackHandler(enabled = showShield || showTabs || showSuggestions || (canGoBack && !isHome)) {
         when {
             showShield -> showShield = false
             showTabs -> showTabs = false
             showSuggestions -> showSuggestions = false
             else -> {
-                webViewRef?.goBack()
+                activeWebView()?.goBack()
                 refreshNavigation()
             }
         }
@@ -561,118 +735,49 @@ private fun SwiftBrowserApp() {
             }
             }
 
+            // Thin page-load progress line, like Brave.
+            if (!showTabs && !isHome && loadProgress in 1..99) {
+                Box(Modifier.fillMaxWidth().height(2.dp)) {
+                    Box(
+                        Modifier.fillMaxWidth(loadProgress / 100f).fillMaxHeight().background(Accent)
+                    )
+                }
+            }
+
             Box(Modifier.weight(1f).fillMaxWidth()) {
-                AndroidView(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .then(
-                            // Brave-style: the page blurs behind the omnibox
-                            // while typing (no-op below Android 12).
-                            if (showSuggestions && !isHome) Modifier.blur(14.dp) else Modifier
+                tabs.forEach { tab ->
+                    key(tab.id) {
+                        val isCurrent = tab.id == activeId
+                        val pageVisible = isCurrent && !isHome && !showTabs &&
+                            address != "swift://bookmarks" && address != "swift://history"
+                        AndroidView(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .then(
+                                    // Brave-style: the page blurs behind the omnibox
+                                    // while typing (no-op below Android 12).
+                                    if (isCurrent && showSuggestions && !isHome) Modifier.blur(14.dp) else Modifier
+                                )
+                                .alpha(if (pageVisible) 1f else 0f),
+                            factory = { ctx -> createWebView(ctx, tab.id) },
+                            update = { wv ->
+                                wv.visibility = if (isCurrent) android.view.View.VISIBLE else android.view.View.INVISIBLE
+                                if (isCurrent) wv.onResume() else wv.onPause()
+                            }
                         )
-                        .alpha(
-                            if (isHome || showTabs || address == "swift://bookmarks" || address == "swift://history") 0f else 1f
-                        ),
-                    factory = { ctx ->
-                        WebView(ctx).apply {
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
-                            settings.loadsImagesAutomatically = true
-                            settings.javaScriptCanOpenWindowsAutomatically = false
-                            settings.setSupportMultipleWindows(false)
-                            settings.allowFileAccess = false
-                            settings.allowContentAccess = false
-                            settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                settings.safeBrowsingEnabled = true
+                        DisposableEffect(tab.id) {
+                            onDispose {
+                                webViews.remove(tab.id)?.let { wv ->
+                                    wv.stopLoading()
+                                    (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+                                    wv.destroy()
+                                }
+                                FaviconStore.remove(tab.id)
+                                ThumbStore.remove(tab.id)
                             }
-                            settings.mediaPlaybackRequiresUserGesture = true
-                            CookieManager.getInstance().setAcceptCookie(true)
-
-                            webChromeClient = object : WebChromeClient() {
-                                override fun onReceivedTitle(view: WebView?, title: String?) {
-                                    pageTitle = title ?: "Swift Browser"
-                                    updateActiveTab(title = pageTitle)
-                                }
-                            }
-
-                            webViewClient = object : WebViewClient() {
-                                override fun shouldOverrideUrlLoading(
-                                    view: WebView?,
-                                    request: WebResourceRequest?
-                                ): Boolean {
-                                    val uri = request?.url ?: return false
-                                    return uri.scheme !in listOf("http", "https")
-                                }
-
-                                override fun shouldInterceptRequest(
-                                    view: WebView?,
-                                    request: WebResourceRequest?
-                                ): WebResourceResponse? {
-                                    val req = request ?: return null
-                                    val url = req.url.toString()
-
-                                    if (currentBlockingEnabled && blocker.shouldBlock(url, firstPartyUrl.get())) {
-                                        Handler(Looper.getMainLooper()).post {
-                                            blockedCount++
-                                            updateActiveTab(count = blockedCount)
-                                        }
-                                        return WebResourceResponse(
-                                            "text/plain",
-                                            "utf-8",
-                                            204,
-                                            "Blocked",
-                                            emptyMap(),
-                                            ByteArrayInputStream(ByteArray(0))
-                                        )
-                                    }
-                                    return null
-                                }
-
-                                override fun onPageStarted(
-                                    view: WebView?,
-                                    url: String?,
-                                    favicon: android.graphics.Bitmap?
-                                ) {
-                                    if (url != null) {
-                                        firstPartyUrl.set(url)
-                                        pageUrl = url
-                                        address = url
-                                        showSuggestions = false
-                                    }
-                                }
-
-                                override fun onPageFinished(view: WebView?, url: String?) {
-                                    pageUrl = url ?: pageUrl
-                                    address = pageUrl
-                                    updateActiveTab(url = pageUrl, title = pageTitle, count = blockedCount)
-                                    if (!currentPrivateMode) store.addHistory(pageTitle, pageUrl)
-                                    refreshNavigation()
-                                }
-                            }
-
-                            setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, _ ->
-                                runCatching {
-                                    val filename = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
-                                    val request = DownloadManager.Request(Uri.parse(downloadUrl))
-                                        .setMimeType(mimeType)
-                                        .addRequestHeader("User-Agent", userAgent)
-                                        .setTitle(filename)
-                                        .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                                        .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
-                                    (ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-                                    Toast.makeText(ctx, "Download started", Toast.LENGTH_SHORT).show()
-                                }.onFailure {
-                                    Toast.makeText(ctx, "Download failed", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-
-                            webViewRef = this
-                            if (!isHome && pageUrl.startsWith("http")) loadUrl(pageUrl)
                         }
-                    },
-                    update = { webViewRef = it }
-                )
+                    }
+                }
 
                 androidx.compose.animation.AnimatedVisibility(
                     visible = isHome && !showTabs && address != "swift://bookmarks" && address != "swift://history",
@@ -694,7 +799,8 @@ private fun SwiftBrowserApp() {
                         bookmarks = store.bookmarks().take(5),
                         recent = store.history().take(4),
                         onShowBookmarks = { address = "swift://bookmarks" },
-                        onShowHistory = { address = "swift://history" }
+                        onShowHistory = { address = "swift://history" },
+                        totalBlocked = totalBlocked
                     )
                 }
 
@@ -821,46 +927,47 @@ private fun SwiftBrowserApp() {
                 val members = tabs.filter { tabGroups[it.id] == activeGid }
                 val gColor = groupColorOf(activeGid)
                 Row(
-                    Modifier.fillMaxWidth().background(Bg).padding(horizontal = 8.dp, vertical = 6.dp),
+                    Modifier.fillMaxWidth().background(Bg).padding(horizontal = 6.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(
                         onClick = {
+                            captureThumb(activeId)
                             pendingOpenGroup = activeGid
                             showTabs = true
                             keyboardController?.hide()
                             focusManager.clearFocus()
                         },
-                        modifier = Modifier.size(44.dp)
+                        modifier = Modifier.size(34.dp)
                     ) {
                         Icon(Icons.Default.KeyboardArrowUp, "Open group", tint = TextMain)
                     }
                     Row(
                         Modifier.weight(1f).horizontalScroll(rememberScrollState())
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            .padding(horizontal = 4.dp, vertical = 0.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         members.forEach { m ->
                             val isActive = m.id == activeId
-                            Box(Modifier.size(54.dp)) {
+                            Box(Modifier.size(40.dp)) {
                                 Box(
-                                    Modifier.align(Alignment.Center).size(46.dp).clip(CircleShape)
+                                    Modifier.align(Alignment.Center).size(34.dp).clip(CircleShape)
                                         .background(Surface2)
                                         .then(if (isActive) Modifier.border(2.dp, gColor, CircleShape) else Modifier)
                                         .clickable { if (!isActive) selectTab(m) },
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    SiteBadge(m, 30.dp)
+                                    SiteBadge(m, 20.dp)
                                 }
                                 if (isActive) {
                                     Box(
-                                        Modifier.align(Alignment.TopEnd).size(20.dp).clip(CircleShape)
+                                        Modifier.align(Alignment.TopEnd).size(15.dp).clip(CircleShape)
                                             .background(gColor)
                                             .clickable { closeTab(m, false) },
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        Icon(Icons.Default.Close, "Close tab", tint = GroupInk, modifier = Modifier.size(13.dp))
+                                        Icon(Icons.Default.Close, "Close tab", tint = GroupInk, modifier = Modifier.size(10.dp))
                                     }
                                 }
                             }
@@ -868,7 +975,7 @@ private fun SwiftBrowserApp() {
                     }
                     IconButton(
                         onClick = { newTabInGroup(activeGid) },
-                        modifier = Modifier.size(44.dp).border(1.5.dp, TextMuted, CircleShape)
+                        modifier = Modifier.size(34.dp).border(1.5.dp, TextMuted, CircleShape)
                     ) {
                         Icon(Icons.Default.Add, "New tab in group", tint = TextMain)
                     }
@@ -947,6 +1054,7 @@ private fun SwiftBrowserApp() {
                     "${tabs.size} tabs",
                     selected = showTabs
                 ) {
+                    if (!showTabs) captureThumb(activeId)
                     showTabs = !showTabs
                     showShield = false
                     showSuggestions = false
@@ -963,6 +1071,42 @@ private fun SwiftBrowserApp() {
 }
 
 @Composable
+private fun GlassCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(24.dp))
+            .background(Brush.verticalGradient(listOf(Color(0x2EFFFFFF), Color(0x14FFFFFF))))
+            .border(1.dp, Color(0x1FFFFFFF), RoundedCornerShape(24.dp))
+            .padding(16.dp),
+        content = content
+    )
+}
+
+@Composable
+private fun HomeSectionLabel(text: String) {
+    Text(
+        text,
+        color = TextMuted, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp,
+        modifier = Modifier.padding(start = 6.dp, bottom = 8.dp)
+    )
+}
+
+@Composable
+private fun HomeStat(value: String, label: String, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(value, color = Accent, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        Text(label, color = TextMuted, fontSize = 10.sp, lineHeight = 13.sp)
+    }
+}
+
+private fun formatKb(kb: Long): String =
+    if (kb < 1024) "$kb KB" else String.format("%.1f MB", kb / 1024.0)
+
+private fun formatSeconds(sec: Double): String =
+    if (sec < 60) String.format("%.0f s", sec) else String.format("%.1f min", sec / 60.0)
+
+@Composable
 private fun HomeScreen(
     searchActive: Boolean,
     onFocusSearch: () -> Unit,
@@ -971,8 +1115,30 @@ private fun HomeScreen(
     bookmarks: List<Pair<String, String>>,
     recent: List<Pair<String, String>>,
     onShowBookmarks: () -> Unit,
-    onShowHistory: () -> Unit
+    onShowHistory: () -> Unit,
+    totalBlocked: Int
 ) {
+    val greeting = remember {
+        val h = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        when {
+            h < 5 -> "GOOD NIGHT"
+            h < 12 -> "GOOD MORNING"
+            h < 17 -> "GOOD AFTERNOON"
+            else -> "GOOD EVENING"
+        }
+    }
+    val defaults = listOf(
+        "YouTube" to "https://m.youtube.com",
+        "Wikipedia" to "https://www.wikipedia.org",
+        "GitHub" to "https://github.com",
+        "Gmail" to "https://mail.google.com",
+        "Maps" to "https://www.google.com/maps",
+        "Reddit" to "https://www.reddit.com",
+        "X" to "https://x.com",
+        "News" to "https://news.google.com"
+    )
+    val shortcuts = (bookmarks + defaults).distinctBy { it.second }.take(8)
+
     Box(
         Modifier
             .fillMaxSize()
@@ -990,7 +1156,7 @@ private fun HomeScreen(
         Box(
             Modifier.fillMaxSize().background(
                 Brush.verticalGradient(
-                    listOf(Color(0x22000000), Color(0x4D000000))
+                    listOf(Color(0x22000000), Color(0x66000000))
                 )
             )
         )
@@ -998,102 +1164,101 @@ private fun HomeScreen(
             Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp)
-                .padding(top = 28.dp)
+                .padding(horizontal = 18.dp)
+                .padding(top = 26.dp, bottom = 20.dp)
         ) {
-
-        // Welcome section
-        Row(
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(
-                Modifier.weight(1f)
-            ) {
-                Text(
-                    "GOOD TO SEE YOU",
-                    color = TextMuted,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.5.sp
-                )
-
-                Text(
-                    "Browse freely.",
-                    color = TextMain,
-                    fontSize = 29.sp,
-                    fontWeight = FontWeight.Bold
-                )
-
-                Text(
-                    "A faster, quieter web starts here.",
-                    color = TextMuted,
-                    fontSize = 13.sp
-                )
-            }
-
-            Box(
-                Modifier
-                    .size(52.dp)
-                    .clip(RoundedCornerShape(17.dp))
-                    .background(
-                        Brush.linearGradient(
-                            listOf(
-                                Accent,
-                                Color(0xFFB83F25)
-                            )
-                        )
-                    ),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    Icons.Default.Shield,
-                    null,
-                    tint = Color.White,
-                    modifier = Modifier.size(28.dp)
-                )
-            }
-        }
-
-        Spacer(Modifier.height(30.dp))
-
-        // Search box opens the address bar directly — like Brave's
-        // "Search the web privately" field.
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .height(66.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(Surface2)
-                .clickable {
-                    onFocusSearch()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        greeting,
+                        color = Accent, fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold, letterSpacing = 2.sp
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Browse freely.",
+                        color = TextMain, fontSize = 34.sp, fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "A faster, quieter web starts here.",
+                        color = TextMuted, fontSize = 13.sp
+                    )
                 }
-                .padding(horizontal = 17.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                Icons.Default.Search,
-                null,
-                tint = TextMuted,
-                modifier = Modifier.size(24.dp)
-            )
+                Box(
+                    Modifier
+                        .size(54.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(Brush.linearGradient(listOf(Accent, Color(0xFFB83F25)))),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.Shield, null, tint = Color.White, modifier = Modifier.size(29.dp))
+                }
+            }
 
-            Spacer(Modifier.width(13.dp))
+            Spacer(Modifier.height(24.dp))
 
-            Text(
-                "Search the web privately",
-                color = TextMuted,
-                fontSize = 15.sp,
-                modifier = Modifier.weight(1f)
-            )
+            HomeSectionLabel("PRIVACY STATS")
+            GlassCard {
+                Row(Modifier.fillMaxWidth()) {
+                    HomeStat(totalBlocked.toString(), "Trackers & ads\nblocked", Modifier.weight(1f))
+                    HomeStat(formatKb(totalBlocked * 40L), "Est. data\nsaved", Modifier.weight(1f))
+                    HomeStat(formatSeconds(totalBlocked * 0.05), "Est. time\nsaved", Modifier.weight(1f))
+                }
+            }
 
-            Icon(
-                Icons.Default.ArrowForward,
-                null,
-                tint = TextMuted
-            )
-        }
+            Spacer(Modifier.height(20.dp))
 
-        Spacer(Modifier.height(30.dp))
+            HomeSectionLabel("QUICK ACCESS")
+            GlassCard {
+                shortcuts.chunked(4).forEachIndexed { rowIndex, rowItems ->
+                    if (rowIndex > 0) Spacer(Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth()) {
+                        rowItems.forEach { (name, url) ->
+                            val label = hostOf(url).removePrefix("m.").substringBefore('.')
+                                .ifBlank { name }
+                                .replaceFirstChar { it.uppercaseChar() }
+                            val c = SiteColors[Math.abs(label.hashCode()) % SiteColors.size]
+                            Column(
+                                Modifier.weight(1f)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .clickable { onOpen(url) }
+                                    .padding(vertical = 6.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Box(
+                                    Modifier.size(52.dp).clip(CircleShape)
+                                        .background(Brush.linearGradient(listOf(c, c.copy(alpha = 0.6f)))),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        label.first().toString(),
+                                        color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    label,
+                                    color = TextMain, fontSize = 11.sp, maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                            }
+                        }
+                        repeat(4 - rowItems.size) { Spacer(Modifier.weight(1f)) }
+                    }
+                }
+            }
+
+            if (recent.isNotEmpty()) {
+                Spacer(Modifier.height(20.dp))
+                HomeSectionLabel("RECENTLY VISITED")
+                GlassCard {
+                    recent.forEach { (title, url) ->
+                        HomeLinkRow(title.ifBlank { url }, url, Icons.Default.History, onOpen)
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
         }
     }
 }
@@ -1372,7 +1537,7 @@ private fun ShieldStat(label: String, value: String, modifier: Modifier = Modifi
     }
 }
 
-// A normal (single) tab card. Used in the main grid and inside an opened group.
+// A normal (single) tab card: favicon + title + close, then the page thumbnail.
 @Composable
 private fun SingleTabCard(
     tab: BrowserTab,
@@ -1382,9 +1547,14 @@ private fun SingleTabCard(
     onSelect: () -> Unit,
     onClose: () -> Unit,
     onRemoveFromGroup: (() -> Unit)?,
-    showActiveLabel: Boolean = true,
+    showActiveLabel: Boolean = false,
     modifier: Modifier = Modifier
 ) {
+    val label = when {
+        tab.url == "swift://home" -> "New tab"
+        tab.title.isBlank() || tab.title.startsWith("http") -> hostOf(tab.url).ifBlank { "New tab" }
+        else -> tab.title
+    }
     Column(
         modifier
             .fillMaxSize()
@@ -1404,48 +1574,31 @@ private fun SingleTabCard(
                 shape = RoundedCornerShape(16.dp)
             )
             .clickable { onSelect() }
-            .padding(11.dp)
+            .padding(horizontal = 8.dp, vertical = 7.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier.size(28.dp).clip(RoundedCornerShape(9.dp)).background(Surface3),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    if (tab.url == "swift://home") Icons.Default.Home else Icons.Default.Language,
-                    null, tint = Accent, modifier = Modifier.size(15.dp)
-                )
+        Row(Modifier.height(30.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
+                SiteBadge(tab, 18.dp)
             }
-            Spacer(Modifier.width(8.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    tab.title.ifBlank { "New tab" },
-                    color = TextMain, fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold, maxLines = 1
-                )
-                Text(
-                    if (tab.url == "swift://home") "New tab" else tab.url,
-                    color = TextMuted, fontSize = 9.sp, maxLines = 1
-                )
-            }
-            if (isActive && showActiveLabel) {
-                Text("ACTIVE", color = Accent, fontSize = 8.sp, fontWeight = FontWeight.Bold)
-            }
+            Spacer(Modifier.width(7.dp))
+            Text(
+                label,
+                color = TextMain, fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
             if (onRemoveFromGroup != null) {
-                IconButton(onClick = onRemoveFromGroup, modifier = Modifier.size(28.dp)) {
-                    Icon(Icons.Default.RemoveCircleOutline, "Remove from group", tint = TextMuted, modifier = Modifier.size(15.dp))
+                IconButton(onClick = onRemoveFromGroup, modifier = Modifier.size(26.dp)) {
+                    Icon(Icons.Default.RemoveCircleOutline, "Remove from group", tint = TextMuted, modifier = Modifier.size(14.dp))
                 }
             }
-            IconButton(onClick = onClose, modifier = Modifier.size(30.dp)) {
-                Icon(Icons.Default.Close, "Close tab", tint = TextMuted, modifier = Modifier.size(16.dp))
+            IconButton(onClick = onClose, modifier = Modifier.size(26.dp)) {
+                Icon(Icons.Default.Close, "Close tab", tint = TextMuted, modifier = Modifier.size(15.dp))
             }
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(6.dp))
         PagePreview(tab, Modifier.weight(1f).fillMaxWidth())
-        if (tab.blockedCount > 0) {
-            Spacer(Modifier.height(6.dp))
-            Text("${tab.blockedCount} trackers blocked", color = Green, fontSize = 9.sp)
-        }
     }
 }
 
@@ -1802,7 +1955,7 @@ private fun TabSwitcher(
                         }
 
                     Box(
-                        Modifier.fillMaxWidth().height(230.dp)
+                        Modifier.fillMaxWidth().height(196.dp)
                             .graphicsLayer { scaleX = cardScale; scaleY = cardScale }
                     ) {
                         if (entry.isGroup) {
@@ -1982,7 +2135,7 @@ private fun TabSwitcher(
                         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                     ) {
                         gridItems(openEntry.tabs, key = { it.id }) { tab ->
-                            Box(Modifier.fillMaxWidth().height(200.dp)) {
+                            Box(Modifier.fillMaxWidth().height(176.dp)) {
                                 SingleTabCard(
                                     tab = tab,
                                     isActive = tab.id == activeId,
@@ -2118,12 +2271,22 @@ private fun relativeTime(ts: Long): String {
     }
 }
 
-// Round site badge: colored letter, or a home icon for the start page.
+// Site icon: the page's real favicon when known, else a colored letter,
+// or a home icon for the start page.
 @Composable
 private fun SiteBadge(tab: BrowserTab, size: androidx.compose.ui.unit.Dp) {
     val host = hostOf(tab.url)
+    val fav = FaviconStore[tab.id]
     if (tab.url == "swift://home" || host.isEmpty()) {
         Icon(Icons.Default.Home, null, tint = TextMuted, modifier = Modifier.size(size * 0.65f))
+    } else if (fav != null) {
+        val img = remember(fav) { fav.asImageBitmap() }
+        Image(
+            bitmap = img,
+            contentDescription = null,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.size(size).clip(RoundedCornerShape(size / 5))
+        )
     } else {
         Box(
             Modifier.size(size).clip(CircleShape)
@@ -2241,7 +2404,7 @@ private fun hostOf(url: String): String =
 // Query of a Brave Search results URL, or null for any other URL.
 private fun searchQueryOf(url: String): String? {
     val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
-    if (uri.host != "search.google.com" || uri.path?.startsWith("/search") != true) return null
+    if (uri.host != "search.brave.com" || uri.path?.startsWith("/search") != true) return null
     return uri.getQueryParameter("q")
 }
 
@@ -2255,8 +2418,8 @@ private fun prettyAddress(url: String): String {
     return url
 }
 
-// Stand-in for a page thumbnail: site letter + name, so every tab is
-// recognisable at a glance.
+// Page thumbnail (real snapshot of the page); falls back to favicon + site
+// name until a snapshot exists.
 @Composable
 private fun PagePreview(
     tab: BrowserTab,
@@ -2265,6 +2428,7 @@ private fun PagePreview(
     tint: Color = Surface2
 ) {
     val host = hostOf(tab.url)
+    val thumb = ThumbStore[tab.id]
     Box(
         modifier.clip(RoundedCornerShape(if (compact) 10.dp else 12.dp)).background(tint),
         contentAlignment = Alignment.Center
@@ -2275,29 +2439,27 @@ private fun PagePreview(
                 tint = TextMuted.copy(alpha = 0.5f),
                 modifier = Modifier.size(if (compact) 18.dp else 32.dp)
             )
+        } else if (thumb != null) {
+            val img = remember(thumb) { thumb.asImageBitmap() }
+            Image(
+                bitmap = img,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                alignment = Alignment.TopCenter,
+                modifier = Modifier.fillMaxSize()
+            )
         } else {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.padding(4.dp)
             ) {
-                Box(
-                    Modifier.size(if (compact) 24.dp else 46.dp).clip(CircleShape)
-                        .background(SiteColors[Math.abs(host.hashCode()) % SiteColors.size]),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        host.first().uppercaseChar().toString(),
-                        color = Color.White,
-                        fontSize = if (compact) 12.sp else 21.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
+                SiteBadge(tab, if (compact) 22.dp else 40.dp)
                 Spacer(Modifier.height(if (compact) 3.dp else 8.dp))
                 Text(
-                    if (compact) host else tab.title.ifBlank { host },
+                    host,
                     color = if (compact) TextMain else TextMuted,
                     fontSize = if (compact) 8.sp else 11.sp,
-                    maxLines = if (compact) 2 else 3,
+                    maxLines = 2,
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                 )
