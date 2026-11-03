@@ -3,6 +3,7 @@ package com.swift.browser
 import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.Context
+import android.graphics.Bitmap
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -23,6 +24,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -54,7 +56,10 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -66,6 +71,7 @@ import java.io.ByteArrayInputStream
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -316,31 +322,26 @@ private fun SwiftBrowserApp() {
                 .statusBarsPadding()
                 .navigationBarsPadding()
         ) {
-            // Browser top bar and interactive address field.
+            // Browser top bar: just the address pill, app logo inside it
+            // (like Brave's lion inside its omnibox).
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(
-                    Modifier.size(35.dp).clip(CircleShape)
-                        .background(Brush.linearGradient(listOf(Accent, Color(0xFFE94D25)))),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text("S", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Black)
-                }
-                Spacer(Modifier.width(9.dp))
                 Row(
                     Modifier.weight(1f).height(46.dp).clip(RoundedCornerShape(24.dp))
-                        .background(Surface2).padding(start = 12.dp, end = 5.dp),
+                        .background(Surface2).padding(start = 8.dp, end = 5.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        if (isHome) Icons.Default.Search else Icons.Default.Lock,
-                        contentDescription = "Address",
-                        tint = TextMuted,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(Modifier.width(7.dp))
+                    // App logo inside the search bar.
+                    Box(
+                        Modifier.size(29.dp).clip(CircleShape)
+                            .background(Brush.linearGradient(listOf(Accent, Color(0xFFE94D25)))),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("S", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Black)
+                    }
+                    Spacer(Modifier.width(9.dp))
                     BasicTextField(
                         value = address,
                         onValueChange = {
@@ -385,42 +386,6 @@ private fun SwiftBrowserApp() {
                         modifier = Modifier.size(34.dp).clip(CircleShape).background(Accent)
                     ) {
                         Icon(Icons.Default.ArrowForward, "Go", tint = Color.White, modifier = Modifier.size(18.dp))
-                    }
-                }
-                Spacer(Modifier.width(5.dp))
-                Box {
-                    IconButton(onClick = { showMenu = true }, modifier = Modifier.size(38.dp)) {
-                        Icon(Icons.Default.MoreVert, "Menu", tint = TextMain)
-                    }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false },
-                        modifier = Modifier.background(Surface)
-                    ) {
-                        BrowserMenuItem("Bookmarks", Icons.Default.Bookmark) {
-                            showMenu = false
-                            showTabs = false
-                            showShield = false
-                            address = "swift://bookmarks"
-                            showSuggestions = false
-                        }
-                        BrowserMenuItem("History", Icons.Default.History) {
-                            showMenu = false
-                            address = "swift://history"
-                            showSuggestions = false
-                        }
-                        BrowserMenuItem("Downloads", Icons.Default.Download) {
-                            showMenu = false
-                            runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
-                        }
-                        BrowserMenuItem("Share page", Icons.Default.Share) {
-                            showMenu = false
-                            sharePage(context, pageUrl)
-                        }
-                        BrowserMenuItem("Privacy dashboard", Icons.Default.Shield) {
-                            showMenu = false
-                            showShield = true
-                        }
                     }
                 }
             }
@@ -758,13 +723,45 @@ private fun SwiftBrowserApp() {
                     showSuggestions = false
                 }
 
-                // SETTINGS
-                ToolbarButton(
-                    Icons.Default.MoreVert,
-                    "Settings",
-                    selected = showMenu
-                ) {
-                    showMenu = true
+                // SETTINGS (menu lives here now, not in the top bar)
+                Box {
+                    ToolbarButton(
+                        Icons.Default.Settings,
+                        "Settings",
+                        selected = showMenu
+                    ) {
+                        showMenu = true
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false },
+                        modifier = Modifier.background(Surface)
+                    ) {
+                        BrowserMenuItem("Bookmarks", Icons.Default.Bookmark) {
+                            showMenu = false
+                            showTabs = false
+                            showShield = false
+                            address = "swift://bookmarks"
+                            showSuggestions = false
+                        }
+                        BrowserMenuItem("History", Icons.Default.History) {
+                            showMenu = false
+                            address = "swift://history"
+                            showSuggestions = false
+                        }
+                        BrowserMenuItem("Downloads", Icons.Default.Download) {
+                            showMenu = false
+                            runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
+                        }
+                        BrowserMenuItem("Share page", Icons.Default.Share) {
+                            showMenu = false
+                            sharePage(context, pageUrl)
+                        }
+                        BrowserMenuItem("Privacy dashboard", Icons.Default.Shield) {
+                            showMenu = false
+                            showShield = true
+                        }
+                    }
                 }
             }
         }
@@ -781,14 +778,8 @@ private fun HomeScreen(
     onShowBookmarks: () -> Unit,
     onShowHistory: () -> Unit
 ) {
-    Box(
-        Modifier
-            .fillMaxSize()
-            // Brave-style: wallpaper blurs behind the search box while typing
-            // (Modifier.blur is a no-op below Android 12, scrim still applies).
-            .then(if (searchActive) Modifier.blur(26.dp) else Modifier)
-    ) {
-        WallpaperBackdrop()
+    Box(Modifier.fillMaxSize()) {
+        WallpaperBackdrop(blurred = searchActive)
         // Reading scrim so content stays legible over the wallpaper.
         Box(
             Modifier.fillMaxSize().background(
@@ -897,175 +888,152 @@ private fun HomeScreen(
         }
 
         Spacer(Modifier.height(30.dp))
-
-        // Quick access
-        Row(
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                "Quick access",
-                color = TextMain,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.weight(1f)
-            )
-
-            TextButton(
-                onClick = onShowBookmarks
-            ) {
-                Text(
-                    "Edit",
-                    color = Accent
-                )
-            }
-        }
-
-        val shortcuts = listOf(
-            Triple("Brave", "B", "https://search.brave.com"),
-            Triple("YouTube", "Y", "https://youtube.com"),
-            Triple("Wikipedia", "W", "https://wikipedia.org"),
-            Triple("GitHub", "G", "https://github.com")
-        )
-
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            shortcuts.forEach { (name, letter, url) ->
-
-                Column(
-                    Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(17.dp))
-                        .background(Surface)
-                        .clickable {
-                            onOpen(url)
-                        }
-                        .padding(vertical = 16.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-
-                    Box(
-                        Modifier
-                            .size(43.dp)
-                            .clip(CircleShape)
-                            .background(Surface3),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            letter,
-                            color = Accent,
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    Spacer(Modifier.height(9.dp))
-
-                    Text(
-                        name,
-                        color = TextMain,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-            }
-        }
-
-        Spacer(Modifier.height(25.dp))
-
-        // Privacy information
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(14.dp))
-                .background(Surface)
-                .clickable { onShowHistory() }
-                .padding(15.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                Icons.Default.Shield,
-                null,
-                tint = Accent,
-                modifier = Modifier.size(23.dp)
-            )
-
-            Spacer(Modifier.width(12.dp))
-
-            Column {
-                Text(
-                    "Private browsing",
-                    color = TextMain,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-
-                Text(
-                    "Browse with tracker protection enabled.",
-                    color = TextMuted,
-                    fontSize = 11.sp
-                )
-            }
-        }
         }
     }
 }
 
-// Night-mountain wallpaper drawn with Canvas (no image asset needed).
+// Night-mountain wallpaper (no image asset needed).
+// The blurred variant renders the scene into a TINY bitmap and scales it back
+// up with bilinear filtering — that upscale IS the blur, and unlike
+// Modifier.blur() it works on every Android version, not just Android 12+.
 @Composable
-private fun WallpaperBackdrop() {
-    Canvas(Modifier.fillMaxSize()) {
-        val w = size.width
-        val h = size.height
-
-        // Night sky
-        drawRect(
-            Brush.verticalGradient(
-                listOf(Color(0xFF1C2540), Color(0xFF131826), Color(0xFF101114))
+private fun WallpaperBackdrop(blurred: Boolean) {
+    Crossfade(targetState = blurred, animationSpec = tween(220), label = "wallpaper") { isBlurred ->
+        if (isBlurred) {
+            val blurredBitmap = remember { renderWallpaperBitmap() }
+            Image(
+                bitmap = blurredBitmap.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.FillBounds,
+                modifier = Modifier.fillMaxSize(),
+                filterQuality = FilterQuality.High
             )
-        )
+        } else {
+            Canvas(Modifier.fillMaxSize()) {
+                val w = size.width
+                val h = size.height
 
-        // Ambient glows
-        drawCircle(
-            Brush.radialGradient(
-                listOf(Color(0x59FF6B35), Color(0x00FF6B35)),
-                center = Offset(w * 0.85f, h * 0.10f),
-                radius = w * 0.55f
-            ),
-            radius = w * 0.55f,
-            center = Offset(w * 0.85f, h * 0.10f)
-        )
-        drawCircle(
-            Brush.radialGradient(
-                listOf(Color(0x335B8DEF), Color(0x005B8DEF)),
-                center = Offset(w * 0.12f, h * 0.30f),
-                radius = w * 0.45f
-            ),
-            radius = w * 0.45f,
-            center = Offset(w * 0.12f, h * 0.30f)
-        )
+                // Night sky
+                drawRect(
+                    Brush.verticalGradient(
+                        listOf(Color(0xFF1C2540), Color(0xFF131826), Color(0xFF101114))
+                    )
+                )
 
-        // Stars (deterministic placement)
-        for (i in 0 until 34) {
-            val sx = (i * 137.508f) % w
-            val sy = (i * 79.377f) % (h * 0.52f)
-            drawCircle(
-                Color(0x59FFFFFF),
-                radius = 1.1f + (i % 3) * 0.5f,
-                center = Offset(sx, sy)
-            )
+                // Ambient glows
+                drawCircle(
+                    Brush.radialGradient(
+                        listOf(Color(0x59FF6B35), Color(0x00FF6B35)),
+                        center = Offset(w * 0.85f, h * 0.10f),
+                        radius = w * 0.55f
+                    ),
+                    radius = w * 0.55f,
+                    center = Offset(w * 0.85f, h * 0.10f)
+                )
+                drawCircle(
+                    Brush.radialGradient(
+                        listOf(Color(0x335B8DEF), Color(0x005B8DEF)),
+                        center = Offset(w * 0.12f, h * 0.30f),
+                        radius = w * 0.45f
+                    ),
+                    radius = w * 0.45f,
+                    center = Offset(w * 0.12f, h * 0.30f)
+                )
+
+                // Stars (deterministic placement)
+                for (i in 0 until 34) {
+                    val sx = (i * 137.508f) % w
+                    val sy = (i * 79.377f) % (h * 0.52f)
+                    drawCircle(
+                        Color(0x59FFFFFF),
+                        radius = 1.1f + (i % 3) * 0.5f,
+                        center = Offset(sx, sy)
+                    )
+                }
+
+                // Moon
+                drawCircle(Color(0x2EF2EAD8), radius = w * 0.06f, center = Offset(w * 0.72f, h * 0.09f))
+                drawCircle(Color(0x1AF2EAD8), radius = w * 0.075f, center = Offset(w * 0.72f, h * 0.09f))
+
+                // Snow-capped ridges
+                ridge(Color(0xFF26324B), 0.64f, 0.022f, 0.0f)
+                ridge(Color(0xFF1D2436), 0.74f, 0.028f, 1.7f)
+                ridge(Color(0xFF151A26), 0.85f, 0.034f, 3.4f)
+            }
         }
-
-        // Moon
-        drawCircle(Color(0x2EF2EAD8), radius = w * 0.06f, center = Offset(w * 0.72f, h * 0.09f))
-        drawCircle(Color(0x1AF2EAD8), radius = w * 0.075f, center = Offset(w * 0.72f, h * 0.09f))
-
-        // Snow-capped ridges
-        ridge(Color(0xFF26324B), 0.64f, 0.022f, 0.0f)
-        ridge(Color(0xFF1D2436), 0.74f, 0.028f, 1.7f)
-        ridge(Color(0xFF151A26), 0.85f, 0.034f, 3.4f)
     }
+}
+
+// Renders the wallpaper scene into a deliberately low-resolution bitmap.
+private fun renderWallpaperBitmap(): Bitmap {
+    val w = 96
+    val h = 216
+    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bmp)
+    val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+
+    // Night sky
+    paint.shader = android.graphics.LinearGradient(
+        0f, 0f, 0f, h.toFloat(),
+        0xFF1C2540.toInt(), 0xFF101114.toInt(),
+        android.graphics.Shader.TileMode.CLAMP
+    )
+    canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
+
+    // Ambient glows
+    paint.shader = android.graphics.RadialGradient(
+        w * 0.85f, h * 0.10f, w * 0.55f,
+        0x59FF6B35.toInt(), 0x00FF6B35.toInt(),
+        android.graphics.Shader.TileMode.CLAMP
+    )
+    canvas.drawCircle(w * 0.85f, h * 0.10f, w * 0.55f, paint)
+    paint.shader = android.graphics.RadialGradient(
+        w * 0.12f, h * 0.30f, w * 0.45f,
+        0x335B8DEF.toInt(), 0x005B8DEF.toInt(),
+        android.graphics.Shader.TileMode.CLAMP
+    )
+    canvas.drawCircle(w * 0.12f, h * 0.30f, w * 0.45f, paint)
+    paint.shader = null
+
+    // Moon
+    paint.color = 0x2EF2EAD8.toInt()
+    canvas.drawCircle(w * 0.72f, h * 0.09f, w * 0.07f, paint)
+    paint.color = 0x1AF2EAD8.toInt()
+    canvas.drawCircle(w * 0.72f, h * 0.09f, w * 0.075f, paint)
+
+    // Ridges
+    drawFrameworkRidge(canvas, paint, 0xFF26324B.toInt(), 0.64f, 0.022f, 0.0f)
+    drawFrameworkRidge(canvas, paint, 0xFF1D2436.toInt(), 0.74f, 0.028f, 1.7f)
+    drawFrameworkRidge(canvas, paint, 0xFF151A26.toInt(), 0.85f, 0.034f, 3.4f)
+    return bmp
+}
+
+private fun drawFrameworkRidge(
+    canvas: android.graphics.Canvas,
+    paint: android.graphics.Paint,
+    color: Int,
+    topFraction: Float,
+    jag: Float,
+    phase: Float
+) {
+    val w = canvas.width.toFloat()
+    val h = canvas.height.toFloat()
+    val base = h * topFraction
+    val path = android.graphics.Path()
+    path.moveTo(-10f, h + 10f)
+    path.lineTo(-10f, base)
+    var x = -10f
+    val step = (w + 20f) / 6f
+    for (i in 0 until 6) {
+        val peak = base - h * jag * (1f + abs(kotlin.math.sin(i * 2.3f + phase)) * 2.2f)
+        path.lineTo(x + step * 0.45f, peak)
+        path.lineTo(x + step, base + h * jag * 0.5f)
+        x += step
+    }
+    path.lineTo(w + 10f, h + 10f)
+    path.close()
+    paint.color = color
+    canvas.drawPath(path, paint)
 }
 
 private fun DrawScope.ridge(color: Color, topFraction: Float, jag: Float, phase: Float) {
