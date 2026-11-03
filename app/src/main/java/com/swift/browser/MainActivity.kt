@@ -90,6 +90,17 @@ import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.unit.IntOffset
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.MutableTransitionState
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.scaleIn
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
+import kotlinx.coroutines.launch
 
 private val Bg = Color(0xFF101114)
 private val Surface = Color(0xFF1A1C20)
@@ -149,6 +160,9 @@ private fun SwiftBrowserApp() {
     var showSuggestions by remember { mutableStateOf(false) }
     var addressFocused by remember { mutableStateOf(false) }
     val tabGroups = remember { mutableStateMapOf<Long, Long>() }
+    val groupNames = remember { mutableStateMapOf<Long, String>() }
+    val groupUpdated = remember { mutableStateMapOf<Long, Long>() }
+    var pendingOpenGroup by remember { mutableStateOf<Long?>(null) }
     var groupCounter by remember { mutableLongStateOf(GROUP_ID_BASE + 1) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var canGoBack by remember { mutableStateOf(false) }
@@ -240,6 +254,13 @@ private fun SwiftBrowserApp() {
         showTabs = false
     }
 
+    fun newTabInGroup(gid: Long) {
+        val id = idCounter.get()
+        newTab()
+        tabGroups[id] = gid
+        groupUpdated[gid] = System.currentTimeMillis()
+    }
+
     fun selectTab(tab: BrowserTab) {
         activeId = tab.id
         pageUrl = tab.url
@@ -250,7 +271,7 @@ private fun SwiftBrowserApp() {
         if (tab.url != "swift://home") webViewRef?.loadUrl(tab.url)
     }
 
-    fun closeTab(tab: BrowserTab) {
+    fun closeTab(tab: BrowserTab, fromOverview: Boolean = true) {
         if (tabs.size == 1) {
             tabs[0] = BrowserTab(tab.id)
             tabGroups.clear()
@@ -264,7 +285,7 @@ private fun SwiftBrowserApp() {
             val next = tabs.getOrNull((index - 1).coerceAtLeast(0)) ?: tabs.first()
             selectTab(next)
             // Closing a tab from the overview must not leave the overview.
-            showTabs = true
+            if (fromOverview) showTabs = true
         }
     }
 
@@ -293,12 +314,15 @@ private fun SwiftBrowserApp() {
             sourceGroup != null && targetGroup == null ->
                 tabGroups[targetKey] = sourceGroup
         }
+        val resultGid = tabGroups[targetKey] ?: targetKey.takeIf { it >= GROUP_ID_BASE }
+        if (resultGid != null) groupUpdated[resultGid] = System.currentTimeMillis()
     }
 
     // Dropped on empty space: drag a tab out of its group / dissolve a group.
     fun handleDropOutside(key: Long) {
         if (key >= GROUP_ID_BASE) {
             tabGroups.keys.filter { tabGroups[it] == key }.forEach { tabGroups.remove(it) }
+            groupNames.remove(key)
         } else {
             tabGroups.remove(key)
         }
@@ -313,6 +337,7 @@ private fun SwiftBrowserApp() {
         }
         val gid = groupCounter++
         loose.forEach { tabGroups[it.id] = gid }
+        groupUpdated[gid] = System.currentTimeMillis()
         Toast.makeText(context, "Grouped ${loose.size} tabs", Toast.LENGTH_SHORT).show()
     }
 
@@ -743,6 +768,19 @@ private fun SwiftBrowserApp() {
                         tabs = tabs.toList(),
                         activeId = activeId,
                         groups = tabGroups,
+                        groupNames = groupNames,
+                        groupUpdated = groupUpdated,
+                        onRenameGroup = { gid, name ->
+                            if (name.isBlank()) {
+                                groupNames.remove(gid)
+                            } else {
+                                groupNames[gid] = name
+                            }
+                            groupUpdated[gid] = System.currentTimeMillis()
+                        },
+                        onNewTabInGroup = { newTabInGroup(it) },
+                        openGroupRequest = pendingOpenGroup,
+                        onOpenGroupConsumed = { pendingOpenGroup = null },
                         onSelect = { selectTab(it) },
                         onClose = { closeTab(it) },
                         onNew = { newTab() },
@@ -773,6 +811,67 @@ private fun SwiftBrowserApp() {
                         },
                         onClose = { showShield = false }
                     )
+                }
+            }
+
+            // Brave-style group strip: when the open tab belongs to a group, a
+            // slim bar lets you jump between that group's tabs.
+            val activeGid = tabGroups[activeId]
+            if (!showTabs && activeGid != null) {
+                val members = tabs.filter { tabGroups[it.id] == activeGid }
+                val gColor = groupColorOf(activeGid)
+                Row(
+                    Modifier.fillMaxWidth().background(Bg).padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = {
+                            pendingOpenGroup = activeGid
+                            showTabs = true
+                            keyboardController?.hide()
+                            focusManager.clearFocus()
+                        },
+                        modifier = Modifier.size(44.dp)
+                    ) {
+                        Icon(Icons.Default.KeyboardArrowUp, "Open group", tint = TextMain)
+                    }
+                    Row(
+                        Modifier.weight(1f).horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        members.forEach { m ->
+                            val isActive = m.id == activeId
+                            Box(Modifier.size(54.dp)) {
+                                Box(
+                                    Modifier.align(Alignment.Center).size(46.dp).clip(CircleShape)
+                                        .background(Surface2)
+                                        .then(if (isActive) Modifier.border(2.dp, gColor, CircleShape) else Modifier)
+                                        .clickable { if (!isActive) selectTab(m) },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    SiteBadge(m, 30.dp)
+                                }
+                                if (isActive) {
+                                    Box(
+                                        Modifier.align(Alignment.TopEnd).size(20.dp).clip(CircleShape)
+                                            .background(gColor)
+                                            .clickable { closeTab(m, false) },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Default.Close, "Close tab", tint = GroupInk, modifier = Modifier.size(13.dp))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    IconButton(
+                        onClick = { newTabInGroup(activeGid) },
+                        modifier = Modifier.size(44.dp).border(1.5.dp, TextMuted, CircleShape)
+                    ) {
+                        Icon(Icons.Default.Add, "New tab in group", tint = TextMain)
+                    }
                 }
             }
 
@@ -1283,6 +1382,7 @@ private fun SingleTabCard(
     onSelect: () -> Unit,
     onClose: () -> Unit,
     onRemoveFromGroup: (() -> Unit)?,
+    showActiveLabel: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -1328,7 +1428,7 @@ private fun SingleTabCard(
                     color = TextMuted, fontSize = 9.sp, maxLines = 1
                 )
             }
-            if (isActive) {
+            if (isActive && showActiveLabel) {
                 Text("ACTIVE", color = Accent, fontSize = 8.sp, fontWeight = FontWeight.Bold)
             }
             if (onRemoveFromGroup != null) {
@@ -1355,6 +1455,8 @@ private fun SingleTabCard(
 private fun GroupCard(
     entry: TabEntry,
     color: Color,
+    name: String,
+    onRename: () -> Unit,
     hovered: Boolean,
     onOpen: () -> Unit,
     onUngroup: () -> Unit,
@@ -1381,7 +1483,7 @@ private fun GroupCard(
             )
             Spacer(Modifier.width(10.dp))
             Text(
-                if (count == 1) "1 tab" else "$count tabs",
+                name,
                 color = GroupInk, fontSize = 19.sp,
                 fontWeight = FontWeight.SemiBold, maxLines = 1,
                 modifier = Modifier.weight(1f)
@@ -1395,6 +1497,10 @@ private fun GroupCard(
                     onDismissRequest = { menuOpen = false },
                     modifier = Modifier.background(Surface)
                 ) {
+                    BrowserMenuItem("Rename", Icons.Default.Edit) {
+                        menuOpen = false
+                        onRename()
+                    }
                     BrowserMenuItem("Ungroup", Icons.Default.FolderOff) {
                         menuOpen = false
                         onUngroup()
@@ -1455,10 +1561,21 @@ private fun TabSwitcher(
     onGroup: (Long, Long) -> Unit,
     onDropOutside: (Long) -> Unit,
     onGroupAll: () -> Unit,
-    onCloseAll: () -> Unit
+    onCloseAll: () -> Unit,
+    groupNames: Map<Long, String>,
+    groupUpdated: Map<Long, Long>,
+    onRenameGroup: (Long, String) -> Unit,
+    onNewTabInGroup: (Long) -> Unit,
+    openGroupRequest: Long?,
+    onOpenGroupConsumed: () -> Unit
 ) {
     var query by remember { mutableStateOf("") }
-    var openGroupKey by remember { mutableStateOf<Long?>(null) }
+    var openGroupKey by remember { mutableStateOf(openGroupRequest) }
+    var renameKey by remember { mutableStateOf<Long?>(null) }
+    var settling by remember { mutableStateOf<Settle?>(null) }
+    val settleAnim = remember { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) { onOpenGroupConsumed() }
     var section by remember { mutableIntStateOf(0) } // 0 = tabs, 1 = groups
     var dragKey by remember { mutableStateOf<Long?>(null) }
     var dragPos by remember { mutableStateOf(Offset.Zero) }
@@ -1522,71 +1639,8 @@ private fun TabSwitcher(
 
     fun groupColorFor(key: Long): Color = GroupColors[(key % GroupColors.size).toInt()]
 
-    // ---------- Opened group (Brave: tap a group to see its tabs) ----------
-    if (openEntry != null) {
-        val gColor = groupColorFor(openEntry.key)
-        var detailMenu by remember { mutableStateOf(false) }
-        Column(Modifier.fillMaxSize().background(Bg)) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(onClick = { openGroupKey = null }) {
-                    Icon(Icons.Default.ArrowBack, "Back", tint = TextMain)
-                }
-                Box(Modifier.size(22.dp).clip(CircleShape).background(gColor))
-                Spacer(Modifier.width(10.dp))
-                Text(
-                    if (openEntry.tabs.size == 1) "1 tab" else "${openEntry.tabs.size} tabs",
-                    color = TextMain, fontSize = 19.sp, fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f)
-                )
-                Box {
-                    IconButton(onClick = { detailMenu = true }) {
-                        Icon(Icons.Default.MoreVert, "Group options", tint = TextMain)
-                    }
-                    DropdownMenu(
-                        expanded = detailMenu,
-                        onDismissRequest = { detailMenu = false },
-                        modifier = Modifier.background(Surface)
-                    ) {
-                        BrowserMenuItem("Ungroup", Icons.Default.FolderOff) {
-                            detailMenu = false
-                            onDropOutside(openEntry.key)
-                        }
-                        BrowserMenuItem("Close group", Icons.Default.Close) {
-                            detailMenu = false
-                            openEntry.tabs.toList().forEach { onClose(it) }
-                        }
-                    }
-                }
-            }
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
-                modifier = Modifier.fillMaxSize().padding(horizontal = 17.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = PaddingValues(bottom = 12.dp)
-            ) {
-                gridItems(openEntry.tabs, key = { it.id }) { tab ->
-                    Box(Modifier.fillMaxWidth().height(230.dp)) {
-                        SingleTabCard(
-                            tab = tab,
-                            isActive = tab.id == activeId,
-                            hovered = false,
-                            ringColor = gColor,
-                            onSelect = { onSelect(tab) },
-                            onClose = { onClose(tab) },
-                            onRemoveFromGroup = { onDropOutside(tab.id) }
-                        )
-                    }
-                }
-            }
-        }
-        return
-    }
-
     // ---------- Main tab grid ----------
+    Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize().background(Bg)) {
         // Brave-style header: centered switch between Tabs and Tab groups.
         Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
@@ -1664,7 +1718,15 @@ private fun TabSwitcher(
         }
 
         Box(Modifier.weight(1f).fillMaxWidth().onGloballyPositioned { gridTopLeft = it.positionInRoot() }) {
-            LazyVerticalGrid(
+            if (section == 1) GroupListSection(
+                entries = filtered,
+                names = groupNames,
+                updated = groupUpdated,
+                onOpen = { openGroupKey = it },
+                onRename = { renameKey = it },
+                onUngroup = { onDropOutside(it) },
+                onCloseGroup = { e -> e.tabs.toList().forEach { onClose(it) } }
+            ) else LazyVerticalGrid(
                 columns = GridCells.Fixed(2),
                 modifier = Modifier.fillMaxSize().padding(horizontal = 17.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -1676,9 +1738,20 @@ private fun TabSwitcher(
                     val isActiveEntry = activeMember.id == activeId
                     val isHovered = hoverKey == entry.key && dragKey != entry.key
 
-                    // Drag + bounds behaviour shared by tab cards and group cards.
-                    // While dragging, the original card is HIDDEN completely
-                    // (no dim ghost left behind) — only the held copy is visible.
+                    // Brave: the card under the dragged tab shrinks a little to
+                    // "absorb" it.
+                    val absorbing = isHovered || settling?.target == entry.key
+                    val cardScale by animateFloatAsState(
+                        targetValue = if (absorbing) 0.9f else 1f,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioMediumBouncy,
+                            stiffness = Spring.StiffnessMedium
+                        ),
+                        label = "absorb"
+                    )
+
+                    // Drag behaviour shared by tab cards and group cards. The
+                    // original card is hidden while the held copy moves.
                     val dragModifier = Modifier
                         .alpha(if (dragKey == entry.key) 0f else 1f)
                         .onGloballyPositioned { cardBounds[entry.key] = it.boundsInRoot() }
@@ -1698,17 +1771,27 @@ private fun TabSwitcher(
                                     } else null
                                 },
                                 onDragEnd = {
-                                    if (dragDistance > 40f) {
-                                        val target = targetUnder(dragPos, entry.key)
-                                        when (target) {
-                                            null -> onDropOutside(entry.key)
-                                            NEW_TAB_KEY -> { /* ignore drops on the New tab card */ }
-                                            else -> onGroup(entry.key, target)
+                                    val target = if (dragDistance > 40f) targetUnder(dragPos, entry.key) else null
+                                    val targetRect = target?.let { cardBounds[it] }
+                                    if (dragDistance > 40f && target != null && target != NEW_TAB_KEY && targetRect != null) {
+                                        // Fly the held card into the target, then merge.
+                                        val src = entry.key
+                                        settling = Settle(src, target, dragPos, targetRect.center)
+                                        hoverKey = null
+                                        scope.launch {
+                                            settleAnim.snapTo(0f)
+                                            settleAnim.animateTo(1f, tween(240))
+                                            onGroup(src, target)
+                                            settling = null
+                                            dragKey = null
+                                            dragDistance = 0f
                                         }
+                                    } else {
+                                        if (dragDistance > 40f && target == null) onDropOutside(entry.key)
+                                        dragKey = null
+                                        hoverKey = null
+                                        dragDistance = 0f
                                     }
-                                    dragKey = null
-                                    hoverKey = null
-                                    dragDistance = 0f
                                 },
                                 onDragCancel = {
                                     dragKey = null
@@ -1718,12 +1801,17 @@ private fun TabSwitcher(
                             )
                         }
 
-                    Box(Modifier.fillMaxWidth().height(230.dp)) {
+                    Box(
+                        Modifier.fillMaxWidth().height(230.dp)
+                            .graphicsLayer { scaleX = cardScale; scaleY = cardScale }
+                    ) {
                         if (entry.isGroup) {
                             GroupCard(
                                 entry = entry,
                                 color = groupColorFor(entry.key),
-                                hovered = isHovered,
+                                name = groupLabel(groupNames, entry.key, entry.tabs.size),
+                                onRename = { renameKey = entry.key },
+                                hovered = false,
                                 onOpen = { openGroupKey = entry.key },
                                 onUngroup = { onDropOutside(entry.key) },
                                 onCloseGroup = { entry.tabs.toList().forEach { onClose(it) } },
@@ -1733,7 +1821,7 @@ private fun TabSwitcher(
                             SingleTabCard(
                                 tab = activeMember,
                                 isActive = isActiveEntry,
-                                hovered = isHovered,
+                                hovered = false,
                                 ringColor = null,
                                 onSelect = { onSelect(activeMember) },
                                 onClose = { onClose(activeMember) },
@@ -1754,87 +1842,156 @@ private fun TabSwitcher(
                 }
             }
 
-            // A small COPY OF THE CARD ITSELF is held under the finger while
-            // dragging — like Brave.
+            // The real card (same size) is held under the finger while dragging.
+            // On drop it shrinks and flies into the target.
             dragKey?.let { key ->
                 val dragged = entries.firstOrNull { it.key == key }
-                val dragTab = dragged?.tabs?.firstOrNull()
-                val isGroupDrag = dragged?.isGroup == true
-                Box(
-                    Modifier.offset {
-                        IntOffset(
-                            (dragPos.x - gridTopLeft.x - 95.dp.toPx()).roundToInt(),
-                            (dragPos.y - gridTopLeft.y - 65.dp.toPx()).roundToInt()
+                val rect = cardBounds[key]
+                if (dragged != null && rect != null) {
+                    val density = LocalDensity.current
+                    val wDp = with(density) { rect.width.toDp() }
+                    val hDp = with(density) { rect.height.toDp() }
+                    val st = settling
+                    val p = settleAnim.value
+                    val pos = if (st != null) {
+                        Offset(
+                            st.from.x + (st.to.x - st.from.x) * p,
+                            st.from.y + (st.to.y - st.from.y) * p
                         )
-                    }
-                ) {
-                    if (isGroupDrag && dragged != null) {
-                        Column(
-                            Modifier
-                                .width(170.dp)
-                                .height(130.dp)
-                                .clip(RoundedCornerShape(20.dp))
-                                .background(groupColorFor(dragged.key))
-                                .padding(12.dp)
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Box(Modifier.size(20.dp).clip(CircleShape).background(Color(0xFFEEF0F6)))
-                                Spacer(Modifier.width(8.dp))
-                                Text(
-                                    "${dragged.tabs.size} tabs",
-                                    color = GroupInk, fontSize = 15.sp, fontWeight = FontWeight.SemiBold
+                    } else dragPos
+                    Box(
+                        Modifier
+                            .offset {
+                                IntOffset(
+                                    (pos.x - gridTopLeft.x - rect.width / 2f).roundToInt(),
+                                    (pos.y - gridTopLeft.y - rect.height / 2f).roundToInt()
                                 )
                             }
-                            Spacer(Modifier.height(8.dp))
-                            Box(
-                                Modifier.weight(1f).fillMaxWidth()
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(Color(0x33FFFFFF))
+                            .size(wDp, hDp)
+                            .graphicsLayer {
+                                val sc = if (st != null) 1f - 0.7f * p else 1.04f
+                                scaleX = sc
+                                scaleY = sc
+                                alpha = if (st != null) 1f - 0.9f * p else 0.96f
+                            }
+                    ) {
+                        if (dragged.isGroup) {
+                            GroupCard(
+                                entry = dragged,
+                                color = groupColorFor(dragged.key),
+                                name = groupLabel(groupNames, dragged.key, dragged.tabs.size),
+                                onRename = {},
+                                hovered = false,
+                                onOpen = {}, onUngroup = {}, onCloseGroup = {}
+                            )
+                        } else {
+                            val t = dragged.tabs.first()
+                            SingleTabCard(
+                                tab = t, isActive = t.id == activeId, hovered = false,
+                                ringColor = null, onSelect = {}, onClose = {},
+                                onRemoveFromGroup = null
                             )
                         }
-                    } else {
-                        Column(
-                            Modifier
-                                .width(190.dp)
-                                .height(130.dp)
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(Surface3)
-                                .border(1.dp, Color(0x40FFFFFF), RoundedCornerShape(16.dp))
-                                .padding(10.dp)
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Box(
-                                    Modifier.size(26.dp).clip(RoundedCornerShape(8.dp)).background(Surface),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        if (dragTab?.url == "swift://home") Icons.Default.Home else Icons.Default.Language,
-                                        null, tint = Accent, modifier = Modifier.size(14.dp)
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- Group popup (Brave: a small sheet over the dimmed grid) ----------
+    if (openEntry != null) {
+        val gColor = groupColorFor(openEntry.key)
+        var popupMenu by remember { mutableStateOf(false) }
+        val label = groupLabel(groupNames, openEntry.key, openEntry.tabs.size)
+        Box(
+            Modifier.fillMaxSize()
+                .background(Color(0xB3000000))
+                .pointerInput(Unit) { detectTapGestures(onTap = { openGroupKey = null }) }
+        ) {
+            androidx.compose.animation.AnimatedVisibility(
+                visibleState = remember { MutableTransitionState(false).apply { targetState = true } },
+                enter = fadeIn(tween(140)) + scaleIn(initialScale = 0.92f, animationSpec = tween(170)),
+                modifier = Modifier.align(Alignment.Center)
+            ) {
+                Column(
+                    Modifier
+                        .padding(horizontal = 16.dp)
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(30.dp))
+                        .background(Color(0xFF202226))
+                        .pointerInput(Unit) { detectTapGestures(onTap = {}) }
+                        .padding(top = 8.dp, bottom = 12.dp)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = { openGroupKey = null }) {
+                            Icon(Icons.Default.ArrowBack, "Back", tint = TextMain)
+                        }
+                        Box(Modifier.size(22.dp).clip(CircleShape).background(gColor))
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            label,
+                            color = TextMain, fontSize = 22.sp, maxLines = 1,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { renameKey = openEntry.key }
+                                .drawBehind {
+                                    drawLine(
+                                        TextMuted,
+                                        Offset(0f, size.height),
+                                        Offset(size.width, size.height),
+                                        1.dp.toPx()
                                     )
                                 }
-                                Spacer(Modifier.width(8.dp))
-                                Column {
-                                    Text(
-                                        dragTab?.title?.ifBlank { "New tab" } ?: "Tab",
-                                        color = TextMain, fontSize = 11.sp,
-                                        fontWeight = FontWeight.SemiBold, maxLines = 1
-                                    )
-                                    Text(
-                                        if (dragTab?.url == "swift://home") "New tab" else dragTab?.url ?: "",
-                                        color = TextMuted, fontSize = 8.sp, maxLines = 1
-                                    )
+                                .padding(vertical = 4.dp)
+                        )
+                        IconButton(onClick = { onNewTabInGroup(openEntry.key) }) {
+                            Icon(Icons.Default.Add, "New tab in group", tint = TextMain)
+                        }
+                        Box {
+                            IconButton(onClick = { popupMenu = true }) {
+                                Icon(Icons.Default.MoreVert, "Group options", tint = TextMain)
+                            }
+                            DropdownMenu(
+                                expanded = popupMenu,
+                                onDismissRequest = { popupMenu = false },
+                                modifier = Modifier.background(Surface)
+                            ) {
+                                BrowserMenuItem("Rename", Icons.Default.Edit) {
+                                    popupMenu = false
+                                    renameKey = openEntry.key
+                                }
+                                BrowserMenuItem("Ungroup", Icons.Default.FolderOff) {
+                                    popupMenu = false
+                                    onDropOutside(openEntry.key)
+                                }
+                                BrowserMenuItem("Close group", Icons.Default.Close) {
+                                    popupMenu = false
+                                    openEntry.tabs.toList().forEach { onClose(it) }
                                 }
                             }
-                            Spacer(Modifier.height(8.dp))
-                            Box(
-                                Modifier.weight(1f).fillMaxWidth()
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(Surface),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    if (dragTab?.url == "swift://home") Icons.Default.Home else Icons.Default.Language,
-                                    null, tint = TextMuted.copy(alpha = 0.5f), modifier = Modifier.size(22.dp)
+                        }
+                    }
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(2),
+                        modifier = Modifier.heightIn(max = 520.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                    ) {
+                        gridItems(openEntry.tabs, key = { it.id }) { tab ->
+                            Box(Modifier.fillMaxWidth().height(200.dp)) {
+                                SingleTabCard(
+                                    tab = tab,
+                                    isActive = tab.id == activeId,
+                                    hovered = false,
+                                    ringColor = gColor,
+                                    onSelect = { onSelect(tab) },
+                                    onClose = { onClose(tab) },
+                                    onRemoveFromGroup = { onDropOutside(tab.id) },
+                                    showActiveLabel = false
                                 )
                             }
                         }
@@ -1842,6 +1999,30 @@ private fun TabSwitcher(
                 }
             }
         }
+    }
+
+    renameKey?.let { rk ->
+        var text by remember(rk) { mutableStateOf(groupNames[rk] ?: "") }
+        AlertDialog(
+            onDismissRequest = { renameKey = null },
+            containerColor = Surface,
+            title = { Text("Rename group", color = TextMain) },
+            text = {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    singleLine = true,
+                    placeholder = { Text("Group name") }
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { onRenameGroup(rk, text.trim()); renameKey = null }) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameKey = null }) { Text("Cancel") }
+            }
+        )
+    }
     }
 }
 
@@ -1917,6 +2098,138 @@ private fun ToolbarButton(
     }
 }
 
+private data class Settle(val source: Long, val target: Long, val from: Offset, val to: Offset)
+
+private fun groupColorOf(key: Long): Color = GroupColors[(key % GroupColors.size).toInt()]
+
+private fun groupLabel(names: Map<Long, String>, key: Long, count: Int): String =
+    names[key]?.takeIf { it.isNotBlank() } ?: if (count == 1) "1 tab" else "$count tabs"
+
+private fun relativeTime(ts: Long): String {
+    if (ts <= 0L) return "Updated just now"
+    val m = (System.currentTimeMillis() - ts) / 60000
+    fun ago(n: Long, unit: String) = "Updated $n $unit${if (n == 1L) "" else "s"} ago"
+    return when {
+        m < 1 -> "Updated just now"
+        m < 60 -> ago(m, "minute")
+        m < 1440 -> ago(m / 60, "hour")
+        m < 10080 -> ago(m / 1440, "day")
+        else -> ago(m / 10080, "week")
+    }
+}
+
+// Round site badge: colored letter, or a home icon for the start page.
+@Composable
+private fun SiteBadge(tab: BrowserTab, size: androidx.compose.ui.unit.Dp) {
+    val host = hostOf(tab.url)
+    if (tab.url == "swift://home" || host.isEmpty()) {
+        Icon(Icons.Default.Home, null, tint = TextMuted, modifier = Modifier.size(size * 0.65f))
+    } else {
+        Box(
+            Modifier.size(size).clip(CircleShape)
+                .background(SiteColors[Math.abs(host.hashCode()) % SiteColors.size]),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                host.first().uppercaseChar().toString(),
+                color = Color.White, fontSize = (size.value * 0.5f).sp, fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+// "Tab groups" section: one row per group — preview, color dot, name, age.
+@Composable
+private fun GroupListSection(
+    entries: List<TabEntry>,
+    names: Map<Long, String>,
+    updated: Map<Long, Long>,
+    onOpen: (Long) -> Unit,
+    onRename: (Long) -> Unit,
+    onUngroup: (Long) -> Unit,
+    onCloseGroup: (TabEntry) -> Unit
+) {
+    LazyColumn(
+        Modifier.fillMaxSize().padding(horizontal = 17.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+        contentPadding = PaddingValues(bottom = 12.dp)
+    ) {
+        items(entries, key = { it.key }) { entry ->
+            var menu by remember { mutableStateOf(false) }
+            val count = entry.tabs.size
+            Row(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Surface)
+                    .clickable { onOpen(entry.key) }
+                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(
+                    Modifier.size(80.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(Bg)
+                        .border(1.dp, Surface3, RoundedCornerShape(18.dp))
+                        .padding(5.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    repeat(2) { row ->
+                        Row(
+                            Modifier.weight(1f).fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            repeat(2) { col ->
+                                val idx = row * 2 + col
+                                val member = entry.tabs.getOrNull(idx)
+                                val overflow = idx == 3 && count > 4
+                                Box(
+                                    Modifier.weight(1f).fillMaxHeight()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Surface2),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (overflow) {
+                                        Text("+${count - 3}", color = TextMain, fontSize = 12.sp)
+                                    } else if (member != null) {
+                                        SiteBadge(member, 22.dp)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.width(16.dp))
+                Column(Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(14.dp).clip(CircleShape).background(groupColorOf(entry.key)))
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            groupLabel(names, entry.key, count),
+                            color = TextMain, fontSize = 19.sp, maxLines = 1
+                        )
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(relativeTime(updated[entry.key] ?: 0L), color = TextMuted, fontSize = 13.sp)
+                }
+                Box {
+                    IconButton(onClick = { menu = true }) {
+                        Icon(Icons.Default.MoreVert, "Group options", tint = TextMain)
+                    }
+                    DropdownMenu(
+                        expanded = menu,
+                        onDismissRequest = { menu = false },
+                        modifier = Modifier.background(Surface)
+                    ) {
+                        BrowserMenuItem("Rename", Icons.Default.Edit) { menu = false; onRename(entry.key) }
+                        BrowserMenuItem("Ungroup", Icons.Default.FolderOff) { menu = false; onUngroup(entry.key) }
+                        BrowserMenuItem("Close group", Icons.Default.Close) { menu = false; onCloseGroup(entry) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 private val SiteColors = listOf(
     Color(0xFF5B8DEF), Color(0xFF65C98A), Color(0xFFE8765A),
     Color(0xFFC98BDE), Color(0xFFD9A93C), Color(0xFF3FB6BF)
@@ -1928,7 +2241,7 @@ private fun hostOf(url: String): String =
 // Query of a Brave Search results URL, or null for any other URL.
 private fun searchQueryOf(url: String): String? {
     val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
-    if (uri.host != "search.brave.com" || uri.path?.startsWith("/search") != true) return null
+    if (uri.host != "search.google.com" || uri.path?.startsWith("/search") != true) return null
     return uri.getQueryParameter("q")
 }
 
@@ -1979,27 +2292,3 @@ private fun PagePreview(
                         fontWeight = FontWeight.Bold
                     )
                 }
-                Spacer(Modifier.height(if (compact) 3.dp else 8.dp))
-                Text(
-                    if (compact) host else tab.title.ifBlank { host },
-                    color = if (compact) TextMain else TextMuted,
-                    fontSize = if (compact) 8.sp else 11.sp,
-                    maxLines = if (compact) 2 else 3,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-                )
-            }
-        }
-    }
-}
-
-private fun sharePage(context: Context, url: String) {
-    if (!url.startsWith("http")) return
-    runCatching {
-        val send = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, url)
-        }
-        context.startActivity(Intent.createChooser(send, "Share page"))
-    }
-}
