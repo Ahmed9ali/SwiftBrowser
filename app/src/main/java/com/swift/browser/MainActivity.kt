@@ -1324,7 +1324,7 @@ private fun TabSwitcher(
                 onClick = onGroupAll,
                 modifier = Modifier.align(Alignment.Center).size(40.dp)
             ) {
-                Icon(Icons.Default.AutoAwesomeFolder, "Group tabs", tint = TextMain, modifier = Modifier.size(22.dp))
+                Icon(Icons.Default.CreateNewFolder, "Group tabs", tint = TextMain, modifier = Modifier.size(22.dp))
             }
             IconButton(
                 onClick = onCloseAll,
