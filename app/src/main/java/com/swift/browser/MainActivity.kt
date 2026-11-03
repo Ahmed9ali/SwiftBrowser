@@ -346,20 +346,36 @@ private fun SwiftBrowserApp() {
 
     // Settings menu, shared by the normal bottom bar and the tab-overview bar.
     @Composable
-    fun SettingsMenuBox() {
+    fun SettingsMenuBox(dots: Boolean = false) {
         Box {
-            ToolbarButton(
-                Icons.Default.Settings,
-                "Settings",
-                selected = showMenu
-            ) {
-                showMenu = true
+            if (dots) {
+                IconButton(onClick = { showMenu = true }, modifier = Modifier.size(44.dp)) {
+                    Icon(Icons.Default.MoreVert, "Menu", tint = TextMain)
+                }
+            } else {
+                ToolbarButton(
+                    Icons.Default.Settings,
+                    "Settings",
+                    selected = showMenu
+                ) {
+                    showMenu = true
+                }
             }
             DropdownMenu(
                 expanded = showMenu,
                 onDismissRequest = { showMenu = false },
                 modifier = Modifier.background(Surface)
             ) {
+                if (showTabs) {
+                    BrowserMenuItem("Group all tabs", Icons.Default.CreateNewFolder) {
+                        showMenu = false
+                        groupAllTabs()
+                    }
+                    BrowserMenuItem("Close all tabs", Icons.Default.DeleteSweep) {
+                        showMenu = false
+                        closeAllTabs()
+                    }
+                }
                 BrowserMenuItem("Bookmarks", Icons.Default.Bookmark) {
                     showMenu = false
                     showTabs = false
@@ -412,7 +428,7 @@ private fun SwiftBrowserApp() {
                 Row(
                     Modifier.weight(1f).height(46.dp).clip(RoundedCornerShape(24.dp))
                         .background(if (addressFocused) Surface3 else Surface2)
-                        .padding(start = 8.dp, end = 5.dp),
+                        .padding(start = 8.dp, end = 14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     // App logo inside the search bar.
@@ -425,7 +441,7 @@ private fun SwiftBrowserApp() {
                     }
                     Spacer(Modifier.width(9.dp))
                     BasicTextField(
-                        value = address,
+                        value = if (addressFocused) address else prettyAddress(address),
                         onValueChange = {
                             address = it
                             showSuggestions = it.isNotBlank()
@@ -433,41 +449,37 @@ private fun SwiftBrowserApp() {
                         modifier = Modifier
                             .weight(1f)
                             .focusRequester(addressFocusRequester)
-                            .onFocusChanged { addressFocused = it.isFocused },
+                            .onFocusChanged {
+                                val wasFocused = addressFocused
+                                addressFocused = it.isFocused
+                                // Editing a search page shows just the query.
+                                if (it.isFocused && !wasFocused) {
+                                    searchQueryOf(address)?.let { q -> address = q }
+                                }
+                                // Leaving the field without navigating restores the link.
+                                if (!it.isFocused && wasFocused && pageUrl.startsWith("http")) {
+                                    address = pageUrl
+                                }
+                            },
                         singleLine = true,
                         textStyle = TextStyle(color = TextMain, fontSize = 14.sp),
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
                         keyboardActions = KeyboardActions(onGo = { load(address) }),
                         decorationBox = { inner ->
                             if (address.isEmpty()) {
-                                Text("Search Brave or type URL", color = TextMuted, fontSize = 13.sp)
+                                Text("Search or type URL", color = TextMuted, fontSize = 13.sp)
                             }
                             inner()
                         }
                     )
-                    if (address.isNotEmpty()) {
+                    // Only a clear button while typing; otherwise it is just the link.
+                    if (addressFocused && address.isNotEmpty()) {
                         IconButton(
                             onClick = { address = ""; showSuggestions = false },
                             modifier = Modifier.size(31.dp)
                         ) {
                             Icon(Icons.Default.Close, "Clear address", tint = TextMuted, modifier = Modifier.size(17.dp))
                         }
-                    } else if (!isHome) {
-                        IconButton(onClick = {
-                            runCatching {
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("URL", pageUrl))
-                                Toast.makeText(context, "Link copied", Toast.LENGTH_SHORT).show()
-                            }
-                        }, modifier = Modifier.size(31.dp)) {
-                            Icon(Icons.Default.ContentCopy, "Copy URL", tint = TextMuted, modifier = Modifier.size(16.dp))
-                        }
-                    }
-                    IconButton(
-                        onClick = { load(address) },
-                        modifier = Modifier.size(34.dp).clip(CircleShape).background(Accent)
-                    ) {
-                        Icon(Icons.Default.ArrowForward, "Go", tint = Color.White, modifier = Modifier.size(18.dp))
                     }
                 }
             }
@@ -786,7 +798,7 @@ private fun SwiftBrowserApp() {
                         Icon(Icons.Default.Add, "New tab", tint = Color(0xFF16181C), modifier = Modifier.size(22.dp))
                     }
                     Box(Modifier.align(Alignment.CenterEnd)) {
-                        SettingsMenuBox()
+                        SettingsMenuBox(dots = true)
                     }
                 }
             } else {
@@ -1329,17 +1341,7 @@ private fun SingleTabCard(
             }
         }
         Spacer(Modifier.height(8.dp))
-        Box(
-            Modifier.weight(1f).fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .background(Surface2),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                if (tab.url == "swift://home") Icons.Default.Home else Icons.Default.Language,
-                null, tint = TextMuted.copy(alpha = 0.5f), modifier = Modifier.size(28.dp)
-            )
-        }
+        PagePreview(tab, Modifier.weight(1f).fillMaxWidth())
         if (tab.blockedCount > 0) {
             Spacer(Modifier.height(6.dp))
             Text("${tab.blockedCount} trackers blocked", color = Green, fontSize = 9.sp)
@@ -1418,19 +1420,21 @@ private fun GroupCard(
                         val idx = row * 2 + col
                         val member = entry.tabs.getOrNull(idx)
                         val overflow = idx == 3 && count > 4
-                        Box(
-                            Modifier.weight(1f).fillMaxHeight()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (member != null) Color(0xFF23262C) else Color(0x33FFFFFF)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (overflow) {
-                                Text("+${count - 3}", color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                            } else if (member != null) {
-                                Icon(
-                                    if (member.url == "swift://home") Icons.Default.Home else Icons.Default.Language,
-                                    null, tint = TextMuted, modifier = Modifier.size(18.dp)
-                                )
+                        if (member != null && !overflow) {
+                            PagePreview(
+                                member, Modifier.weight(1f).fillMaxHeight(),
+                                compact = true, tint = Color(0xFF23262C)
+                            )
+                        } else {
+                            Box(
+                                Modifier.weight(1f).fillMaxHeight()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (overflow) Color(0xFF23262C) else Color(0x33FFFFFF)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (overflow) {
+                                    Text("+${count - 3}", color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                }
                             }
                         }
                     }
@@ -1455,6 +1459,7 @@ private fun TabSwitcher(
 ) {
     var query by remember { mutableStateOf("") }
     var openGroupKey by remember { mutableStateOf<Long?>(null) }
+    var section by remember { mutableIntStateOf(0) } // 0 = tabs, 1 = groups
     var dragKey by remember { mutableStateOf<Long?>(null) }
     var dragPos by remember { mutableStateOf(Offset.Zero) }
     var dragDistance by remember { mutableStateOf(0f) }
@@ -1477,7 +1482,8 @@ private fun TabSwitcher(
         list
     }
 
-    val filtered = if (query.isBlank()) entries else entries.filter { e ->
+    val sectionEntries = if (section == 1) entries.filter { it.isGroup } else entries
+    val filtered = if (query.isBlank()) sectionEntries else sectionEntries.filter { e ->
         e.tabs.any { it.title.contains(query, true) || it.url.contains(query, true) }
     }
 
@@ -1563,7 +1569,7 @@ private fun TabSwitcher(
                 contentPadding = PaddingValues(bottom = 12.dp)
             ) {
                 gridItems(openEntry.tabs, key = { it.id }) { tab ->
-                    Box(Modifier.fillMaxWidth().height(160.dp)) {
+                    Box(Modifier.fillMaxWidth().height(230.dp)) {
                         SingleTabCard(
                             tab = tab,
                             isActive = tab.id == activeId,
@@ -1582,16 +1588,43 @@ private fun TabSwitcher(
 
     // ---------- Main tab grid ----------
     Column(Modifier.fillMaxSize().background(Bg)) {
-        // Brave has no "Tabs / N open tabs" title: just the action icons.
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.End,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = onGroupAll, modifier = Modifier.size(42.dp)) {
-                Icon(Icons.Default.CreateNewFolder, "Group tabs", tint = TextMain, modifier = Modifier.size(22.dp))
+        // Brave-style header: centered switch between Tabs and Tab groups.
+        Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(
+                Modifier.align(Alignment.Center)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Surface2)
+                    .padding(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Box(
+                    Modifier.width(58.dp).height(40.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(if (section == 0) Surface3 else Color.Transparent)
+                        .clickable { section = 0 },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        Modifier.size(22.dp).border(2.dp, TextMain, RoundedCornerShape(6.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(tabs.size.toString(), color = TextMain, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+                Box(
+                    Modifier.width(58.dp).height(40.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(if (section == 1) Surface3 else Color.Transparent)
+                        .clickable { section = 1 },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.GridView, "Tab groups", tint = TextMain, modifier = Modifier.size(22.dp))
+                }
             }
-            IconButton(onClick = onCloseAll, modifier = Modifier.size(42.dp)) {
+            IconButton(
+                onClick = onCloseAll,
+                modifier = Modifier.align(Alignment.CenterEnd).size(42.dp)
+            ) {
                 Icon(Icons.Default.DeleteSweep, "Close all tabs", tint = TextMuted, modifier = Modifier.size(22.dp))
             }
         }
@@ -1685,7 +1718,7 @@ private fun TabSwitcher(
                             )
                         }
 
-                    Box(Modifier.fillMaxWidth().height(160.dp)) {
+                    Box(Modifier.fillMaxWidth().height(230.dp)) {
                         if (entry.isGroup) {
                             GroupCard(
                                 entry = entry,
@@ -1714,7 +1747,10 @@ private fun TabSwitcher(
 
             if (filtered.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("No tabs match \"$query\"", color = TextMuted, fontSize = 13.sp)
+                    Text(
+                        if (query.isBlank()) "No tab groups yet" else "No tabs match \"$query\"",
+                        color = TextMuted, fontSize = 13.sp
+                    )
                 }
             }
 
@@ -1878,6 +1914,82 @@ private fun ToolbarButton(
             modifier = Modifier.size(21.dp)
         )
         Text(label, color = if (selected) Accent else TextMuted, fontSize = 9.sp, maxLines = 1)
+    }
+}
+
+private val SiteColors = listOf(
+    Color(0xFF5B8DEF), Color(0xFF65C98A), Color(0xFFE8765A),
+    Color(0xFFC98BDE), Color(0xFFD9A93C), Color(0xFF3FB6BF)
+)
+
+private fun hostOf(url: String): String =
+    runCatching { Uri.parse(url).host }.getOrNull()?.removePrefix("www.") ?: ""
+
+// Query of a Brave Search results URL, or null for any other URL.
+private fun searchQueryOf(url: String): String? {
+    val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
+    if (uri.host != "search.brave.com" || uri.path?.startsWith("/search") != true) return null
+    return uri.getQueryParameter("q")
+}
+
+// What the address bar shows when not editing: a clean link, with the
+// search engine's address replaced by Swift's own name.
+private fun prettyAddress(url: String): String {
+    searchQueryOf(url)?.let { return "swift://search/$it" }
+    if (url.startsWith("http://") || url.startsWith("https://")) {
+        return url.substringAfter("://").removePrefix("www.").trimEnd('/')
+    }
+    return url
+}
+
+// Stand-in for a page thumbnail: site letter + name, so every tab is
+// recognisable at a glance.
+@Composable
+private fun PagePreview(
+    tab: BrowserTab,
+    modifier: Modifier = Modifier,
+    compact: Boolean = false,
+    tint: Color = Surface2
+) {
+    val host = hostOf(tab.url)
+    Box(
+        modifier.clip(RoundedCornerShape(if (compact) 10.dp else 12.dp)).background(tint),
+        contentAlignment = Alignment.Center
+    ) {
+        if (tab.url == "swift://home" || host.isEmpty()) {
+            Icon(
+                Icons.Default.Home, null,
+                tint = TextMuted.copy(alpha = 0.5f),
+                modifier = Modifier.size(if (compact) 18.dp else 32.dp)
+            )
+        } else {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.padding(4.dp)
+            ) {
+                Box(
+                    Modifier.size(if (compact) 24.dp else 46.dp).clip(CircleShape)
+                        .background(SiteColors[Math.abs(host.hashCode()) % SiteColors.size]),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        host.first().uppercaseChar().toString(),
+                        color = Color.White,
+                        fontSize = if (compact) 12.sp else 21.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Spacer(Modifier.height(if (compact) 3.dp else 8.dp))
+                Text(
+                    if (compact) host else tab.title.ifBlank { host },
+                    color = if (compact) TextMain else TextMuted,
+                    fontSize = if (compact) 8.sp else 11.sp,
+                    maxLines = if (compact) 2 else 3,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                )
+            }
+        }
     }
 }
 
