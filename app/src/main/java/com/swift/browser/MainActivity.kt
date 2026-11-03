@@ -24,7 +24,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.Crossfade
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -74,6 +73,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
@@ -127,6 +127,7 @@ private fun SwiftBrowserApp() {
     val context = LocalContext.current
     val addressFocusRequester = remember {androidx.compose.ui.focus.FocusRequester()}
     val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val store = remember { BrowserStore(context) }
     val blocker = remember { TrackerBlocker(context) }
     val idCounter = remember { AtomicLong(2) }
@@ -205,6 +206,8 @@ private fun SwiftBrowserApp() {
             updateActiveTab(pageUrl, pageTitle, 0)
             showSuggestions = false
             showTabs = false
+            keyboardController?.hide()
+            focusManager.clearFocus()
             return
         }
 
@@ -217,6 +220,10 @@ private fun SwiftBrowserApp() {
         webViewRef?.loadUrl(url)
         showSuggestions = false
         showTabs = false
+        // Hide the keyboard so the loaded page / search results are
+        // immediately visible — like Brave.
+        keyboardController?.hide()
+        focusManager.clearFocus()
     }
 
     fun newTab() {
@@ -558,10 +565,14 @@ private fun SwiftBrowserApp() {
                     modifier = Modifier.fillMaxSize()
                 ) {
                     HomeScreen(
-                        searchActive = addressFocused,
+                        searchActive = addressFocused || showSuggestions,
                         onFocusSearch = {
                             addressFocusRequester.requestFocus()
                             keyboardController?.show()
+                        },
+                        onDismissKeyboard = {
+                            keyboardController?.hide()
+                            focusManager.clearFocus()
                         },
                         onOpen = { load(it) },
                         bookmarks = store.bookmarks().take(5),
@@ -772,13 +783,25 @@ private fun SwiftBrowserApp() {
 private fun HomeScreen(
     searchActive: Boolean,
     onFocusSearch: () -> Unit,
+    onDismissKeyboard: () -> Unit,
     onOpen: (String) -> Unit,
     bookmarks: List<Pair<String, String>>,
     recent: List<Pair<String, String>>,
     onShowBookmarks: () -> Unit,
     onShowHistory: () -> Unit
 ) {
-    Box(Modifier.fillMaxSize()) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            // Tapping anywhere outside a control closes the keyboard.
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { onDismissKeyboard() },
+                    onDoubleTap = { onDismissKeyboard() },
+                    onLongPress = { onDismissKeyboard() }
+                )
+            }
+    ) {
         WallpaperBackdrop(blurred = searchActive)
         // Reading scrim so content stays legible over the wallpaper.
         Box(
@@ -898,18 +921,8 @@ private fun HomeScreen(
 // Modifier.blur() it works on every Android version, not just Android 12+.
 @Composable
 private fun WallpaperBackdrop(blurred: Boolean) {
-    Crossfade(targetState = blurred, animationSpec = tween(220), label = "wallpaper") { isBlurred ->
-        if (isBlurred) {
-            val blurredBitmap = remember { renderWallpaperBitmap() }
-            Image(
-                bitmap = blurredBitmap.asImageBitmap(),
-                contentDescription = null,
-                contentScale = ContentScale.FillBounds,
-                modifier = Modifier.fillMaxSize(),
-                filterQuality = FilterQuality.High
-            )
-        } else {
-            Canvas(Modifier.fillMaxSize()) {
+    // Sharp wallpaper — always drawn underneath.
+    Canvas(Modifier.fillMaxSize()) {
                 val w = size.width
                 val h = size.height
 
@@ -959,15 +972,31 @@ private fun WallpaperBackdrop(blurred: Boolean) {
                 ridge(Color(0xFF26324B), 0.64f, 0.022f, 0.0f)
                 ridge(Color(0xFF1D2436), 0.74f, 0.028f, 1.7f)
                 ridge(Color(0xFF151A26), 0.85f, 0.034f, 3.4f)
-            }
-        }
+    }
+
+    // The opaque pre-blurred bitmap fades in ON TOP of the sharp wallpaper
+    // when the search bar is active. Unlike Modifier.blur(), this renders
+    // on every Android version and every phone.
+    androidx.compose.animation.AnimatedVisibility(
+        visible = blurred,
+        enter = fadeIn(tween(200)),
+        exit = fadeOut(tween(160))
+    ) {
+        val blurredBitmap = remember { renderWallpaperBitmap() }
+        Image(
+            bitmap = blurredBitmap.asImageBitmap(),
+            contentDescription = null,
+            contentScale = ContentScale.FillBounds,
+            modifier = Modifier.fillMaxSize(),
+            filterQuality = FilterQuality.High
+        )
     }
 }
 
 // Renders the wallpaper scene into a deliberately low-resolution bitmap.
 private fun renderWallpaperBitmap(): Bitmap {
-    val w = 96
-    val h = 216
+    val w = 64
+    val h = 144
     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bmp)
     val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
