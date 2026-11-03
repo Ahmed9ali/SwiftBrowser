@@ -466,6 +466,8 @@ private fun SwiftBrowserApp() {
             }
 
             // Small protection strip opens the detailed shield dashboard.
+            // Hidden in the tabs overview, like Brave.
+            if (!showTabs) {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 1.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -511,6 +513,7 @@ private fun SwiftBrowserApp() {
                         )
                     }
                 }
+            }
             }
 
             Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -762,15 +765,17 @@ private fun SwiftBrowserApp() {
                         .background(Surface)
                         .padding(horizontal = 12.dp, vertical = 9.dp)
                 ) {
-                    IconButton(
-                        onClick = { newTab() },
-                        modifier = Modifier
+                    // Brave-style "+" pill: light background, dark icon.
+                    Row(
+                        Modifier
                             .align(Alignment.Center)
-                            .size(46.dp)
-                            .clip(CircleShape)
-                            .background(Accent)
+                            .clip(RoundedCornerShape(22.dp))
+                            .background(Color(0xFFE8E8EC))
+                            .clickable { newTab() }
+                            .padding(horizontal = 18.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.Add, "New tab", tint = Color.White, modifier = Modifier.size(24.dp))
+                        Icon(Icons.Default.Add, "New tab", tint = Color(0xFF16181C), modifier = Modifier.size(22.dp))
                     }
                     Box(Modifier.align(Alignment.CenterEnd)) {
                         SettingsMenuBox()
@@ -1267,7 +1272,6 @@ private fun TabSwitcher(
     var dragDistance by remember { mutableStateOf(0f) }
     var hoverKey by remember { mutableStateOf<Long?>(null) }
     val cardBounds = remember { mutableStateMapOf<Long, Rect>() }
-    val expandedGroups = remember { mutableStateListOf<Long>() }
     var gridTopLeft by remember { mutableStateOf(Offset.Zero) }
 
     // Build grid entries: single tabs plus one stacked card per group.
@@ -1380,12 +1384,13 @@ private fun TabSwitcher(
                     val activeMember = entry.tabs.firstOrNull { it.id == activeId } ?: entry.tabs.first()
                     val isActiveEntry = activeMember.id == activeId
                     val isHovered = hoverKey == entry.key && dragKey != entry.key
-                    val isExpanded = entry.key in expandedGroups
                     val groupColor = if (entry.isGroup) {
                         GroupColors[(entry.key % GroupColors.size).toInt()]
                     } else Accent
-                    val height = if (entry.isGroup && isExpanded) {
-                        (160 + 44 * entry.tabs.size).dp
+                    // Groups are taller: their member tabs are visible directly
+                    // inside the card — like Brave — no tap needed.
+                    val height = if (entry.isGroup) {
+                        (168 + 46 * entry.tabs.size).dp
                     } else 160.dp
 
                     Box(Modifier.fillMaxWidth().height(height)) {
@@ -1408,6 +1413,8 @@ private fun TabSwitcher(
                         Column(
                             Modifier
                                 .fillMaxSize()
+                                // The dragged card fades out while its copy is held.
+                                .alpha(if (dragKey == entry.key) 0.25f else 1f)
                                 .onGloballyPositioned { cardBounds[entry.key] = it.boundsInRoot() }
                                 .clip(RoundedCornerShape(16.dp))
                                 .background(if (isActiveEntry) Color(0xFF2A2119) else Surface)
@@ -1502,19 +1509,6 @@ private fun TabSwitcher(
                                     IconButton(onClick = { onClose(activeMember) }, modifier = Modifier.size(30.dp)) {
                                         Icon(Icons.Default.Close, "Close tab", tint = TextMuted, modifier = Modifier.size(16.dp))
                                     }
-                                } else {
-                                    IconButton(
-                                        onClick = {
-                                            if (entry.key in expandedGroups) expandedGroups.remove(entry.key)
-                                            else expandedGroups.add(entry.key)
-                                        },
-                                        modifier = Modifier.size(30.dp)
-                                    ) {
-                                        Icon(
-                                            if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                                            "Expand group", tint = TextMuted, modifier = Modifier.size(18.dp)
-                                        )
-                                    }
                                 }
                             }
                             Spacer(Modifier.height(8.dp))
@@ -1535,7 +1529,9 @@ private fun TabSwitcher(
                                 Spacer(Modifier.height(6.dp))
                                 Text("${activeMember.blockedCount} trackers blocked", color = Green, fontSize = 9.sp)
                             }
-                            if (entry.isGroup && isExpanded) {
+                            // Group members are shown DIRECTLY inside the card
+                            // as small tab previews — like Brave.
+                            if (entry.isGroup) {
                                 Spacer(Modifier.height(8.dp))
                                 entry.tabs.forEach { member ->
                                     Row(
@@ -1578,33 +1574,70 @@ private fun TabSwitcher(
                 }
             }
 
-            // Floating chip that follows the dragged tab / group.
+            // A small COPY OF THE CARD ITSELF is held under the finger while
+            // dragging — like Brave — instead of a tiny chip.
             dragKey?.let { key ->
                 val dragged = entries.firstOrNull { it.key == key }
+                val dragTab = dragged?.tabs?.firstOrNull()
                 Box(
                     Modifier.offset {
                         IntOffset(
-                            (dragPos.x - gridTopLeft.x - 70.dp.toPx()).roundToInt(),
-                            (dragPos.y - gridTopLeft.y - 20.dp.toPx()).roundToInt()
+                            (dragPos.x - gridTopLeft.x - 95.dp.toPx()).roundToInt(),
+                            (dragPos.y - gridTopLeft.y - 65.dp.toPx()).roundToInt()
                         )
                     }
                 ) {
-                    Row(
+                    Column(
                         Modifier
-                            .clip(RoundedCornerShape(14.dp))
+                            .width(190.dp)
+                            .height(130.dp)
+                            .clip(RoundedCornerShape(16.dp))
                             .background(Surface3)
-                            .padding(horizontal = 12.dp, vertical = 9.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                            .border(1.dp, Color(0x40FFFFFF), RoundedCornerShape(16.dp))
+                            .padding(10.dp)
                     ) {
-                        Icon(
-                            if (dragged?.isGroup == true) Icons.Default.Folder else Icons.Default.Language,
-                            null, tint = Accent, modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            dragged?.tabs?.firstOrNull()?.title?.ifBlank { "Tab" } ?: "Tab",
-                            color = TextMain, fontSize = 12.sp, maxLines = 1
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                Modifier.size(26.dp).clip(RoundedCornerShape(8.dp))
+                                    .background(if (dragged?.isGroup == true) (if (dragged != null) GroupColors[(dragged.key % GroupColors.size).toInt()].copy(alpha = 0.25f) else Surface2) else Surface),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    when {
+                                        dragged?.isGroup == true -> Icons.Default.Folder
+                                        dragTab?.url == "swift://home" -> Icons.Default.Home
+                                        else -> Icons.Default.Language
+                                    },
+                                    null, tint = Accent, modifier = Modifier.size(14.dp)
+                                )
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    dragged?.tabs?.firstOrNull()?.title?.ifBlank { "New tab" } ?: "Tab",
+                                    color = TextMain, fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold, maxLines = 1
+                                )
+                                Text(
+                                    if (dragged?.isGroup == true) "${dragged.tabs.size} tabs grouped"
+                                    else if (dragTab?.url == "swift://home") "New tab"
+                                    else dragTab?.url ?: "",
+                                    color = TextMuted, fontSize = 8.sp, maxLines = 1
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Box(
+                            Modifier.weight(1f).fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(Surface),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                if (dragTab?.url == "swift://home") Icons.Default.Home else Icons.Default.Language,
+                                null, tint = TextMuted.copy(alpha = 0.5f), modifier = Modifier.size(22.dp)
+                            )
+                        }
                     }
                 }
             }
