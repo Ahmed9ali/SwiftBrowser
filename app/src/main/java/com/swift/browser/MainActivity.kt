@@ -2241,7 +2241,7 @@ private fun hostOf(url: String): String =
 // Query of a Brave Search results URL, or null for any other URL.
 private fun searchQueryOf(url: String): String? {
     val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
-    if (uri.host != "search.brave.com" || uri.path?.startsWith("/search") != true) return null
+    if (uri.host != "search.google.com" || uri.path?.startsWith("/search") != true) return null
     return uri.getQueryParameter("q")
 }
 
@@ -2292,3 +2292,27 @@ private fun PagePreview(
                         fontWeight = FontWeight.Bold
                     )
                 }
+                Spacer(Modifier.height(if (compact) 3.dp else 8.dp))
+                Text(
+                    if (compact) host else tab.title.ifBlank { host },
+                    color = if (compact) TextMain else TextMuted,
+                    fontSize = if (compact) 8.sp else 11.sp,
+                    maxLines = if (compact) 2 else 3,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+private fun sharePage(context: Context, url: String) {
+    if (!url.startsWith("http")) return
+    runCatching {
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, url)
+        }
+        context.startActivity(Intent.createChooser(send, "Share page"))
+    }
+}
