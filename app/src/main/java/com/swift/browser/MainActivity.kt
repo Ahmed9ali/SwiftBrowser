@@ -101,6 +101,13 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 
 private val Bg = Color(0xFF101114)
 private val Surface = Color(0xFF1A1C20)
@@ -120,15 +127,135 @@ private val ThumbStore = mutableStateMapOf<Long, Bitmap>()
 private const val GROUP_ID_BASE = 1_000_000L
 private const val NEW_TAB_KEY = -1L
 
-// Brave/Chrome-style pastel group colors (light card, dark text).
+// Brave/Chrome tab-group colors (grey, blue, red, yellow, green, pink, purple, cyan, orange).
 private val GroupColors = listOf(
-    Color(0xFFB3C3FF), Color(0xFFA8DAB5), Color(0xFFF6B8B0),
-    Color(0xFFFDD663), Color(0xFFD7AEFB), Color(0xFF8AD8E6)
+    Color(0xFF9AA0A6), Color(0xFF8AB4F8), Color(0xFFF28B82),
+    Color(0xFFFDD663), Color(0xFF81C995), Color(0xFFFF8BCB),
+    Color(0xFFC58AF9), Color(0xFF78D9EC), Color(0xFFFCAD70)
 )
+// Colors the user picked (group key -> palette index); others use a default.
+private val GroupColorStore = mutableStateMapOf<Long, Int>()
 private val GroupInk = Color(0xFF1B1D22)
 
 // One card in the tab grid: either a single tab or a group of tabs.
 private data class TabEntry(val key: Long, val isGroup: Boolean, val tabs: List<BrowserTab>)
+
+// Pull-to-refresh container for a WebView (no extra dependency needed).
+private class PullRefreshLayout(context: Context) : android.widget.FrameLayout(context) {
+    var onRefresh: (() -> Unit)? = null
+    private val density = context.resources.displayMetrics.density
+    private val slop = android.view.ViewConfiguration.get(context).scaledTouchSlop
+    private val threshold = 72f * density
+    private val maxPull = 130f * density
+    private var startX = 0f
+    private var startY = 0f
+    private var pulling = false
+    private var pull = 0f
+    private var refreshing = false
+    private var anim: android.animation.ValueAnimator? = null
+    private val timeout = Runnable { endRefresh() }
+    private val bgPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF2A2D34.toInt()
+    }
+    private val arcPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFF6B35.toInt()
+        style = android.graphics.Paint.Style.STROKE
+        strokeWidth = 3f * density
+        strokeCap = android.graphics.Paint.Cap.ROUND
+    }
+    private val arcRect = android.graphics.RectF()
+
+    init { setWillNotDraw(false) }
+
+    private fun canChildScrollUp(): Boolean = getChildAt(0)?.canScrollVertically(-1) == true
+
+    override fun onInterceptTouchEvent(ev: android.view.MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                startX = ev.x
+                startY = ev.y
+                pulling = false
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                val dy = ev.y - startY
+                if (!pulling && !refreshing && dy > slop && dy > abs(ev.x - startX) && !canChildScrollUp()) {
+                    pulling = true
+                    anim?.cancel()
+                    startY = ev.y
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                }
+            }
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> pulling = false
+        }
+        return pulling
+    }
+
+    override fun onTouchEvent(ev: android.view.MotionEvent): Boolean {
+        if (!pulling) return super.onTouchEvent(ev)
+        when (ev.actionMasked) {
+            android.view.MotionEvent.ACTION_MOVE ->
+                setPull(((ev.y - startY) * 0.5f).coerceIn(0f, maxPull))
+            android.view.MotionEvent.ACTION_UP -> {
+                pulling = false
+                if (pull >= threshold) startRefresh() else settle(0f)
+            }
+            android.view.MotionEvent.ACTION_CANCEL -> {
+                pulling = false
+                settle(0f)
+            }
+        }
+        return true
+    }
+
+    private fun setPull(v: Float) {
+        pull = v
+        getChildAt(0)?.translationY = v * 0.35f
+        invalidate()
+    }
+
+    private fun settle(target: Float) {
+        anim?.cancel()
+        anim = android.animation.ValueAnimator.ofFloat(pull, target).apply {
+            duration = 200
+            addUpdateListener { setPull(it.animatedValue as Float) }
+            start()
+        }
+    }
+
+    private fun startRefresh() {
+        refreshing = true
+        settle(threshold * 0.8f)
+        onRefresh?.invoke()
+        removeCallbacks(timeout)
+        postDelayed(timeout, 10_000)
+    }
+
+    fun endRefresh() {
+        if (!refreshing) return
+        refreshing = false
+        removeCallbacks(timeout)
+        settle(0f)
+    }
+
+    override fun dispatchDraw(canvas: android.graphics.Canvas) {
+        super.dispatchDraw(canvas)
+        if (pull > 1f) {
+            val r = 18f * density
+            val cx = width / 2f
+            val cy = pull * 0.9f - r
+            canvas.drawCircle(cx, cy, r, bgPaint)
+            arcRect.set(cx - r * 0.55f, cy - r * 0.55f, cx + r * 0.55f, cy + r * 0.55f)
+            if (refreshing) {
+                val start = (System.currentTimeMillis() % 900L) / 900f * 360f
+                canvas.drawArc(arcRect, start, 270f, false, arcPaint)
+                postInvalidateOnAnimation()
+            } else {
+                val sweep = (pull / threshold).coerceAtMost(1f) * 300f
+                canvas.drawArc(arcRect, -90f + pull * 1.5f, sweep, false, arcPaint)
+            }
+        }
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -167,10 +294,14 @@ private fun SwiftBrowserApp() {
     val groupNames = remember { mutableStateMapOf<Long, String>() }
     val groupUpdated = remember { mutableStateMapOf<Long, Long>() }
     var pendingOpenGroup by remember { mutableStateOf<Long?>(null) }
+    var pendingEditGroup by remember { mutableStateOf<Long?>(null) }
+    var showGroupSheet by remember { mutableStateOf(false) }
+    var editGroupKey by remember { mutableStateOf<Long?>(null) }
     var groupCounter by remember { mutableLongStateOf(GROUP_ID_BASE + 1) }
     // One WebView per tab: pages, history and network errors never leak between tabs.
     val webViews = remember { HashMap<Long, WebView>() }
-    remember { FaviconStore.clear(); ThumbStore.clear(); 0 }
+    val refreshLayouts = remember { HashMap<Long, PullRefreshLayout>() }
+    remember { FaviconStore.clear(); ThumbStore.clear(); GroupColorStore.clear(); 0 }
     var loadProgress by remember { mutableIntStateOf(100) }
     var totalBlocked by remember { mutableIntStateOf(0) }
     var canGoBack by remember { mutableStateOf(false) }
@@ -307,6 +438,7 @@ private fun SwiftBrowserApp() {
         pageTitle = tab.title
         blockedCount = tab.blockedCount
         showTabs = false
+        showGroupSheet = false
         loadProgress = 100
         canGoBack = webViews[tab.id]?.canGoBack() == true
     }
@@ -352,6 +484,7 @@ private fun SwiftBrowserApp() {
                 val gid = groupCounter++
                 tabGroups[sourceKey] = gid
                 tabGroups[targetKey] = gid
+                pendingEditGroup = gid
             }
             // Group onto a loose tab: pull that tab into the group.
             sourceGroup != null && targetGroup == null ->
@@ -366,6 +499,7 @@ private fun SwiftBrowserApp() {
         if (key >= GROUP_ID_BASE) {
             tabGroups.keys.filter { tabGroups[it] == key }.forEach { tabGroups.remove(it) }
             groupNames.remove(key)
+            GroupColorStore.remove(key)
         } else {
             tabGroups.remove(key)
         }
@@ -381,6 +515,7 @@ private fun SwiftBrowserApp() {
         val gid = groupCounter++
         loose.forEach { tabGroups[it.id] = gid }
         groupUpdated[gid] = System.currentTimeMillis()
+        pendingEditGroup = gid
         Toast.makeText(context, "Grouped ${loose.size} tabs", Toast.LENGTH_SHORT).show()
     }
 
@@ -433,6 +568,7 @@ private fun SwiftBrowserApp() {
                 }
 
                 override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                    if (newProgress >= 100) refreshLayouts[tabId]?.endRefresh()
                     if (tabId == activeId && view?.url?.startsWith("about:") != true) {
                         loadProgress = newProgress
                     }
@@ -497,6 +633,7 @@ private fun SwiftBrowserApp() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (url == null || url.startsWith("about:")) return
                     updateTabById(tabId, url = url)
+                    refreshLayouts[tabId]?.endRefresh()
                     val title = tabs.firstOrNull { it.id == tabId }?.title ?: url
                     if (tabId == activeId) {
                         pageUrl = url
@@ -531,8 +668,9 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    BackHandler(enabled = showShield || showTabs || showSuggestions || (canGoBack && !isHome)) {
+    BackHandler(enabled = showGroupSheet || showShield || showTabs || showSuggestions || (canGoBack && !isHome)) {
         when {
+            showGroupSheet -> showGroupSheet = false
             showShield -> showShield = false
             showTabs -> showTabs = false
             showSuggestions -> showSuggestions = false
@@ -609,6 +747,7 @@ private fun SwiftBrowserApp() {
             onBackground = TextMain, onSurface = TextMain
         )
     ) {
+        Box(Modifier.fillMaxSize()) {
         Column(
             Modifier
                 .fillMaxSize()
@@ -759,14 +898,33 @@ private fun SwiftBrowserApp() {
                                     if (isCurrent && showSuggestions && !isHome) Modifier.blur(14.dp) else Modifier
                                 )
                                 .alpha(if (pageVisible) 1f else 0f),
-                            factory = { ctx -> createWebView(ctx, tab.id) },
-                            update = { wv ->
-                                wv.visibility = if (isCurrent) android.view.View.VISIBLE else android.view.View.INVISIBLE
-                                if (isCurrent) wv.onResume() else wv.onPause()
+                            factory = { ctx ->
+                                val wv = createWebView(ctx, tab.id)
+                                PullRefreshLayout(ctx).apply {
+                                    addView(
+                                        wv,
+                                        android.widget.FrameLayout.LayoutParams(
+                                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                                            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                                        )
+                                    )
+                                    onRefresh = {
+                                        val u = wv.url
+                                        if (u != null && !u.startsWith("about:")) wv.reload() else endRefresh()
+                                    }
+                                    refreshLayouts[tab.id] = this
+                                }
+                            },
+                            update = { layout ->
+                                layout.visibility = if (isCurrent) android.view.View.VISIBLE else android.view.View.INVISIBLE
+                                webViews[tab.id]?.let { wv ->
+                                    if (isCurrent) wv.onResume() else wv.onPause()
+                                }
                             }
                         )
                         DisposableEffect(tab.id) {
                             onDispose {
+                                refreshLayouts.remove(tab.id)
                                 webViews.remove(tab.id)?.let { wv ->
                                     wv.stopLoading()
                                     (wv.parent as? android.view.ViewGroup)?.removeView(wv)
@@ -887,6 +1045,9 @@ private fun SwiftBrowserApp() {
                         onNewTabInGroup = { newTabInGroup(it) },
                         openGroupRequest = pendingOpenGroup,
                         onOpenGroupConsumed = { pendingOpenGroup = null },
+                        editGroupRequest = pendingEditGroup,
+                        onEditConsumed = { pendingEditGroup = null },
+                        onSearchWeb = { load(it) },
                         onSelect = { selectTab(it) },
                         onClose = { closeTab(it) },
                         onNew = { newTab() },
@@ -933,8 +1094,7 @@ private fun SwiftBrowserApp() {
                     IconButton(
                         onClick = {
                             captureThumb(activeId)
-                            pendingOpenGroup = activeGid
-                            showTabs = true
+                            showGroupSheet = true
                             keyboardController?.hide()
                             focusManager.clearFocus()
                         },
@@ -1066,6 +1226,46 @@ private fun SwiftBrowserApp() {
                 SettingsMenuBox()
             }
             }
+        }
+
+        // Brave: the group's tabs open as a popup right over the page.
+        val sheetGid = tabGroups[activeId]
+        if (showGroupSheet && !showTabs && sheetGid != null) {
+            val members = tabs.filter { tabGroups[it.id] == sheetGid }
+            GroupPopupOverlay(
+                entry = TabEntry(sheetGid, true, members),
+                activeId = activeId,
+                label = groupLabel(groupNames, sheetGid, members.size),
+                color = groupColorOf(sheetGid),
+                onDismiss = { showGroupSheet = false },
+                onNewTab = { showGroupSheet = false; newTabInGroup(sheetGid) },
+                onEdit = { editGroupKey = sheetGid },
+                onUngroup = { showGroupSheet = false; handleDropOutside(sheetGid) },
+                onCloseGroup = {
+                    showGroupSheet = false
+                    members.toList().forEach { closeTab(it, false) }
+                },
+                onSelect = { showGroupSheet = false; selectTab(it) },
+                onCloseTab = { closeTab(it, false) },
+                onRemoveFromGroup = { handleDropOutside(it.id) }
+            )
+        }
+        editGroupKey?.let { gk ->
+            GroupEditDialog(
+                key = gk,
+                initialName = groupNames[gk] ?: "",
+                onSave = { name ->
+                    if (name.isBlank()) {
+                        groupNames.remove(gk)
+                    } else {
+                        groupNames[gk] = name
+                    }
+                    groupUpdated[gk] = System.currentTimeMillis()
+                    editGroupKey = null
+                },
+                onDismiss = { editGroupKey = null }
+            )
+        }
         }
     }
 }
@@ -1602,8 +1802,8 @@ private fun SingleTabCard(
     }
 }
 
-// Brave-style group card: pastel colored card, circle + "N tabs" + 3-dot menu,
-// and a 2x2 grid of mini tab previews (empty slots are tinted blocks).
+// Brave-style group card: dark card tinted with the group's color, colored dot +
+// name + menu, and a 2x2 grid of large page thumbnails.
 @Composable
 private fun GroupCard(
     entry: TabEntry,
@@ -1622,35 +1822,35 @@ private fun GroupCard(
     Column(
         modifier
             .fillMaxSize()
-            .clip(RoundedCornerShape(22.dp))
-            .background(color)
+            .clip(RoundedCornerShape(20.dp))
+            .background(groupTint(color))
             .then(
-                if (hovered) Modifier.border(2.dp, Color.White, RoundedCornerShape(22.dp)) else Modifier
+                if (hovered) Modifier.border(2.dp, Color.White, RoundedCornerShape(20.dp)) else Modifier
             )
             .clickable { onOpen() }
-            .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 12.dp)
+            .padding(start = 8.dp, end = 8.dp, top = 2.dp, bottom = 8.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier.size(24.dp).clip(CircleShape).background(Color(0xFFEEF0F6))
-            )
-            Spacer(Modifier.width(10.dp))
+        Row(Modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically) {
+            Spacer(Modifier.width(4.dp))
+            Box(Modifier.size(20.dp).clip(CircleShape).background(color))
+            Spacer(Modifier.width(9.dp))
             Text(
                 name,
-                color = GroupInk, fontSize = 19.sp,
+                color = TextMain, fontSize = 17.sp,
                 fontWeight = FontWeight.SemiBold, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
             Box {
-                IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(40.dp)) {
-                    Icon(Icons.Default.MoreVert, "Group options", tint = GroupInk, modifier = Modifier.size(20.dp))
+                IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(36.dp)) {
+                    Icon(Icons.Default.MoreVert, "Group options", tint = TextMain, modifier = Modifier.size(20.dp))
                 }
                 DropdownMenu(
                     expanded = menuOpen,
                     onDismissRequest = { menuOpen = false },
                     modifier = Modifier.background(Surface)
                 ) {
-                    BrowserMenuItem("Rename", Icons.Default.Edit) {
+                    BrowserMenuItem("Edit group", Icons.Default.Edit) {
                         menuOpen = false
                         onRename()
                     }
@@ -1665,15 +1865,14 @@ private fun GroupCard(
                 }
             }
         }
-        Spacer(Modifier.height(4.dp))
         Column(
-            Modifier.weight(1f).fillMaxWidth().padding(end = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            Modifier.weight(1f).fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
             repeat(2) { row ->
                 Row(
                     Modifier.weight(1f).fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     repeat(2) { col ->
                         val idx = row * 2 + col
@@ -1688,11 +1887,11 @@ private fun GroupCard(
                             Box(
                                 Modifier.weight(1f).fillMaxHeight()
                                     .clip(RoundedCornerShape(10.dp))
-                                    .background(if (overflow) Color(0xFF23262C) else Color(0x33FFFFFF)),
+                                    .background(Color(0x59000000)),
                                 contentAlignment = Alignment.Center
                             ) {
                                 if (overflow) {
-                                    Text("+${count - 3}", color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                    Text("+${count - 3}", color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
                                 }
                             }
                         }
@@ -1720,7 +1919,10 @@ private fun TabSwitcher(
     onRenameGroup: (Long, String) -> Unit,
     onNewTabInGroup: (Long) -> Unit,
     openGroupRequest: Long?,
-    onOpenGroupConsumed: () -> Unit
+    onOpenGroupConsumed: () -> Unit,
+    editGroupRequest: Long?,
+    onEditConsumed: () -> Unit,
+    onSearchWeb: (String) -> Unit
 ) {
     var query by remember { mutableStateOf("") }
     var openGroupKey by remember { mutableStateOf(openGroupRequest) }
@@ -1729,6 +1931,14 @@ private fun TabSwitcher(
     val settleAnim = remember { Animatable(0f) }
     val scope = rememberCoroutineScope()
     LaunchedEffect(Unit) { onOpenGroupConsumed() }
+    var searching by remember { mutableStateOf(false) }
+    // A freshly created group asks for its name and color (like Brave).
+    LaunchedEffect(editGroupRequest) {
+        if (editGroupRequest != null) {
+            renameKey = editGroupRequest
+            onEditConsumed()
+        }
+    }
     var section by remember { mutableIntStateOf(0) } // 0 = tabs, 1 = groups
     var dragKey by remember { mutableStateOf<Long?>(null) }
     var dragPos by remember { mutableStateOf(Offset.Zero) }
@@ -1753,9 +1963,7 @@ private fun TabSwitcher(
     }
 
     val sectionEntries = if (section == 1) entries.filter { it.isGroup } else entries
-    val filtered = if (query.isBlank()) sectionEntries else sectionEntries.filter { e ->
-        e.tabs.any { it.title.contains(query, true) || it.url.contains(query, true) }
-    }
+    val filtered = sectionEntries
 
     val openEntry = openGroupKey?.let { k -> entries.firstOrNull { it.key == k && it.isGroup } }
 
@@ -1790,7 +1998,7 @@ private fun TabSwitcher(
         return best
     }
 
-    fun groupColorFor(key: Long): Color = GroupColors[(key % GroupColors.size).toInt()]
+    fun groupColorFor(key: Long): Color = groupColorOf(key)
 
     // ---------- Main tab grid ----------
     Box(Modifier.fillMaxSize()) {
@@ -1836,7 +2044,7 @@ private fun TabSwitcher(
             }
         }
 
-        // "Search your tabs" — filters the OPEN TABS only, never searches the web.
+        // "Search your tabs" opens a full search screen (tabs list + web search), like Brave.
         Row(
             Modifier
                 .fillMaxWidth()
@@ -1845,29 +2053,13 @@ private fun TabSwitcher(
                 .height(46.dp)
                 .clip(RoundedCornerShape(24.dp))
                 .background(Surface2)
+                .clickable { searching = true }
                 .padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(Icons.Default.Tab, null, tint = TextMuted, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(9.dp))
-            BasicTextField(
-                value = query,
-                onValueChange = { query = it },
-                modifier = Modifier.weight(1f),
-                singleLine = true,
-                textStyle = TextStyle(color = TextMain, fontSize = 13.sp),
-                decorationBox = { inner ->
-                    if (query.isEmpty()) {
-                        Text("Search your tabs", color = TextMuted, fontSize = 13.sp)
-                    }
-                    inner()
-                }
-            )
-            if (query.isNotEmpty()) {
-                IconButton(onClick = { query = "" }, modifier = Modifier.size(30.dp)) {
-                    Icon(Icons.Default.Close, "Clear search", tint = TextMuted, modifier = Modifier.size(16.dp))
-                }
-            }
+            Text("Search your tabs", color = TextMuted, fontSize = 13.sp)
         }
 
         Box(Modifier.weight(1f).fillMaxWidth().onGloballyPositioned { gridTopLeft = it.positionInRoot() }) {
@@ -1989,7 +2181,7 @@ private fun TabSwitcher(
             if (filtered.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(
-                        if (query.isBlank()) "No tab groups yet" else "No tabs match \"$query\"",
+                        "No tab groups yet",
                         color = TextMuted, fontSize = 13.sp
                     )
                 }
@@ -2053,129 +2245,403 @@ private fun TabSwitcher(
 
     // ---------- Group popup (Brave: a small sheet over the dimmed grid) ----------
     if (openEntry != null) {
-        val gColor = groupColorFor(openEntry.key)
-        var popupMenu by remember { mutableStateOf(false) }
-        val label = groupLabel(groupNames, openEntry.key, openEntry.tabs.size)
-        Box(
-            Modifier.fillMaxSize()
-                .background(Color(0xB3000000))
-                .pointerInput(Unit) { detectTapGestures(onTap = { openGroupKey = null }) }
+        GroupPopupOverlay(
+            entry = openEntry,
+            activeId = activeId,
+            label = groupLabel(groupNames, openEntry.key, openEntry.tabs.size),
+            color = groupColorFor(openEntry.key),
+            onDismiss = { openGroupKey = null },
+            onNewTab = { onNewTabInGroup(openEntry.key) },
+            onEdit = { renameKey = openEntry.key },
+            onUngroup = { onDropOutside(openEntry.key) },
+            onCloseGroup = { openEntry.tabs.toList().forEach { onClose(it) } },
+            onSelect = onSelect,
+            onCloseTab = onClose,
+            onRemoveFromGroup = { onDropOutside(it.id) }
+        )
+    }
+
+    // ---------- Search screen: matching tabs list + web search ----------
+    if (searching) {
+        BackHandler { searching = false }
+        TabSearchScreen(
+            tabs = tabs,
+            groups = groups,
+            groupNames = groupNames,
+            onBack = { searching = false },
+            onSelectTab = { onSelect(it) },
+            onOpenGroup = { searching = false; openGroupKey = it },
+            onSearchWeb = onSearchWeb
+        )
+    }
+
+    renameKey?.let { rk ->
+        GroupEditDialog(
+            key = rk,
+            initialName = groupNames[rk] ?: "",
+            onSave = { name -> onRenameGroup(rk, name); renameKey = null },
+            onDismiss = { renameKey = null }
+        )
+    }
+    }
+}
+
+// The group's tabs as a rounded popup over a dimmed screen. Used both in the
+// tab overview and directly over a web page (from the group bar).
+@Composable
+private fun GroupPopupOverlay(
+    entry: TabEntry,
+    activeId: Long,
+    label: String,
+    color: Color,
+    onDismiss: () -> Unit,
+    onNewTab: () -> Unit,
+    onEdit: () -> Unit,
+    onUngroup: () -> Unit,
+    onCloseGroup: () -> Unit,
+    onSelect: (BrowserTab) -> Unit,
+    onCloseTab: (BrowserTab) -> Unit,
+    onRemoveFromGroup: (BrowserTab) -> Unit
+) {
+    var popupMenu by remember { mutableStateOf(false) }
+    Box(
+        Modifier.fillMaxSize()
+            .background(Color(0xB3000000))
+            .pointerInput(Unit) { detectTapGestures(onTap = { onDismiss() }) }
+    ) {
+        androidx.compose.animation.AnimatedVisibility(
+            visibleState = remember { MutableTransitionState(false).apply { targetState = true } },
+            enter = fadeIn(tween(140)) + scaleIn(initialScale = 0.92f, animationSpec = tween(170)),
+            modifier = Modifier.align(Alignment.Center)
         ) {
-            androidx.compose.animation.AnimatedVisibility(
-                visibleState = remember { MutableTransitionState(false).apply { targetState = true } },
-                enter = fadeIn(tween(140)) + scaleIn(initialScale = 0.92f, animationSpec = tween(170)),
-                modifier = Modifier.align(Alignment.Center)
+            Column(
+                Modifier
+                    .padding(horizontal = 16.dp)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(30.dp))
+                    .background(Color(0xFF202226))
+                    .pointerInput(Unit) { detectTapGestures(onTap = {}) }
+                    .padding(top = 8.dp, bottom = 12.dp)
             ) {
-                Column(
-                    Modifier
-                        .padding(horizontal = 16.dp)
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(30.dp))
-                        .background(Color(0xFF202226))
-                        .pointerInput(Unit) { detectTapGestures(onTap = {}) }
-                        .padding(top = 8.dp, bottom = 12.dp)
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(onClick = { openGroupKey = null }) {
-                            Icon(Icons.Default.ArrowBack, "Back", tint = TextMain)
-                        }
-                        Box(Modifier.size(22.dp).clip(CircleShape).background(gColor))
-                        Spacer(Modifier.width(12.dp))
-                        Text(
-                            label,
-                            color = TextMain, fontSize = 22.sp, maxLines = 1,
-                            modifier = Modifier
-                                .weight(1f)
-                                .clickable { renameKey = openEntry.key }
-                                .drawBehind {
-                                    drawLine(
-                                        TextMuted,
-                                        Offset(0f, size.height),
-                                        Offset(size.width, size.height),
-                                        1.dp.toPx()
-                                    )
-                                }
-                                .padding(vertical = 4.dp)
-                        )
-                        IconButton(onClick = { onNewTabInGroup(openEntry.key) }) {
-                            Icon(Icons.Default.Add, "New tab in group", tint = TextMain)
-                        }
-                        Box {
-                            IconButton(onClick = { popupMenu = true }) {
-                                Icon(Icons.Default.MoreVert, "Group options", tint = TextMain)
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.ArrowBack, "Back", tint = TextMain)
+                    }
+                    Box(Modifier.size(22.dp).clip(CircleShape).background(color))
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        label,
+                        color = TextMain, fontSize = 22.sp, maxLines = 1,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { onEdit() }
+                            .drawBehind {
+                                drawLine(
+                                    TextMuted,
+                                    Offset(0f, size.height),
+                                    Offset(size.width, size.height),
+                                    1.dp.toPx()
+                                )
                             }
-                            DropdownMenu(
-                                expanded = popupMenu,
-                                onDismissRequest = { popupMenu = false },
-                                modifier = Modifier.background(Surface)
-                            ) {
-                                BrowserMenuItem("Rename", Icons.Default.Edit) {
-                                    popupMenu = false
-                                    renameKey = openEntry.key
-                                }
-                                BrowserMenuItem("Ungroup", Icons.Default.FolderOff) {
-                                    popupMenu = false
-                                    onDropOutside(openEntry.key)
-                                }
-                                BrowserMenuItem("Close group", Icons.Default.Close) {
-                                    popupMenu = false
-                                    openEntry.tabs.toList().forEach { onClose(it) }
-                                }
+                            .padding(vertical = 4.dp)
+                    )
+                    IconButton(onClick = onNewTab) {
+                        Icon(Icons.Default.Add, "New tab in group", tint = TextMain)
+                    }
+                    Box {
+                        IconButton(onClick = { popupMenu = true }) {
+                            Icon(Icons.Default.MoreVert, "Group options", tint = TextMain)
+                        }
+                        DropdownMenu(
+                            expanded = popupMenu,
+                            onDismissRequest = { popupMenu = false },
+                            modifier = Modifier.background(Surface)
+                        ) {
+                            BrowserMenuItem("Edit group", Icons.Default.Edit) {
+                                popupMenu = false
+                                onEdit()
+                            }
+                            BrowserMenuItem("Ungroup", Icons.Default.FolderOff) {
+                                popupMenu = false
+                                onUngroup()
+                            }
+                            BrowserMenuItem("Close group", Icons.Default.Close) {
+                                popupMenu = false
+                                onCloseGroup()
                             }
                         }
                     }
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(2),
-                        modifier = Modifier.heightIn(max = 520.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
-                    ) {
-                        gridItems(openEntry.tabs, key = { it.id }) { tab ->
-                            Box(Modifier.fillMaxWidth().height(176.dp)) {
-                                SingleTabCard(
-                                    tab = tab,
-                                    isActive = tab.id == activeId,
-                                    hovered = false,
-                                    ringColor = gColor,
-                                    onSelect = { onSelect(tab) },
-                                    onClose = { onClose(tab) },
-                                    onRemoveFromGroup = { onDropOutside(tab.id) },
-                                    showActiveLabel = false
-                                )
-                            }
+                }
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(2),
+                    modifier = Modifier.heightIn(max = 520.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                ) {
+                    gridItems(entry.tabs, key = { it.id }) { tab ->
+                        Box(Modifier.fillMaxWidth().height(176.dp)) {
+                            SingleTabCard(
+                                tab = tab,
+                                isActive = tab.id == activeId,
+                                hovered = false,
+                                ringColor = color,
+                                onSelect = { onSelect(tab) },
+                                onClose = { onCloseTab(tab) },
+                                onRemoveFromGroup = { onRemoveFromGroup(tab) },
+                                showActiveLabel = false
+                            )
                         }
                     }
                 }
             }
         }
     }
+}
 
-    renameKey?.let { rk ->
-        var text by remember(rk) { mutableStateOf(groupNames[rk] ?: "") }
-        AlertDialog(
-            onDismissRequest = { renameKey = null },
-            containerColor = Surface,
-            title = { Text("Rename group", color = TextMain) },
-            text = {
+// Name + color picker for a group (opens when a group is created or edited).
+@Composable
+private fun GroupEditDialog(
+    key: Long,
+    initialName: String,
+    onSave: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var text by remember(key) { mutableStateOf(initialName) }
+    var selected by remember(key) {
+        mutableIntStateOf(GroupColorStore[key] ?: (key % GroupColors.size).toInt())
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Surface,
+        title = { Text("Edit group", color = TextMain) },
+        text = {
+            Column {
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it },
                     singleLine = true,
                     placeholder = { Text("Group name") }
                 )
-            },
-            confirmButton = {
-                TextButton(onClick = { onRenameGroup(rk, text.trim()); renameKey = null }) { Text("Save") }
-            },
-            dismissButton = {
-                TextButton(onClick = { renameKey = null }) { Text("Cancel") }
+                Spacer(Modifier.height(16.dp))
+                Text("Color", color = TextMuted, fontSize = 12.sp)
+                Spacer(Modifier.height(8.dp))
+                GroupColors.indices.chunked(5).forEach { rowIdx ->
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.padding(bottom = 10.dp)
+                    ) {
+                        rowIdx.forEach { i ->
+                            Box(
+                                Modifier.size(34.dp).clip(CircleShape)
+                                    .background(GroupColors[i])
+                                    .clickable { selected = i },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (selected == i) {
+                                    Icon(Icons.Default.Check, null, tint = GroupInk, modifier = Modifier.size(18.dp))
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        )
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                GroupColorStore[key] = selected
+                onSave(text.trim())
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+private fun highlight(text: String, term: String): androidx.compose.ui.text.AnnotatedString =
+    buildAnnotatedString {
+        val i = if (term.isEmpty()) -1 else text.indexOf(term, ignoreCase = true)
+        if (i < 0) {
+            append(text)
+        } else {
+            append(text.substring(0, i))
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(text.substring(i, i + term.length)) }
+            append(text.substring(i + term.length))
+        }
     }
+
+private fun suggestionText(s: String, term: String): androidx.compose.ui.text.AnnotatedString =
+    buildAnnotatedString {
+        if (s.startsWith(term, ignoreCase = true)) {
+            append(s.substring(0, term.length))
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(s.substring(term.length)) }
+        } else {
+            append(s)
+        }
+    }
+
+// Search-engine suggestions for the typed text (best effort; empty on any failure).
+private fun fetchSuggestions(q: String): List<String> = runCatching {
+    val url = java.net.URL("https://search.brave.com/api/suggest?q=" + Uri.encode(q) + "&rich=false")
+    val conn = url.openConnection() as java.net.HttpURLConnection
+    conn.connectTimeout = 3000
+    conn.readTimeout = 3000
+    conn.setRequestProperty("Accept", "application/json")
+    val body = conn.inputStream.bufferedReader().use { it.readText() }
+    val list = org.json.JSONArray(body).optJSONArray(1) ?: return@runCatching emptyList<String>()
+    (0 until list.length()).map { list.optString(it) }
+        .filter { it.isNotBlank() && !it.equals(q, ignoreCase = true) }
+        .take(5)
+}.getOrDefault(emptyList())
+
+@Composable
+private fun SearchResultRow(
+    onClick: () -> Unit,
+    leading: @Composable () -> Unit,
+    title: androidx.compose.ui.text.AnnotatedString,
+    subtitle: androidx.compose.ui.text.AnnotatedString? = null
+) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) { leading() }
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                title, color = TextMain, fontSize = 17.sp, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+            )
+            if (subtitle != null) {
+                Text(
+                    subtitle, color = Color(0xFFA9B4FF), fontSize = 13.sp, maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+// Brave-style tab search: a list of matching tabs/groups, then web search entries.
+@Composable
+private fun TabSearchScreen(
+    tabs: List<BrowserTab>,
+    groups: Map<Long, Long>,
+    groupNames: Map<Long, String>,
+    onBack: () -> Unit,
+    onSelectTab: (BrowserTab) -> Unit,
+    onOpenGroup: (Long) -> Unit,
+    onSearchWeb: (String) -> Unit
+) {
+    var q by remember { mutableStateOf("") }
+    var suggestions by remember { mutableStateOf<List<String>>(emptyList()) }
+    val focus = remember { androidx.compose.ui.focus.FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+    LaunchedEffect(q) {
+        suggestions = emptyList()
+        if (q.isNotBlank()) {
+            delay(220)
+            suggestions = withContext(Dispatchers.IO) { fetchSuggestions(q.trim()) }
+        }
+    }
+    val term = q.trim()
+    val tabMatches = if (term.isEmpty()) emptyList() else tabs.filter {
+        it.title.contains(term, true) || it.url.contains(term, true)
+    }
+    val groupMatches = if (term.isEmpty()) emptyList() else tabs.mapNotNull { groups[it.id] }.distinct()
+        .filter { gid -> groupNames[gid]?.contains(term, true) == true }
+    val cardBg = Color(0xFF1B1D21)
+
+    Column(
+        Modifier.fillMaxSize()
+            .background(Color(0xFF25282E))
+            .pointerInput(Unit) { detectTapGestures(onTap = {}) }
+            .padding(horizontal = 12.dp)
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 10.dp).height(52.dp)
+                .clip(RoundedCornerShape(26.dp)).background(Color(0xFF15171A)).padding(horizontal = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Back", tint = TextMain) }
+            BasicTextField(
+                value = q,
+                onValueChange = { q = it },
+                modifier = Modifier.weight(1f).focusRequester(focus),
+                singleLine = true,
+                textStyle = TextStyle(color = TextMain, fontSize = 18.sp),
+                cursorBrush = androidx.compose.ui.graphics.SolidColor(Accent),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { if (term.isNotEmpty()) onSearchWeb(term) })
+            )
+            if (q.isNotEmpty()) {
+                IconButton(onClick = { q = "" }) { Icon(Icons.Default.Close, "Clear", tint = TextMain) }
+            }
+        }
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 16.dp)) {
+            if (tabMatches.isNotEmpty() || groupMatches.isNotEmpty()) {
+                item {
+                    Text(
+                        "Tabs and tab groups", color = TextMuted, fontSize = 15.sp,
+                        modifier = Modifier.padding(start = 8.dp, top = 8.dp, bottom = 8.dp)
+                    )
+                }
+                item {
+                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(cardBg)) {
+                        groupMatches.forEach { gid ->
+                            val count = tabs.count { groups[it.id] == gid }
+                            SearchResultRow(
+                                onClick = { onOpenGroup(gid) },
+                                leading = {
+                                    Box(Modifier.size(22.dp).clip(CircleShape).background(groupColorOf(gid)))
+                                },
+                                title = highlight(groupLabel(groupNames, gid, count), term),
+                                subtitle = buildAnnotatedString { append(if (count == 1) "1 tab" else "$count tabs") }
+                            )
+                        }
+                        tabMatches.forEach { t ->
+                            val label = when {
+                                t.url == "swift://home" -> "New tab"
+                                t.title.isBlank() -> hostOf(t.url)
+                                else -> t.title
+                            }
+                            SearchResultRow(
+                                onClick = { onSelectTab(t) },
+                                leading = { SiteBadge(t, 32.dp) },
+                                title = highlight(label, term),
+                                subtitle = highlight(prettyAddress(t.url), term)
+                            )
+                        }
+                    }
+                }
+            }
+            if (term.isNotEmpty()) {
+                item {
+                    Text(
+                        "Search the web", color = TextMuted, fontSize = 15.sp,
+                        modifier = Modifier.padding(start = 8.dp, top = 16.dp, bottom = 8.dp)
+                    )
+                }
+                item {
+                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(cardBg)) {
+                        SearchResultRow(
+                            onClick = { onSearchWeb(term) },
+                            leading = { Icon(Icons.Default.Search, null, tint = TextMain, modifier = Modifier.size(26.dp)) },
+                            title = buildAnnotatedString { append(term) }
+                        )
+                        suggestions.forEach { s ->
+                            SearchResultRow(
+                                onClick = { onSearchWeb(s) },
+                                leading = { Icon(Icons.Default.Search, null, tint = TextMain, modifier = Modifier.size(26.dp)) },
+                                title = suggestionText(s, term)
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2253,7 +2719,11 @@ private fun ToolbarButton(
 
 private data class Settle(val source: Long, val target: Long, val from: Offset, val to: Offset)
 
-private fun groupColorOf(key: Long): Color = GroupColors[(key % GroupColors.size).toInt()]
+private fun groupColorOf(key: Long): Color =
+    GroupColors[(GroupColorStore[key] ?: (key % GroupColors.size).toInt()).coerceIn(0, GroupColors.size - 1)]
+
+// Dark card background tinted with the group's color (Brave style).
+private fun groupTint(c: Color): Color = lerp(Color(0xFF16181C), c, 0.34f)
 
 private fun groupLabel(names: Map<Long, String>, key: Long, count: Int): String =
     names[key]?.takeIf { it.isNotBlank() } ?: if (count == 1) "1 tab" else "$count tabs"
@@ -2448,6 +2918,15 @@ private fun PagePreview(
                 alignment = Alignment.TopCenter,
                 modifier = Modifier.fillMaxSize()
             )
+            if (compact) {
+                Box(
+                    Modifier.align(Alignment.TopStart).padding(4.dp).size(22.dp)
+                        .clip(CircleShape).background(Color(0xCC1A1C20)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    SiteBadge(tab, 15.dp)
+                }
+            }
         } else {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
