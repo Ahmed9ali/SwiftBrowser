@@ -401,6 +401,7 @@ private fun SwiftBrowserApp() {
     var pendingOpenGroup by remember { mutableStateOf<Long?>(null) }
     var pendingEditGroup by remember { mutableStateOf<Long?>(null) }
     var showGroupSheet by remember { mutableStateOf(false) }
+    var confirmCloseAll by remember { mutableStateOf(false) }
     var editGroupKey by remember { mutableStateOf<Long?>(null) }
     var groupCounter by remember { mutableLongStateOf(session?.groupCounter ?: (GROUP_ID_BASE + 1)) }
     // One WebView per tab: pages, history and network errors never leak between tabs.
@@ -962,8 +963,8 @@ private fun SwiftBrowserApp() {
                 }
             } else {
                 ToolbarButton(
-                    Icons.Default.Settings,
-                    "Settings",
+                    Icons.Default.MoreVert,
+                    "Menu",
                     selected = showMenu
                 ) {
                     showMenu = true
@@ -1009,7 +1010,7 @@ private fun SwiftBrowserApp() {
                     }
                     BrowserMenuItem("Close all tabs", Icons.Default.DeleteSweep) {
                         showMenu = false
-                        closeAllTabs()
+                        confirmCloseAll = true
                     }
                 }
                 BrowserMenuItem("Bookmarks", Icons.Default.Bookmark) {
@@ -1261,7 +1262,16 @@ private fun SwiftBrowserApp() {
                     exit = fadeOut(tween(100)),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    Box(Modifier.fillMaxSize().background(Color(0x73000000)))
+                    Box(
+                        Modifier.fillMaxSize()
+                            .background(Color(0x73000000))
+                            .pointerInput(Unit) {
+                                detectTapGestures(onTap = {
+                                    keyboardController?.hide()
+                                    focusManager.clearFocus()
+                                })
+                            }
+                    )
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
@@ -1344,7 +1354,7 @@ private fun SwiftBrowserApp() {
                         onGroup = { source, target -> handleGroupDrop(source, target) },
                         onDropOutside = { handleDropOutside(it) },
                         onGroupAll = { groupAllTabs() },
-                        onCloseAll = { closeAllTabs() }
+                        onCloseAll = { confirmCloseAll = true }
                     )
                 }
 
@@ -1378,7 +1388,7 @@ private fun SwiftBrowserApp() {
                 val members = tabs.filter { tabGroups[it.id] == activeGid }
                 val gColor = groupColorOf(activeGid)
                 Row(
-                    Modifier.fillMaxWidth().background(Bg).padding(horizontal = 6.dp, vertical = 2.dp),
+                    Modifier.fillMaxWidth().background(Bg).padding(horizontal = 6.dp, vertical = 1.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(
@@ -1388,9 +1398,9 @@ private fun SwiftBrowserApp() {
                             keyboardController?.hide()
                             focusManager.clearFocus()
                         },
-                        modifier = Modifier.size(34.dp)
+                        modifier = Modifier.size(28.dp)
                     ) {
-                        Icon(Icons.Default.KeyboardArrowUp, "Open group", tint = TextMain)
+                        Icon(Icons.Default.KeyboardArrowUp, "Open group", tint = TextMain, modifier = Modifier.size(20.dp))
                     }
                     Row(
                         Modifier.weight(1f).horizontalScroll(rememberScrollState())
@@ -1400,24 +1410,24 @@ private fun SwiftBrowserApp() {
                     ) {
                         members.forEach { m ->
                             val isActive = m.id == activeId
-                            Box(Modifier.size(40.dp)) {
+                            Box(Modifier.size(32.dp)) {
                                 Box(
-                                    Modifier.align(Alignment.Center).size(34.dp).clip(CircleShape)
+                                    Modifier.align(Alignment.Center).size(26.dp).clip(CircleShape)
                                         .background(Surface2)
                                         .then(if (isActive) Modifier.border(2.dp, gColor, CircleShape) else Modifier)
                                         .clickable { if (!isActive) selectTab(m) },
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    SiteBadge(m, 20.dp)
+                                    SiteBadge(m, 16.dp)
                                 }
                                 if (isActive) {
                                     Box(
-                                        Modifier.align(Alignment.TopEnd).size(15.dp).clip(CircleShape)
+                                        Modifier.align(Alignment.TopEnd).size(13.dp).clip(CircleShape)
                                             .background(gColor)
                                             .clickable { closeTab(m, false) },
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        Icon(Icons.Default.Close, "Close tab", tint = GroupInk, modifier = Modifier.size(10.dp))
+                                        Icon(Icons.Default.Close, "Close tab", tint = GroupInk, modifier = Modifier.size(9.dp))
                                     }
                                 }
                             }
@@ -1425,9 +1435,9 @@ private fun SwiftBrowserApp() {
                     }
                     IconButton(
                         onClick = { newTabInGroup(activeGid) },
-                        modifier = Modifier.size(34.dp).border(1.5.dp, TextMuted, CircleShape)
+                        modifier = Modifier.size(26.dp).border(1.dp, TextMuted, CircleShape)
                     ) {
-                        Icon(Icons.Default.Add, "New tab in group", tint = TextMain)
+                        Icon(Icons.Default.Add, "New tab in group", tint = TextMain, modifier = Modifier.size(16.dp))
                     }
                 }
             }
@@ -1439,7 +1449,7 @@ private fun SwiftBrowserApp() {
                     Modifier
                         .fillMaxWidth()
                         .background(Surface)
-                        .padding(horizontal = 12.dp, vertical = 9.dp)
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
                 ) {
                     // Brave-style "+" pill: light background, dark icon.
                     Row(
@@ -1448,10 +1458,10 @@ private fun SwiftBrowserApp() {
                             .clip(RoundedCornerShape(22.dp))
                             .background(Color(0xFFE8E8EC))
                             .clickable { newTab() }
-                            .padding(horizontal = 18.dp, vertical = 10.dp),
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.Add, "New tab", tint = Color(0xFF16181C), modifier = Modifier.size(22.dp))
+                        Icon(Icons.Default.Add, "New tab", tint = Color(0xFF16181C), modifier = Modifier.size(20.dp))
                     }
                     Box(Modifier.align(Alignment.CenterEnd)) {
                         SettingsMenuBox(dots = true)
@@ -1462,7 +1472,7 @@ private fun SwiftBrowserApp() {
                 Modifier
                     .fillMaxWidth()
                     .background(Surface)
-                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                    .padding(horizontal = 12.dp, vertical = 2.dp),
                 horizontalArrangement = Arrangement.SpaceAround,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1499,11 +1509,7 @@ private fun SwiftBrowserApp() {
                 }
 
                 // TABS
-                ToolbarButton(
-                    Icons.Default.Tab,
-                    "${tabs.size} tabs",
-                    selected = showTabs
-                ) {
+                TabCountButton(tabs.size, showTabs) {
                     if (!showTabs) captureThumb(activeId)
                     showTabs = !showTabs
                     showShield = false
@@ -1538,6 +1544,28 @@ private fun SwiftBrowserApp() {
                 onSelect = { showGroupSheet = false; selectTab(it) },
                 onCloseTab = { closeTab(it, false) },
                 onRemoveFromGroup = { handleDropOutside(it.id) }
+            )
+        }
+        if (confirmCloseAll) {
+            AlertDialog(
+                onDismissRequest = { confirmCloseAll = false },
+                containerColor = Surface,
+                title = { Text("Close all tabs?", color = TextMain) },
+                text = {
+                    Text(
+                        "You are about to close all ${tabs.size} open tabs. This can't be undone.",
+                        color = TextMuted
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        confirmCloseAll = false
+                        closeAllTabs()
+                    }) { Text("OK", color = Accent) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmCloseAll = false }) { Text("Cancel", color = TextMain) }
+                }
             )
         }
         editGroupKey?.let { gk ->
@@ -2991,19 +3019,41 @@ private fun ToolbarButton(
     selected: Boolean = false,
     onClick: () -> Unit
 ) {
-    Column(
-        Modifier.clip(RoundedCornerShape(11.dp))
+    Box(
+        Modifier.clip(RoundedCornerShape(14.dp))
             .background(if (selected) AccentSoft else Color.Transparent)
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center
     ) {
         Icon(
             icon, contentDescription = label,
             tint = if (enabled) (if (selected) Accent else TextMain) else TextMuted.copy(alpha = .35f),
-            modifier = Modifier.size(21.dp)
+            modifier = Modifier.size(24.dp)
         )
-        Text(label, color = if (selected) Accent else TextMuted, fontSize = 9.sp, maxLines = 1)
+    }
+}
+
+// Tabs button: a rounded box with the number of open tabs (like Brave).
+@Composable
+private fun TabCountButton(count: Int, selected: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier.clip(RoundedCornerShape(14.dp))
+            .background(if (selected) AccentSoft else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            Modifier.size(22.dp).border(2.dp, if (selected) Accent else TextMain, RoundedCornerShape(6.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                if (count > 99) ":D" else count.toString(),
+                color = if (selected) Accent else TextMain,
+                fontSize = 11.sp, fontWeight = FontWeight.Bold
+            )
+        }
     }
 }
 
