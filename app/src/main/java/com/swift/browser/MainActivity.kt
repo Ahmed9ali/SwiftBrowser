@@ -1420,7 +1420,18 @@ private fun SwiftBrowserApp() {
                                         .clickable { if (!isActive) selectTab(m) },
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    SiteBadge(m, 22.dp)
+                                    if (m.url == "swift://home" || hostOf(m.url).isEmpty()) {
+                                        SiteBadge(m, 22.dp)
+                                    } else {
+                                        // White disc behind the icon (like Brave) so dark
+                                        // logos stay visible on the dark theme.
+                                        Box(
+                                            Modifier.size(26.dp).clip(CircleShape).background(Color.White),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            SiteBadge(m, 17.dp)
+                                        }
+                                    }
                                 }
                                 if (isActive) {
                                     Box(
@@ -1436,7 +1447,7 @@ private fun SwiftBrowserApp() {
                         }
                     }
                     Box(
-                        Modifier.size(40.dp).clip(CircleShape)
+                        Modifier.size(34.dp).clip(CircleShape)
                             .border(1.5.dp, TextMuted, CircleShape)
                             .clickable { newTabInGroup(activeGid) },
                         contentAlignment = Alignment.Center
