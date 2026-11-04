@@ -1387,57 +1387,61 @@ private fun SwiftBrowserApp() {
             if (!showTabs && activeGid != null) {
                 val members = tabs.filter { tabGroups[it.id] == activeGid }
                 val gColor = groupColorOf(activeGid)
+                // Plain boxes (not IconButton) so sizes are exact: IconButton
+                // inflates itself to a 48dp touch target and distorts the bar.
                 Row(
-                    Modifier.fillMaxWidth().background(Bg).padding(horizontal = 6.dp, vertical = 1.dp),
+                    Modifier.fillMaxWidth().height(52.dp).background(Bg)
+                        .padding(start = 8.dp, end = 14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(
-                        onClick = {
+                    Box(
+                        Modifier.size(40.dp).clip(CircleShape).clickable {
                             captureThumb(activeId)
                             showGroupSheet = true
                             keyboardController?.hide()
                             focusManager.clearFocus()
                         },
-                        modifier = Modifier.size(28.dp)
+                        contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Default.KeyboardArrowUp, "Open group", tint = TextMain, modifier = Modifier.size(20.dp))
+                        Icon(Icons.Default.KeyboardArrowUp, "Open group", tint = TextMain, modifier = Modifier.size(26.dp))
                     }
                     Row(
-                        Modifier.weight(1f).horizontalScroll(rememberScrollState())
-                            .padding(horizontal = 4.dp, vertical = 0.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        Modifier.weight(1f).horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         members.forEach { m ->
                             val isActive = m.id == activeId
-                            Box(Modifier.size(32.dp)) {
+                            Box(Modifier.size(44.dp)) {
                                 Box(
-                                    Modifier.align(Alignment.Center).size(26.dp).clip(CircleShape)
+                                    Modifier.align(Alignment.Center).size(36.dp).clip(CircleShape)
                                         .background(Surface2)
                                         .then(if (isActive) Modifier.border(2.dp, gColor, CircleShape) else Modifier)
                                         .clickable { if (!isActive) selectTab(m) },
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    SiteBadge(m, 16.dp)
+                                    SiteBadge(m, 22.dp)
                                 }
                                 if (isActive) {
                                     Box(
-                                        Modifier.align(Alignment.TopEnd).size(13.dp).clip(CircleShape)
+                                        Modifier.align(Alignment.TopEnd).size(17.dp).clip(CircleShape)
                                             .background(gColor)
                                             .clickable { closeTab(m, false) },
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        Icon(Icons.Default.Close, "Close tab", tint = GroupInk, modifier = Modifier.size(9.dp))
+                                        Icon(Icons.Default.Close, "Close tab", tint = GroupInk, modifier = Modifier.size(12.dp))
                                     }
                                 }
                             }
                         }
                     }
-                    IconButton(
-                        onClick = { newTabInGroup(activeGid) },
-                        modifier = Modifier.size(26.dp).border(1.dp, TextMuted, CircleShape)
+                    Box(
+                        Modifier.size(40.dp).clip(CircleShape)
+                            .border(1.5.dp, TextMuted, CircleShape)
+                            .clickable { newTabInGroup(activeGid) },
+                        contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Default.Add, "New tab in group", tint = TextMain, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Add, "New tab in group", tint = TextMain, modifier = Modifier.size(24.dp))
                     }
                 }
             }
