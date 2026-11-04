@@ -79,6 +79,7 @@ import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.focus.onFocusChanged
@@ -742,6 +743,23 @@ private fun SwiftBrowserApp() {
         }
     }
 
+    // Reorder: move a tab (or a whole group) before/after another tab or group.
+    fun moveEntry(sourceKey: Long, targetKey: Long, after: Boolean) {
+        if (sourceKey == targetKey) return
+        fun idsOf(key: Long): List<Long> =
+            if (key >= GROUP_ID_BASE) tabs.filter { tabGroups[it.id] == key }.map { it.id } else listOf(key)
+        val srcIds = idsOf(sourceKey).toSet()
+        val tgtIds = idsOf(targetKey).toSet()
+        if (srcIds.isEmpty() || tgtIds.isEmpty() || srcIds.any { it in tgtIds }) return
+        val moving = tabs.filter { it.id in srcIds }
+        val rest = tabs.filter { it.id !in srcIds }.toMutableList()
+        val idx = if (after) rest.indexOfLast { it.id in tgtIds } + 1 else rest.indexOfFirst { it.id in tgtIds }
+        if (idx < 0) return
+        rest.addAll(idx.coerceIn(0, rest.size), moving)
+        tabs.clear()
+        tabs.addAll(rest)
+    }
+
     // Group-icon action: collect every loose tab into one group.
     fun groupAllTabs() {
         val loose = tabs.filter { tabGroups[it.id] == null }
@@ -1348,6 +1366,7 @@ private fun SwiftBrowserApp() {
                         editGroupRequest = pendingEditGroup,
                         onEditConsumed = { pendingEditGroup = null },
                         onSearchWeb = { load(it) },
+                        onReorder = { src, tgt, after -> moveEntry(src, tgt, after) },
                         onSelect = { selectTab(it) },
                         onClose = { closeTab(it) },
                         onNew = { newTab() },
@@ -2255,7 +2274,8 @@ private fun TabSwitcher(
     onOpenGroupConsumed: () -> Unit,
     editGroupRequest: Long?,
     onEditConsumed: () -> Unit,
-    onSearchWeb: (String) -> Unit
+    onSearchWeb: (String) -> Unit,
+    onReorder: (Long, Long, Boolean) -> Unit
 ) {
     var query by remember { mutableStateOf("") }
     var openGroupKey by remember { mutableStateOf(openGroupRequest) }
@@ -2279,6 +2299,12 @@ private fun TabSwitcher(
     var hoverKey by remember { mutableStateOf<Long?>(null) }
     val cardBounds = remember { mutableStateMapOf<Long, Rect>() }
     var gridTopLeft by remember { mutableStateOf(Offset.Zero) }
+    var hoverZone by remember { mutableIntStateOf(0) } // -1 = before target, 0 = merge, 1 = after target
+    var dragSizePx by remember { mutableStateOf(Offset.Zero) }
+    var gridHeight by remember { mutableIntStateOf(0) }
+    val gridState = rememberLazyGridState()
+    val density = LocalDensity.current
+    val slackPx = with(density) { 7.dp.toPx() }
 
     // Build grid entries: single tabs plus one card per group.
     val entries = run {
@@ -2320,7 +2346,7 @@ private fun TabSwitcher(
         var best: Long? = null
         var bestArea = Float.MAX_VALUE
         cardBounds.forEach { (key, rect) ->
-            if (key != exclude && rect.contains(pos)) {
+            if (key != exclude && rect.inflate(slackPx).contains(pos)) {
                 val area = rect.width * rect.height
                 if (area < bestArea) {
                     bestArea = area
@@ -2332,6 +2358,89 @@ private fun TabSwitcher(
     }
 
     fun groupColorFor(key: Long): Color = groupColorOf(key)
+
+    // Where the held card is relative to the card under it: edges reorder,
+    // the middle merges into a group.
+    fun updateHover(src: Long) {
+        if (dragDistance <= 24f) {
+            hoverKey = null
+            hoverZone = 0
+            return
+        }
+        val t = targetUnder(dragPos, src)
+        hoverKey = t
+        val r = t?.let { cardBounds[it] }
+        hoverZone = if (r == null) 0 else {
+            val fx = (dragPos.x - r.left) / r.width
+            when {
+                fx < 0.28f -> -1
+                fx > 0.72f -> 1
+                else -> 0
+            }
+        }
+    }
+
+    fun finishDrag(key: Long) {
+        val dist = dragDistance
+        val target = if (dist > 40f) targetUnder(dragPos, key) else null
+        val targetRect = target?.let { cardBounds[it] }
+        val zone = hoverZone
+        val relY = dragPos.y - gridTopLeft.y
+        if (target != null && target != NEW_TAB_KEY && targetRect != null && zone == 0) {
+            // Merge: the held card flies into the target, then groups with it.
+            settling = Settle(key, target, dragPos, targetRect.center)
+            hoverKey = null
+            hoverZone = 0
+            scope.launch {
+                settleAnim.snapTo(0f)
+                settleAnim.animateTo(1f, tween(240))
+                onGroup(key, target)
+                settling = null
+                dragKey = null
+                dragDistance = 0f
+            }
+            return
+        }
+        if (target != null && target != NEW_TAB_KEY && zone != 0) {
+            onReorder(key, target, zone > 0)
+        } else if (dist > 40f && target == null && relY >= 0f && relY <= gridHeight.toFloat()) {
+            // Dropped in empty space inside the list: move to the end.
+            val last = filtered.lastOrNull()?.key
+            if (last != null && last != key) onReorder(key, last, true)
+        }
+        dragKey = null
+        hoverKey = null
+        hoverZone = 0
+        dragDistance = 0f
+    }
+    val latestFinish by rememberUpdatedState({ k: Long -> finishDrag(k) })
+
+    // Opening the overview shows the tab you are on, not the top of the list.
+    LaunchedEffect(Unit) {
+        val idx = filtered.indexOfFirst { e -> e.tabs.any { it.id == activeId } }
+        if (idx > 0) gridState.scrollToItem(idx)
+    }
+
+    // Dragging near the top/bottom edge scrolls the list.
+    LaunchedEffect(dragKey) {
+        if (dragKey == null) return@LaunchedEffect
+        val edge = with(density) { 96.dp.toPx() }
+        while (true) {
+            if (settling == null) {
+                val rel = dragPos.y - gridTopLeft.y
+                val delta = when {
+                    rel < edge -> -((edge - rel).coerceAtMost(edge) / edge) * 34f
+                    rel > gridHeight - edge -> ((rel - (gridHeight - edge)).coerceAtMost(edge) / edge) * 34f
+                    else -> 0f
+                }
+                if (delta != 0f) {
+                    gridState.dispatchRawDelta(delta)
+                    dragKey?.let { updateHover(it) }
+                }
+            }
+            delay(16)
+        }
+    }
 
     // ---------- Main tab grid ----------
     Box(Modifier.fillMaxSize()) {
@@ -2395,7 +2504,30 @@ private fun TabSwitcher(
             Text("Search your tabs", color = TextMuted, fontSize = 13.sp)
         }
 
-        Box(Modifier.weight(1f).fillMaxWidth().onGloballyPositioned { gridTopLeft = it.positionInRoot() }) {
+        Box(
+            Modifier.weight(1f).fillMaxWidth()
+                .onGloballyPositioned {
+                    gridTopLeft = it.positionInRoot()
+                    gridHeight = it.size.height
+                }
+                .pointerInput(Unit) {
+                    // Follows the finger for the whole drag (even if the held card scrolls
+                    // out of the list) and finishes the drag when the finger lifts.
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                            val key = dragKey ?: continue
+                            val change = event.changes.firstOrNull() ?: continue
+                            if (settling != null) continue
+                            val newPos = gridTopLeft + change.position
+                            dragDistance += (newPos - dragPos).getDistance()
+                            dragPos = newPos
+                            updateHover(key)
+                            if (!change.pressed) latestFinish(key)
+                        }
+                    }
+                }
+        ) {
             if (section == 1) GroupListSection(
                 entries = filtered,
                 names = groupNames,
@@ -2405,6 +2537,8 @@ private fun TabSwitcher(
                 onUngroup = { onDropOutside(it) },
                 onCloseGroup = { e -> e.tabs.toList().forEach { onClose(it) } }
             ) else LazyVerticalGrid(
+                state = gridState,
+                userScrollEnabled = dragKey == null,
                 columns = GridCells.Fixed(2),
                 modifier = Modifier.fillMaxSize().padding(horizontal = 17.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -2418,7 +2552,7 @@ private fun TabSwitcher(
 
                     // Brave: the card under the dragged tab shrinks a little to
                     // "absorb" it.
-                    val absorbing = isHovered || settling?.target == entry.key
+                    val absorbing = (isHovered && hoverZone == 0) || settling?.target == entry.key
                     val cardScale by animateFloatAsState(
                         targetValue = if (absorbing) 0.9f else 1f,
                         animationSpec = spring(
@@ -2428,54 +2562,30 @@ private fun TabSwitcher(
                         label = "absorb"
                     )
 
-                    // Drag behaviour shared by tab cards and group cards. The
-                    // original card is hidden while the held copy moves.
+                    // Items that scroll away must not leave stale drop targets behind.
+                    DisposableEffect(entry.key) {
+                        onDispose { cardBounds.remove(entry.key) }
+                    }
+
+                    // A long press only STARTS the drag here; the list itself follows the
+                    // finger and finishes the drop, so dragging works across scrolling.
                     val dragModifier = Modifier
                         .alpha(if (dragKey == entry.key) 0f else 1f)
                         .onGloballyPositioned { cardBounds[entry.key] = it.boundsInRoot() }
                         .pointerInput(entry.key) {
                             detectDragGesturesAfterLongPress(
-                                onDragStart = {
+                                onDragStart = { offset ->
+                                    val r = cardBounds[entry.key]
                                     dragKey = entry.key
                                     dragDistance = 0f
-                                    dragPos = cardBounds[entry.key]?.center ?: Offset.Zero
+                                    dragSizePx = if (r != null) Offset(r.width, r.height) else Offset.Zero
+                                    dragPos = if (r != null) Offset(r.left + offset.x, r.top + offset.y) else Offset.Zero
                                     hoverKey = null
+                                    hoverZone = 0
                                 },
-                                onDrag = { _, amount ->
-                                    dragDistance += amount.getDistance()
-                                    dragPos += amount
-                                    hoverKey = if (dragDistance > 24f) {
-                                        targetUnder(dragPos, entry.key)
-                                    } else null
-                                },
-                                onDragEnd = {
-                                    val target = if (dragDistance > 40f) targetUnder(dragPos, entry.key) else null
-                                    val targetRect = target?.let { cardBounds[it] }
-                                    if (dragDistance > 40f && target != null && target != NEW_TAB_KEY && targetRect != null) {
-                                        // Fly the held card into the target, then merge.
-                                        val src = entry.key
-                                        settling = Settle(src, target, dragPos, targetRect.center)
-                                        hoverKey = null
-                                        scope.launch {
-                                            settleAnim.snapTo(0f)
-                                            settleAnim.animateTo(1f, tween(240))
-                                            onGroup(src, target)
-                                            settling = null
-                                            dragKey = null
-                                            dragDistance = 0f
-                                        }
-                                    } else {
-                                        if (dragDistance > 40f && target == null) onDropOutside(entry.key)
-                                        dragKey = null
-                                        hoverKey = null
-                                        dragDistance = 0f
-                                    }
-                                },
-                                onDragCancel = {
-                                    dragKey = null
-                                    hoverKey = null
-                                    dragDistance = 0f
-                                }
+                                onDrag = { _, _ -> },
+                                onDragEnd = { },
+                                onDragCancel = { }
                             )
                         }
 
@@ -2507,6 +2617,18 @@ private fun TabSwitcher(
                                 modifier = dragModifier
                             )
                         }
+                        // Reorder marker: shows where the held card will be placed.
+                        if (isHovered && hoverZone != 0) {
+                            Box(
+                                Modifier
+                                    .align(if (hoverZone < 0) Alignment.CenterStart else Alignment.CenterEnd)
+                                    .offset(x = if (hoverZone < 0) (-8).dp else 8.dp)
+                                    .width(4.dp)
+                                    .fillMaxHeight(0.9f)
+                                    .clip(RoundedCornerShape(2.dp))
+                                    .background(Accent)
+                            )
+                        }
                     }
                 }
             }
@@ -2524,11 +2646,9 @@ private fun TabSwitcher(
             // On drop it shrinks and flies into the target.
             dragKey?.let { key ->
                 val dragged = entries.firstOrNull { it.key == key }
-                val rect = cardBounds[key]
-                if (dragged != null && rect != null) {
-                    val density = LocalDensity.current
-                    val wDp = with(density) { rect.width.toDp() }
-                    val hDp = with(density) { rect.height.toDp() }
+                if (dragged != null && dragSizePx.x > 0f) {
+                    val wDp = with(density) { dragSizePx.x.toDp() }
+                    val hDp = with(density) { dragSizePx.y.toDp() }
                     val st = settling
                     val p = settleAnim.value
                     val pos = if (st != null) {
@@ -2541,8 +2661,8 @@ private fun TabSwitcher(
                         Modifier
                             .offset {
                                 IntOffset(
-                                    (pos.x - gridTopLeft.x - rect.width / 2f).roundToInt(),
-                                    (pos.y - gridTopLeft.y - rect.height / 2f).roundToInt()
+                                    (pos.x - gridTopLeft.x - dragSizePx.x / 2f).roundToInt(),
+                                    (pos.y - gridTopLeft.y - dragSizePx.y / 2f).roundToInt()
                                 )
                             }
                             .size(wDp, hDp)
