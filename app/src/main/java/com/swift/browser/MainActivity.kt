@@ -69,6 +69,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import java.io.ByteArrayInputStream
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.io.File
+import android.os.Parcel
+import android.graphics.BitmapFactory
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
@@ -118,6 +121,94 @@ private val AccentSoft = Color(0x33FF6B35)
 private val TextMain = Color(0xFFF4F4F5)
 private val TextMuted = Color(0xFF9A9DA5)
 private val Green = Color(0xFF65C98A)
+
+// Everything needed to bring the browser back exactly as it was left.
+private class SavedSession(
+    val tabs: List<BrowserTab>,
+    val activeId: Long,
+    val nextId: Long,
+    val groupCounter: Long,
+    val groups: Map<Long, Long>,
+    val names: Map<Long, String>,
+    val colors: Map<Long, Int>,
+    val updated: Map<Long, Long>
+)
+
+private fun loadSession(context: Context): SavedSession? {
+    return try {
+        val raw = context.getSharedPreferences("swift_session", Context.MODE_PRIVATE)
+            .getString("session", null) ?: return null
+        val o = org.json.JSONObject(raw)
+        val arr = o.getJSONArray("tabs")
+        val tabs = (0 until arr.length()).map { i ->
+            val t = arr.getJSONObject(i)
+            BrowserTab(t.getLong("id")).copy(url = t.getString("url"), title = t.getString("title"))
+        }
+        if (tabs.isEmpty()) return null
+        val ids = tabs.map { it.id }.toSet()
+        fun longMap(name: String): Map<Long, Long> {
+            val m = o.optJSONObject(name) ?: return emptyMap()
+            return m.keys().asSequence().associate { it.toLong() to m.getLong(it) }
+        }
+        val activeId = o.optLong("active", tabs.first().id).let { if (it in ids) it else tabs.first().id }
+        val namesJson = o.optJSONObject("names")
+        val colorsJson = o.optJSONObject("colors")
+        SavedSession(
+            tabs = tabs,
+            activeId = activeId,
+            nextId = maxOf(o.optLong("next", 2L), (tabs.maxOf { it.id }) + 1),
+            groupCounter = o.optLong("gc", GROUP_ID_BASE + 1),
+            groups = longMap("groups").filterKeys { it in ids },
+            names = namesJson?.keys()?.asSequence()?.associate { it.toLong() to namesJson.getString(it) } ?: emptyMap(),
+            colors = colorsJson?.keys()?.asSequence()?.associate { it.toLong() to colorsJson.getInt(it) } ?: emptyMap(),
+            updated = longMap("updated")
+        )
+    } catch (e: Exception) {
+        null
+    }
+}
+
+// Bookmarks kept in this app's own storage (first run imports any old ones).
+private class BookmarkStore(context: Context, legacy: () -> List<Pair<String, String>>) {
+    private val prefs = context.getSharedPreferences("swift_bookmarks", Context.MODE_PRIVATE)
+
+    init {
+        if (prefs.getString("items", null) == null) {
+            val old = try { legacy() } catch (e: Exception) { emptyList() }
+            if (old.isNotEmpty()) save(old)
+        }
+    }
+
+    private fun key(u: String) = u.trim().trimEnd('/')
+
+    fun list(): List<Pair<String, String>> {
+        val raw = prefs.getString("items", null) ?: return emptyList()
+        return try {
+            val a = org.json.JSONArray(raw)
+            (0 until a.length()).map { i ->
+                val o = a.getJSONObject(i)
+                o.optString("title") to o.getString("url")
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun isBookmarked(url: String): Boolean = list().any { key(it.second) == key(url) }
+
+    fun add(title: String, url: String) {
+        if (isBookmarked(url)) return
+        save(listOf(title.ifBlank { url } to url) + list())
+    }
+
+    fun remove(url: String) = save(list().filterNot { key(it.second) == key(url) })
+
+    private fun save(items: List<Pair<String, String>>) {
+        val arr = org.json.JSONArray()
+        items.forEach { (t, u) -> arr.put(org.json.JSONObject().put("title", t).put("url", u)) }
+        prefs.edit().putString("items", arr.toString()).commit()
+    }
+}
 
 // Per-tab favicons and page thumbnails (shown in tab cards and the group bar).
 private val FaviconStore = mutableStateMapOf<Long, Bitmap>()
@@ -258,6 +349,16 @@ private class PullRefreshLayout(context: Context) : android.widget.FrameLayout(c
 }
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        // Set by the UI; called when the app stops so tabs survive being closed.
+        var saver: (() -> Unit)? = null
+    }
+
+    override fun onStop() {
+        super.onStop()
+        saver?.invoke()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.statusBarColor = android.graphics.Color.rgb(16, 17, 20)
@@ -275,13 +376,17 @@ private fun SwiftBrowserApp() {
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val store = remember { BrowserStore(context) }
     val blocker = remember { TrackerBlocker(context) }
-    val idCounter = remember { AtomicLong(2) }
+    val session = remember { loadSession(context) }
+    val startTab = session?.let { sess -> sess.tabs.firstOrNull { it.id == sess.activeId } }
+    val idCounter = remember { AtomicLong(session?.nextId ?: 2L) }
     val firstParty = remember { java.util.concurrent.ConcurrentHashMap<Long, String>() }
-    val tabs = remember { mutableStateListOf(BrowserTab(1)) }
-    var activeId by remember { mutableLongStateOf(1L) }
-    var address by remember { mutableStateOf("") }
-    var pageTitle by remember { mutableStateOf("Swift Browser") }
-    var pageUrl by remember { mutableStateOf("swift://home") }
+    val tabs = remember {
+        mutableStateListOf<BrowserTab>().apply { addAll(session?.tabs ?: listOf(BrowserTab(1))) }
+    }
+    var activeId by remember { mutableLongStateOf(session?.activeId ?: 1L) }
+    var address by remember { mutableStateOf(startTab?.url?.takeIf { it.startsWith("http") } ?: "") }
+    var pageTitle by remember { mutableStateOf(startTab?.title ?: "Swift Browser") }
+    var pageUrl by remember { mutableStateOf(startTab?.url ?: "swift://home") }
     var blockedCount by remember { mutableIntStateOf(0) }
     var blockingEnabled by remember { mutableStateOf(true) }
     var privateMode by remember { mutableStateOf(false) }
@@ -290,18 +395,40 @@ private fun SwiftBrowserApp() {
     var showTabs by remember { mutableStateOf(false) }
     var showSuggestions by remember { mutableStateOf(false) }
     var addressFocused by remember { mutableStateOf(false) }
-    val tabGroups = remember { mutableStateMapOf<Long, Long>() }
-    val groupNames = remember { mutableStateMapOf<Long, String>() }
-    val groupUpdated = remember { mutableStateMapOf<Long, Long>() }
+    val tabGroups = remember { mutableStateMapOf<Long, Long>().apply { putAll(session?.groups ?: emptyMap()) } }
+    val groupNames = remember { mutableStateMapOf<Long, String>().apply { putAll(session?.names ?: emptyMap()) } }
+    val groupUpdated = remember { mutableStateMapOf<Long, Long>().apply { putAll(session?.updated ?: emptyMap()) } }
     var pendingOpenGroup by remember { mutableStateOf<Long?>(null) }
     var pendingEditGroup by remember { mutableStateOf<Long?>(null) }
     var showGroupSheet by remember { mutableStateOf(false) }
     var editGroupKey by remember { mutableStateOf<Long?>(null) }
-    var groupCounter by remember { mutableLongStateOf(GROUP_ID_BASE + 1) }
+    var groupCounter by remember { mutableLongStateOf(session?.groupCounter ?: (GROUP_ID_BASE + 1)) }
     // One WebView per tab: pages, history and network errors never leak between tabs.
     val webViews = remember { HashMap<Long, WebView>() }
     val refreshLayouts = remember { HashMap<Long, PullRefreshLayout>() }
-    remember { FaviconStore.clear(); ThumbStore.clear(); GroupColorStore.clear(); 0 }
+    // Tabs that were restored but not opened yet load lazily, like Brave.
+    val unloaded = remember {
+        HashSet<Long>().apply {
+            session?.tabs?.filter { it.url.startsWith("http") }?.forEach { add(it.id) }
+        }
+    }
+    val savedThumbs = remember { HashMap<Long, Bitmap>() }
+    val savedFavicons = remember { HashMap<Long, Bitmap>() }
+    remember {
+        FaviconStore.clear(); ThumbStore.clear(); GroupColorStore.clear()
+        session?.colors?.forEach { (k, v) -> GroupColorStore[k] = v }
+        session?.tabs?.forEach { t ->
+            BitmapFactory.decodeFile(File(context.filesDir, "thumb_${t.id}.jpg").path)?.let {
+                ThumbStore[t.id] = it
+                savedThumbs[t.id] = it
+            }
+            BitmapFactory.decodeFile(File(context.filesDir, "fav_${t.id}.png").path)?.let {
+                FaviconStore[t.id] = it
+                savedFavicons[t.id] = it
+            }
+        }
+        0
+    }
     var loadProgress by remember { mutableIntStateOf(100) }
     var totalBlocked by remember { mutableIntStateOf(0) }
     var canGoBack by remember { mutableStateOf(false) }
@@ -310,7 +437,8 @@ private fun SwiftBrowserApp() {
     val currentPrivateMode by rememberUpdatedState(privateMode)
     val isHome = pageUrl == "swift://home"
     var bookmarkRefresh by remember { mutableIntStateOf(0) }
-    val isBookmarked = remember(pageUrl, bookmarkRefresh) { store.isBookmarked(pageUrl) }
+    val bookmarkStore = remember { BookmarkStore(context) { store.bookmarks() } }
+    val isBookmarked = remember(pageUrl, bookmarkRefresh) { bookmarkStore.isBookmarked(pageUrl) }
 
     fun activeWebView(): WebView? = webViews[activeId]
 
@@ -337,6 +465,111 @@ private fun SwiftBrowserApp() {
             wv.draw(c)
             ThumbStore[id] = bmp
         }
+    }
+
+    // Brings a restored tab's page back (with its back/forward history when possible).
+    fun loadTabContent(id: Long, wv: WebView) {
+        var restored = false
+        val f = File(context.filesDir, "tab_$id.bin")
+        if (f.exists()) {
+            try {
+                val bytes = f.readBytes()
+                val p = Parcel.obtain()
+                p.unmarshall(bytes, 0, bytes.size)
+                p.setDataPosition(0)
+                val b = p.readBundle(WebView::class.java.classLoader)
+                p.recycle()
+                restored = b != null && wv.restoreState(b) != null
+            } catch (e: Exception) {
+                restored = false
+            }
+        }
+        if (!restored) {
+            val u = tabs.firstOrNull { it.id == id }?.url
+            if (u != null && u.startsWith("http")) wv.loadUrl(u)
+        }
+    }
+
+    // Saves tabs, groups, page history, thumbnails and icons so that closing
+    // the app and reopening it brings everything back.
+    fun saveSession() {
+        try {
+            val o = org.json.JSONObject()
+            o.put("active", activeId)
+            o.put("next", idCounter.get())
+            o.put("gc", groupCounter)
+            val arr = org.json.JSONArray()
+            tabs.forEach { t ->
+                arr.put(org.json.JSONObject().put("id", t.id).put("url", t.url).put("title", t.title))
+            }
+            o.put("tabs", arr)
+            fun mapJson(m: Map<Long, Any>): org.json.JSONObject {
+                val j = org.json.JSONObject()
+                m.forEach { (k, v) -> j.put(k.toString(), v) }
+                return j
+            }
+            o.put("groups", mapJson(tabGroups.toMap()))
+            o.put("names", mapJson(groupNames.toMap()))
+            o.put("colors", mapJson(GroupColorStore.toMap()))
+            o.put("updated", mapJson(groupUpdated.toMap()))
+            context.getSharedPreferences("swift_session", Context.MODE_PRIVATE)
+                .edit().putString("session", o.toString()).commit()
+
+            val dir = context.filesDir
+            val ids = tabs.map { it.id }.toSet()
+            tabs.forEach { t ->
+                val stateFile = File(dir, "tab_${t.id}.bin")
+                val wv = webViews[t.id]
+                if (wv != null && t.id !in unloaded && t.url.startsWith("http")) {
+                    val b = Bundle()
+                    if (wv.saveState(b) != null) {
+                        val p = Parcel.obtain()
+                        p.writeBundle(b)
+                        val bytes = p.marshall()
+                        p.recycle()
+                        stateFile.writeBytes(bytes)
+                    }
+                } else if (!t.url.startsWith("http")) {
+                    stateFile.delete()
+                }
+                ThumbStore[t.id]?.let { bmp ->
+                    if (savedThumbs[t.id] !== bmp) {
+                        java.io.FileOutputStream(File(dir, "thumb_${t.id}.jpg")).use {
+                            bmp.compress(Bitmap.CompressFormat.JPEG, 70, it)
+                        }
+                        savedThumbs[t.id] = bmp
+                    }
+                }
+                FaviconStore[t.id]?.let { bmp ->
+                    if (savedFavicons[t.id] !== bmp) {
+                        java.io.FileOutputStream(File(dir, "fav_${t.id}.png")).use {
+                            bmp.compress(Bitmap.CompressFormat.PNG, 100, it)
+                        }
+                        savedFavicons[t.id] = bmp
+                    }
+                }
+            }
+            // Remove files of tabs that no longer exist.
+            val pattern = Regex("^(tab|thumb|fav)_(\\d+)\\.")
+            dir.listFiles()?.forEach { f ->
+                val m = pattern.find(f.name)
+                if (m != null && (m.groupValues[2].toLongOrNull() ?: -1L) !in ids) f.delete()
+            }
+        } catch (e: Exception) {
+            // Saving is best effort; never crash the browser because of it.
+        }
+    }
+
+    DisposableEffect(Unit) {
+        MainActivity.saver = { saveSession() }
+        onDispose { MainActivity.saver = null }
+    }
+
+    val saveHandler = remember { Handler(Looper.getMainLooper()) }
+    val saveTask = remember { Runnable { MainActivity.saver?.invoke() } }
+    fun scheduleSave() {
+        saveHandler.removeCallbacks(saveTask)
+        saveHandler.postDelayed(saveTask, 4000)
     }
 
     fun updateActiveTab(url: String = pageUrl, title: String = pageTitle, count: Int = blockedCount) {
@@ -403,6 +636,7 @@ private fun SwiftBrowserApp() {
         blockedCount = 0
         pageTitle = url
         updateActiveTab(url, pageTitle, 0)
+        unloaded.remove(activeId)
         loadProgress = 5
         activeWebView()?.loadUrl(url)
         showSuggestions = false
@@ -440,6 +674,7 @@ private fun SwiftBrowserApp() {
         showTabs = false
         showGroupSheet = false
         loadProgress = 100
+        if (unloaded.remove(tab.id)) webViews[tab.id]?.let { loadTabContent(tab.id, it) }
         canGoBack = webViews[tab.id]?.canGoBack() == true
     }
 
@@ -447,6 +682,7 @@ private fun SwiftBrowserApp() {
         if (tabs.size == 1) {
             tabs[0] = BrowserTab(tab.id)
             tabGroups.clear()
+            unloaded.remove(tab.id)
             webViews[tab.id]?.let { it.loadUrl("about:blank"); it.clearHistory() }
             ThumbStore.remove(tab.id)
             FaviconStore.remove(tab.id)
@@ -643,6 +879,7 @@ private fun SwiftBrowserApp() {
                     }
                     if (!currentPrivateMode) store.addHistory(title, url)
                     Handler(Looper.getMainLooper()).postDelayed({ captureThumb(tabId) }, 700)
+                    scheduleSave()
                 }
             }
 
@@ -663,21 +900,55 @@ private fun SwiftBrowserApp() {
             }
 
             webViews[tabId] = this
-            val t = tabs.firstOrNull { it.id == tabId }
-            if (t != null && t.url.startsWith("http")) loadUrl(t.url)
+            // The tab that was open when the app closed comes back right away;
+            // other restored tabs load when you first open them.
+            if (tabId == activeId && unloaded.remove(tabId)) loadTabContent(tabId, this)
         }
     }
 
-    BackHandler(enabled = showGroupSheet || showShield || showTabs || showSuggestions || (canGoBack && !isHome)) {
+    fun bookmarksNow(): List<Pair<String, String>> {
+        val version = bookmarkRefresh // re-read whenever a bookmark changes
+        return if (version >= 0) bookmarkStore.list() else emptyList()
+    }
+
+    fun toggleBookmark() {
+        if (!pageUrl.startsWith("http")) return
+        val title = pageTitle.takeIf { it.isNotBlank() && !it.startsWith("http") } ?: hostOf(pageUrl)
+        if (bookmarkStore.isBookmarked(pageUrl)) {
+            bookmarkStore.remove(pageUrl)
+            Toast.makeText(context, "Bookmark removed", Toast.LENGTH_SHORT).show()
+        } else {
+            bookmarkStore.add(title, pageUrl)
+            Toast.makeText(context, "Bookmark saved", Toast.LENGTH_SHORT).show()
+        }
+        bookmarkRefresh++
+    }
+
+    // Back only counts as "history" when the previous entry is a real page.
+    fun canGoBackReal(): Boolean {
+        val wv = activeWebView() ?: return false
+        if (!wv.canGoBack()) return false
+        val list = wv.copyBackForwardList()
+        if (list.currentIndex <= 0) return false
+        val prev = list.getItemAtIndex(list.currentIndex - 1) ?: return false
+        return !(prev.url ?: "").startsWith("about:")
+    }
+
+    BackHandler(enabled = true) {
         when {
             showGroupSheet -> showGroupSheet = false
             showShield -> showShield = false
             showTabs -> showTabs = false
             showSuggestions -> showSuggestions = false
-            else -> {
+            address == "swift://bookmarks" || address == "swift://history" ->
+                address = if (isHome) "" else pageUrl
+            canGoBackReal() -> {
                 activeWebView()?.goBack()
                 refreshNavigation()
             }
+            !isHome -> load("swift://home")
+            // Keep the app (and all tabs) alive instead of closing it.
+            else -> (context as? android.app.Activity)?.moveTaskToBack(true)
         }
     }
 
@@ -703,6 +974,34 @@ private fun SwiftBrowserApp() {
                 onDismissRequest = { showMenu = false },
                 modifier = Modifier.background(Surface)
             ) {
+                if (!showTabs && !isHome && pageUrl.startsWith("http")) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceAround,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(
+                            onClick = { showMenu = false; activeWebView()?.goForward() },
+                            enabled = activeWebView()?.canGoForward() == true
+                        ) {
+                            Icon(Icons.Default.ArrowForward, "Forward", tint = TextMain)
+                        }
+                        IconButton(onClick = { showMenu = false; toggleBookmark() }) {
+                            Icon(
+                                if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
+                                "Bookmark",
+                                tint = if (isBookmarked) Accent else TextMain
+                            )
+                        }
+                        IconButton(onClick = { showMenu = false; sharePage(context, pageUrl) }) {
+                            Icon(Icons.Default.Share, "Share", tint = TextMain)
+                        }
+                        IconButton(onClick = { showMenu = false; activeWebView()?.reload() }) {
+                            Icon(Icons.Default.Refresh, "Reload", tint = TextMain)
+                        }
+                    }
+                    HorizontalDivider(color = Surface3.copy(alpha = .7f))
+                }
                 if (showTabs) {
                     BrowserMenuItem("Group all tabs", Icons.Default.CreateNewFolder) {
                         showMenu = false
@@ -851,16 +1150,7 @@ private fun SwiftBrowserApp() {
                 }
                 if (!isHome && pageUrl.startsWith("http")) {
                     IconButton(
-                        onClick = {
-                            if (isBookmarked) store.removeBookmark(pageUrl)
-                            else store.addBookmark(pageTitle, pageUrl)
-                            bookmarkRefresh++
-                            Toast.makeText(
-                                context,
-                                if (isBookmarked) "Bookmark removed" else "Bookmark saved",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        },
+                        onClick = { toggleBookmark() },
                         modifier = Modifier.size(32.dp)
                     ) {
                         Icon(
@@ -954,7 +1244,7 @@ private fun SwiftBrowserApp() {
                             focusManager.clearFocus()
                         },
                         onOpen = { load(it) },
-                        bookmarks = store.bookmarks().take(5),
+                        bookmarks = bookmarksNow().take(5),
                         recent = store.history().take(4),
                         onShowBookmarks = { address = "swift://bookmarks" },
                         onShowHistory = { address = "swift://history" },
@@ -983,10 +1273,10 @@ private fun SwiftBrowserApp() {
                     val isBookmarks = address == "swift://bookmarks"
                     LinkLibraryPanel(
                         title = if (isBookmarks) "Bookmarks" else "History",
-                        entries = if (isBookmarks) store.bookmarks() else store.history(),
+                        entries = if (isBookmarks) bookmarksNow() else store.history(),
                         icon = if (isBookmarks) Icons.Default.Bookmark else Icons.Default.History,
                         onOpen = { load(it) },
-                        onClose = { address = ""; pageUrl = "swift://home" }
+                        onClose = { address = if (isHome) "" else pageUrl }
                     )
                 }
 
@@ -996,7 +1286,7 @@ private fun SwiftBrowserApp() {
                     exit = fadeOut(tween(80)),
                     modifier = Modifier.align(Alignment.TopCenter)
                 ) {
-                    val suggestions = (store.bookmarks() + store.history())
+                    val suggestions = (bookmarksNow() + store.history())
                         .distinctBy { it.second }
                         .filter { it.first.contains(address, true) || it.second.contains(address, true) }
                         .take(5)
