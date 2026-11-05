@@ -91,6 +91,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.unit.IntOffset
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -212,6 +213,41 @@ private class BookmarkStore(context: Context, legacy: () -> List<Pair<String, St
     }
 }
 
+// Last snapshot of the homepage: every home tab shows it in the tab overview.
+private var HomeThumbStore by mutableStateOf<Bitmap?>(null)
+
+private const val DESKTOP_UA =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+// Reading mode: replaces the page with clean, dark article text (toggle).
+private const val READER_JS = """
+(function(){
+ var id='__swift_reader';
+ var ex=document.getElementById(id);
+ if(ex){ex.remove();return 'off';}
+ var root=document.querySelector('article')||document.querySelector('main')||document.querySelector('[role=main]')||document.body;
+ var out=document.createElement('div'); out.id=id;
+ out.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;overflow:auto;background:#101114;color:#e8e8ea;padding:20px 18px 60px;font:18px/1.7 Roboto,sans-serif';
+ var wrap=document.createElement('div'); wrap.style.cssText='max-width:720px;margin:0 auto';
+ var title=document.createElement('h1'); title.textContent=document.title; title.style.cssText='font-size:26px;line-height:1.3;margin:0 0 16px'; wrap.appendChild(title);
+ var count=0;
+ root.querySelectorAll('h1,h2,h3,h4,p,li,blockquote,pre,img').forEach(function(n){
+  if(n.closest('nav,header,footer,aside,form')) return;
+  var t=n.tagName.toLowerCase();
+  if(t==='img'){ if(n.naturalWidth<160) return; var im=document.createElement('img'); im.src=n.currentSrc||n.src; im.style.cssText='max-width:100%;height:auto;border-radius:10px;margin:12px 0'; wrap.appendChild(im); return; }
+  var txt=(n.innerText||'').trim();
+  if(!txt||(t==='p'&&txt.length<25)) return;
+  var e=document.createElement(t==='li'?'p':t);
+  e.textContent=(t==='li'?'\u2022 ':'')+txt;
+  e.style.cssText='margin:0 0 14px';
+  if(t.charAt(0)==='h'){e.style.fontSize='22px';e.style.marginTop='22px';}
+  wrap.appendChild(e); count++;
+ });
+ if(count<3) return 'none';
+ out.appendChild(wrap); document.body.appendChild(out); return 'on';
+})();
+"""
+
 // Per-tab favicons and page thumbnails (shown in tab cards and the group bar).
 private val FaviconStore = mutableStateMapOf<Long, Bitmap>()
 private val ThumbStore = mutableStateMapOf<Long, Bitmap>()
@@ -224,7 +260,8 @@ private const val NEW_TAB_KEY = -1L
 private val GroupColors = listOf(
     Color(0xFF9AA0A6), Color(0xFF8AB4F8), Color(0xFFF28B82),
     Color(0xFFFDD663), Color(0xFF81C995), Color(0xFFFF8BCB),
-    Color(0xFFC58AF9), Color(0xFF78D9EC), Color(0xFFFCAD70)
+    Color(0xFFC58AF9), Color(0xFF78D9EC), Color(0xFFFCAD70),
+    Color(0xFF4DB6AC), Color(0xFFD4E157), Color(0xFF7986CB)
 )
 // Colors the user picked (group key -> palette index); others use a default.
 private val GroupColorStore = mutableStateMapOf<Long, Int>()
@@ -354,6 +391,19 @@ class MainActivity : ComponentActivity() {
     companion object {
         // Set by the UI; called when the app stops so tabs survive being closed.
         var saver: (() -> Unit)? = null
+
+        // A link opened from outside (or a pinned shortcut): opened in a new tab.
+        var pendingUrl by mutableStateOf<String?>(null)
+    }
+
+    private fun handleIntent(i: Intent?) {
+        val u = i?.dataString
+        if (i?.action == Intent.ACTION_VIEW && u != null && u.startsWith("http")) pendingUrl = u
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
     }
 
     override fun onStop() {
@@ -363,6 +413,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleIntent(intent)
         window.statusBarColor = android.graphics.Color.rgb(16, 17, 20)
         window.navigationBarColor = android.graphics.Color.rgb(16, 17, 20)
         setContent { SwiftBrowserApp() }
@@ -405,6 +456,17 @@ private fun SwiftBrowserApp() {
     var showGroupSheet by remember { mutableStateOf(false) }
     var confirmCloseAll by remember { mutableStateOf(false) }
     var editGroupKey by remember { mutableStateOf<Long?>(null) }
+    var colorPickKey by remember { mutableStateOf<Long?>(null) }
+    var showAddToGroup by remember { mutableStateOf(false) }
+    var showRecent by remember { mutableStateOf(false) }
+    var findOpen by remember { mutableStateOf(false) }
+    var findText by remember { mutableStateOf("") }
+    var findMatches by remember { mutableIntStateOf(0) }
+    var findIndex by remember { mutableIntStateOf(0) }
+    val desktopSites = remember { mutableStateMapOf<Long, Boolean>() }
+    val recentClosed = remember { mutableStateListOf<Pair<String, String>>() }
+    val pendingLoads = remember { HashMap<Long, String>() }
+    val webArea = remember { android.graphics.Rect() }
     var groupCounter by remember { mutableLongStateOf(session?.groupCounter ?: (GROUP_ID_BASE + 1)) }
     // One WebView per tab: pages, history and network errors never leak between tabs.
     val webViews = remember { HashMap<Long, WebView>() }
@@ -417,8 +479,11 @@ private fun SwiftBrowserApp() {
     }
     val savedThumbs = remember { HashMap<Long, Bitmap>() }
     val savedFavicons = remember { HashMap<Long, Bitmap>() }
+    val savedHome = remember { arrayOfNulls<Bitmap>(1) }
     remember {
         FaviconStore.clear(); ThumbStore.clear(); GroupColorStore.clear()
+        HomeThumbStore = BitmapFactory.decodeFile(File(context.filesDir, "home_thumb.jpg").path)
+        savedHome[0] = HomeThumbStore
         session?.colors?.forEach { (k, v) -> GroupColorStore[k] = v }
         session?.tabs?.forEach { t ->
             BitmapFactory.decodeFile(File(context.filesDir, "thumb_${t.id}.jpg").path)?.let {
@@ -453,11 +518,42 @@ private fun SwiftBrowserApp() {
         }
     }
 
+    // Snapshot of the homepage exactly as it is on screen (needs Android 8+).
+    fun captureHomeThumb(id: Long) {
+        if (Build.VERSION.SDK_INT < 26) return
+        val activity = context as? android.app.Activity ?: return
+        if (webArea.isEmpty) return
+        try {
+            val src = android.graphics.Rect(webArea)
+            val full = Bitmap.createBitmap(src.width(), src.height(), Bitmap.Config.ARGB_8888)
+            android.view.PixelCopy.request(
+                activity.window, src, full,
+                android.view.PixelCopy.OnPixelCopyFinishedListener { result ->
+                    if (result == android.view.PixelCopy.SUCCESS) {
+                        val w = 360
+                        val h = (src.height() * w / src.width().toFloat()).toInt().coerceAtLeast(1)
+                        val scaled = Bitmap.createScaledBitmap(full, w, h, true)
+                        ThumbStore[id] = scaled
+                        HomeThumbStore = scaled
+                    }
+                },
+                Handler(Looper.getMainLooper())
+            )
+        } catch (e: Exception) {
+            // Thumbnails are best effort.
+        }
+    }
+
     // Snapshot of a tab's page, shown on its card in the tab overview.
     fun captureThumb(id: Long) {
+        val tab0 = tabs.firstOrNull { it.id == id } ?: return
+        if (tab0.url == "swift://home") {
+            captureHomeThumb(id)
+            return
+        }
         val wv = webViews[id] ?: return
-        val tab = tabs.firstOrNull { it.id == id } ?: return
-        if (tab.url == "swift://home" || wv.width <= 0 || wv.height <= 0) return
+        val tab = tab0
+        if (wv.width <= 0 || wv.height <= 0) return
         runCatching {
             val w = 360
             val scale = w / wv.width.toFloat()
@@ -552,6 +648,14 @@ private fun SwiftBrowserApp() {
                     }
                 }
             }
+            HomeThumbStore?.let { bmp ->
+                if (savedHome[0] !== bmp) {
+                    java.io.FileOutputStream(File(dir, "home_thumb.jpg")).use {
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 70, it)
+                    }
+                    savedHome[0] = bmp
+                }
+            }
             // Remove files of tabs that no longer exist.
             val pattern = Regex("^(tab|thumb|fav)_(\\d+)\\.")
             dir.listFiles()?.forEach { f ->
@@ -625,6 +729,8 @@ private fun SwiftBrowserApp() {
             updateActiveTab(pageUrl, pageTitle, 0)
             // Blank the tab's WebView so no old page can show through later.
             activeWebView()?.let { it.loadUrl("about:blank"); it.clearHistory() }
+            ThumbStore.remove(activeId)
+            findOpen = false
             loadProgress = 100
             showSuggestions = false
             showTabs = false
@@ -676,12 +782,21 @@ private fun SwiftBrowserApp() {
         blockedCount = tab.blockedCount
         showTabs = false
         showGroupSheet = false
+        findOpen = false
         loadProgress = 100
         if (unloaded.remove(tab.id)) webViews[tab.id]?.let { loadTabContent(tab.id, it) }
         canGoBack = webViews[tab.id]?.canGoBack() == true
     }
 
+    fun recordClosed(tab: BrowserTab) {
+        if (!tab.url.startsWith("http")) return
+        recentClosed.removeAll { it.second == tab.url }
+        recentClosed.add(0, tab.title to tab.url)
+        while (recentClosed.size > 15) recentClosed.removeAt(recentClosed.size - 1)
+    }
+
     fun closeTab(tab: BrowserTab, fromOverview: Boolean = true) {
+        recordClosed(tab)
         if (tabs.size == 1) {
             tabs[0] = BrowserTab(tab.id)
             tabGroups.clear()
@@ -779,6 +894,7 @@ private fun SwiftBrowserApp() {
 
     // Delete-all action: closes every tab and lands on a fresh home tab.
     fun closeAllTabs() {
+        tabs.toList().forEach { recordClosed(it) }
         tabs.clear()
         tabGroups.clear()
         val fresh = BrowserTab(idCounter.getAndIncrement())
@@ -811,6 +927,14 @@ private fun SwiftBrowserApp() {
                 settings.safeBrowsingEnabled = true
             }
             settings.mediaPlaybackRequiresUserGesture = true
+            setFindListener(
+                WebView.FindListener { active, count, _ ->
+                    if (tabId == activeId) {
+                        findMatches = count
+                        findIndex = if (count > 0) active + 1 else 0
+                    }
+                }
+            )
             CookieManager.getInstance().setAcceptCookie(true)
 
             webChromeClient = object : WebChromeClient() {
@@ -925,6 +1049,7 @@ private fun SwiftBrowserApp() {
             // The tab that was open when the app closed comes back right away;
             // other restored tabs load when you first open them.
             if (tabId == activeId && unloaded.remove(tabId)) loadTabContent(tabId, this)
+            pendingLoads.remove(tabId)?.let { loadUrl(it) }
         }
     }
 
@@ -958,6 +1083,11 @@ private fun SwiftBrowserApp() {
 
     BackHandler(enabled = true) {
         when {
+            showMenu -> showMenu = false
+            findOpen -> {
+                findOpen = false
+                activeWebView()?.clearMatches()
+            }
             showGroupSheet -> showGroupSheet = false
             showShield -> showShield = false
             showTabs -> showTabs = false
@@ -974,7 +1104,105 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Settings menu, shared by the normal bottom bar and the tab-overview bar.
+    fun openUrlInNewTab(u: String) {
+        newTab()
+        pendingLoads[activeId] = u
+        load(u)
+    }
+
+    LaunchedEffect(MainActivity.pendingUrl) {
+        val u = MainActivity.pendingUrl
+        if (u != null) {
+            openUrlInNewTab(u)
+            MainActivity.pendingUrl = null
+        }
+    }
+
+    fun startPrivateTab() {
+        privateMode = true
+        newTab()
+        Toast.makeText(context, "Private browsing is on: history isn't saved", Toast.LENGTH_SHORT).show()
+    }
+
+    fun toggleDesktopSite() {
+        val wv = activeWebView() ?: return
+        val on = !(desktopSites[activeId] ?: false)
+        desktopSites[activeId] = on
+        wv.settings.userAgentString = if (on) DESKTOP_UA else null
+        wv.settings.useWideViewPort = on
+        wv.settings.loadWithOverviewMode = on
+        wv.reload()
+    }
+
+    fun toggleReadingMode() {
+        activeWebView()?.evaluateJavascript(READER_JS) { result ->
+            if (result?.contains("none") == true) {
+                Toast.makeText(context, "Reading mode isn't available for this page", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    // Clears cookies, storage and cache of the current site and closes its tabs.
+    fun shredSiteData() {
+        val url = pageUrl
+        val host = hostOf(url)
+        if (host.isEmpty()) return
+        val cm = CookieManager.getInstance()
+        cm.getCookie(url)?.split(";")?.forEach { c ->
+            val name = c.substringBefore("=").trim()
+            if (name.isNotEmpty()) {
+                listOf("", "; Domain=$host", "; Domain=.$host").forEach { d ->
+                    cm.setCookie(url, "$name=; Max-Age=0; Path=/$d")
+                }
+            }
+        }
+        cm.flush()
+        val uri = Uri.parse(url)
+        android.webkit.WebStorage.getInstance().deleteOrigin((uri.scheme ?: "https") + "://" + (uri.host ?: host))
+        activeWebView()?.clearCache(true)
+        tabs.filter { hostOf(it.url) == host }.forEach { closeTab(it, false) }
+        recentClosed.removeAll { hostOf(it.second) == host }
+        Toast.makeText(context, "Site data shredded", Toast.LENGTH_SHORT).show()
+    }
+
+    fun installShortcut() {
+        if (Build.VERSION.SDK_INT < 26 || !pageUrl.startsWith("http")) {
+            Toast.makeText(context, "Shortcuts aren't supported here", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val sm = context.getSystemService(android.content.pm.ShortcutManager::class.java)
+        if (sm == null || !sm.isRequestPinShortcutSupported) {
+            Toast.makeText(context, "Your launcher can't pin shortcuts", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val launch = Intent(context, MainActivity::class.java)
+            .setAction(Intent.ACTION_VIEW)
+            .setData(Uri.parse(pageUrl))
+        val icon = FaviconStore[activeId]?.let { android.graphics.drawable.Icon.createWithBitmap(it) }
+            ?: android.graphics.drawable.Icon.createWithResource(context, context.applicationInfo.icon)
+        val info = android.content.pm.ShortcutInfo.Builder(context, "page_" + pageUrl.hashCode())
+            .setShortLabel(pageTitle.ifBlank { hostOf(pageUrl) }.take(24))
+            .setIcon(icon)
+            .setIntent(launch)
+            .build()
+        sm.requestPinShortcut(info, null)
+    }
+
+    fun saveCurrentPage() {
+        val wv = activeWebView() ?: return
+        val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
+        val file = File(dir, hostOf(pageUrl).ifBlank { "page" } + "-" + System.currentTimeMillis() + ".mht")
+        wv.saveWebArchive(file.absolutePath, false) { saved ->
+            Toast.makeText(
+                context,
+                if (saved != null) "Page saved: " + file.name else "Couldn't save this page",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    // Menu button, shared by the normal bottom bar and the tab-overview bar.
+    // The menu itself is drawn as an overlay at the end of this screen.
     @Composable
     fun SettingsMenuBox(dots: Boolean = false) {
         Box {
@@ -989,74 +1217,6 @@ private fun SwiftBrowserApp() {
                     selected = showMenu
                 ) {
                     showMenu = true
-                }
-            }
-            DropdownMenu(
-                expanded = showMenu,
-                onDismissRequest = { showMenu = false },
-                modifier = Modifier.background(Surface)
-            ) {
-                if (!showTabs && !isHome && pageUrl.startsWith("http")) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 6.dp),
-                        horizontalArrangement = Arrangement.SpaceAround,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(
-                            onClick = { showMenu = false; activeWebView()?.goForward() },
-                            enabled = activeWebView()?.canGoForward() == true
-                        ) {
-                            Icon(Icons.Default.ArrowForward, "Forward", tint = TextMain)
-                        }
-                        IconButton(onClick = { showMenu = false; toggleBookmark() }) {
-                            Icon(
-                                if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
-                                "Bookmark",
-                                tint = if (isBookmarked) Accent else TextMain
-                            )
-                        }
-                        IconButton(onClick = { showMenu = false; sharePage(context, pageUrl) }) {
-                            Icon(Icons.Default.Share, "Share", tint = TextMain)
-                        }
-                        IconButton(onClick = { showMenu = false; activeWebView()?.reload() }) {
-                            Icon(Icons.Default.Refresh, "Reload", tint = TextMain)
-                        }
-                    }
-                    HorizontalDivider(color = Surface3.copy(alpha = .7f))
-                }
-                if (showTabs) {
-                    BrowserMenuItem("Group all tabs", Icons.Default.CreateNewFolder) {
-                        showMenu = false
-                        groupAllTabs()
-                    }
-                    BrowserMenuItem("Close all tabs", Icons.Default.DeleteSweep) {
-                        showMenu = false
-                        confirmCloseAll = true
-                    }
-                }
-                BrowserMenuItem("Bookmarks", Icons.Default.Bookmark) {
-                    showMenu = false
-                    showTabs = false
-                    showShield = false
-                    address = "swift://bookmarks"
-                    showSuggestions = false
-                }
-                BrowserMenuItem("History", Icons.Default.History) {
-                    showMenu = false
-                    address = "swift://history"
-                    showSuggestions = false
-                }
-                BrowserMenuItem("Downloads", Icons.Default.Download) {
-                    showMenu = false
-                    runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
-                }
-                BrowserMenuItem("Share page", Icons.Default.Share) {
-                    showMenu = false
-                    sharePage(context, pageUrl)
-                }
-                BrowserMenuItem("Privacy dashboard", Icons.Default.Shield) {
-                    showMenu = false
-                    showShield = true
                 }
             }
         }
@@ -1144,6 +1304,61 @@ private fun SwiftBrowserApp() {
             }
             }
 
+            // Find in page bar (menu > Find in page).
+            if (findOpen && !showTabs) {
+                val findFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+                LaunchedEffect(Unit) { findFocus.requestFocus() }
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).height(46.dp)
+                        .clip(RoundedCornerShape(24.dp)).background(Surface2).padding(horizontal = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    BasicTextField(
+                        value = findText,
+                        onValueChange = {
+                            findText = it
+                            if (it.isBlank()) {
+                                activeWebView()?.clearMatches()
+                                findMatches = 0
+                                findIndex = 0
+                            } else {
+                                activeWebView()?.findAllAsync(it)
+                            }
+                        },
+                        modifier = Modifier.weight(1f).padding(start = 12.dp).focusRequester(findFocus),
+                        singleLine = true,
+                        textStyle = TextStyle(color = TextMain, fontSize = 15.sp),
+                        cursorBrush = androidx.compose.ui.graphics.SolidColor(Accent),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(onSearch = { activeWebView()?.findNext(true) }),
+                        decorationBox = { inner ->
+                            if (findText.isEmpty()) Text("Find in page", color = TextMuted, fontSize = 15.sp)
+                            inner()
+                        }
+                    )
+                    Text(
+                        if (findMatches > 0) "$findIndex/$findMatches" else if (findText.isNotBlank()) "0/0" else "",
+                        color = TextMuted, fontSize = 13.sp
+                    )
+                    IconButton(onClick = { activeWebView()?.findNext(false) }, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Default.KeyboardArrowUp, "Previous", tint = TextMain)
+                    }
+                    IconButton(onClick = { activeWebView()?.findNext(true) }, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Default.KeyboardArrowDown, "Next", tint = TextMain)
+                    }
+                    IconButton(
+                        onClick = {
+                            activeWebView()?.clearMatches()
+                            findOpen = false
+                            findText = ""
+                        },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(Icons.Default.Close, "Close", tint = TextMain)
+                    }
+                }
+            }
+
             // Small protection strip opens the detailed shield dashboard.
             // Hidden in the tabs overview, like Brave.
             if (!showTabs) {
@@ -1195,7 +1410,15 @@ private fun SwiftBrowserApp() {
                 }
             }
 
-            Box(Modifier.weight(1f).fillMaxWidth()) {
+            Box(
+                Modifier.weight(1f).fillMaxWidth().onGloballyPositioned {
+                    val pos = it.positionInWindow()
+                    webArea.set(
+                        pos.x.toInt(), pos.y.toInt(),
+                        (pos.x + it.size.width).toInt(), (pos.y + it.size.height).toInt()
+                    )
+                }
+            ) {
                 tabs.forEach { tab ->
                     key(tab.id) {
                         val isCurrent = tab.id == activeId
@@ -1573,6 +1796,7 @@ private fun SwiftBrowserApp() {
                 onDismiss = { showGroupSheet = false },
                 onNewTab = { showGroupSheet = false; newTabInGroup(sheetGid) },
                 onEdit = { editGroupKey = sheetGid },
+                onPickColor = { colorPickKey = sheetGid },
                 onUngroup = { showGroupSheet = false; handleDropOutside(sheetGid) },
                 onCloseGroup = {
                     showGroupSheet = false
@@ -1583,6 +1807,221 @@ private fun SwiftBrowserApp() {
                 onRemoveFromGroup = { handleDropOutside(it.id) }
             )
         }
+        if (showMenu) {
+            val onPage = !showTabs && !isHome && pageUrl.startsWith("http")
+            BoxWithConstraints(
+                Modifier.fillMaxSize()
+                    .background(Color(0x66000000))
+                    .pointerInput(Unit) { detectTapGestures(onTap = { showMenu = false }) }
+            ) {
+                val maxMenuH = maxHeight * 0.86f
+                Column(
+                    Modifier
+                        .align(Alignment.BottomEnd)
+                        .navigationBarsPadding()
+                        .padding(end = 10.dp, bottom = 58.dp)
+                        .widthIn(max = 320.dp)
+                        .fillMaxWidth(0.84f)
+                        .heightIn(max = maxMenuH)
+                        .clip(RoundedCornerShape(26.dp))
+                        .background(Color(0xFF2F3137))
+                        .pointerInput(Unit) { detectTapGestures(onTap = {}) }
+                ) {
+                    Column(
+                        Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(top = 8.dp)
+                    ) {
+                        MenuRow(Icons.Default.Add, "New tab") { showMenu = false; newTab() }
+                        MenuRow(Icons.Default.VisibilityOff, "New Private tab") { showMenu = false; startPrivateTab() }
+                        MenuRow(Icons.Default.GridView, "Add tab to group") { showMenu = false; showAddToGroup = true }
+                        if (showTabs) {
+                            MenuRow(Icons.Default.CreateNewFolder, "Group all tabs") { showMenu = false; groupAllTabs() }
+                            MenuRow(Icons.Default.DeleteSweep, "Close all tabs") { showMenu = false; confirmCloseAll = true }
+                        }
+                        MenuDivider()
+                        MenuRow(Icons.Default.History, "History") {
+                            showMenu = false
+                            showTabs = false
+                            address = "swift://history"
+                            showSuggestions = false
+                        }
+                        MenuRow(Icons.Default.Download, "Downloads") {
+                            showMenu = false
+                            runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
+                        }
+                        MenuRow(Icons.Default.Bookmarks, "Bookmarks") {
+                            showMenu = false
+                            showTabs = false
+                            showShield = false
+                            address = "swift://bookmarks"
+                            showSuggestions = false
+                        }
+                        MenuRow(Icons.Default.Tab, "Recent tabs") { showMenu = false; showRecent = true }
+                        MenuDivider()
+                        if (onPage) {
+                            MenuRow(Icons.Default.Search, "Find in page") {
+                                showMenu = false
+                                findText = ""
+                                findMatches = 0
+                                findIndex = 0
+                                findOpen = true
+                            }
+                            MenuRow(Icons.Default.Translate, "Translate\u2026") {
+                                showMenu = false
+                                load(
+                                    "https://translate.google.com/translate?sl=auto&tl=" +
+                                        java.util.Locale.getDefault().language + "&u=" + Uri.encode(pageUrl)
+                                )
+                            }
+                            MenuRow(Icons.Default.Description, "Show Reading mode") {
+                                showMenu = false
+                                toggleReadingMode()
+                            }
+                            MenuRow(Icons.Default.AddToHomeScreen, "Install and create shortcut") {
+                                showMenu = false
+                                installShortcut()
+                            }
+                            MenuRow(
+                                Icons.Default.DesktopWindows, "Desktop site",
+                                trailing = {
+                                    Checkbox(checked = desktopSites[activeId] == true, onCheckedChange = null)
+                                }
+                            ) {
+                                showMenu = false
+                                toggleDesktopSite()
+                            }
+                            MenuRow(Icons.Default.DeleteForever, "Shred site data") {
+                                showMenu = false
+                                shredSiteData()
+                            }
+                            MenuDivider()
+                        }
+                        MenuRow(Icons.Default.Settings, "Settings") { showMenu = false; showShield = true }
+                        MenuRow(Icons.Default.Public, "Set as default browser") {
+                            showMenu = false
+                            runCatching {
+                                context.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+                            }
+                        }
+                        MenuRow(Icons.Default.PowerSettingsNew, "Exit") {
+                            showMenu = false
+                            (context as? android.app.Activity)?.finishAndRemoveTask()
+                        }
+                        Spacer(Modifier.height(6.dp))
+                    }
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        MenuCircleButton(
+                            Icons.Default.ArrowForward, "Forward",
+                            enabled = onPage && activeWebView()?.canGoForward() == true
+                        ) { showMenu = false; activeWebView()?.goForward() }
+                        MenuCircleButton(
+                            if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
+                            "Bookmark", enabled = onPage, highlight = isBookmarked
+                        ) { showMenu = false; toggleBookmark() }
+                        MenuCircleButton(Icons.Default.Share, "Share", enabled = onPage) {
+                            showMenu = false
+                            sharePage(context, pageUrl)
+                        }
+                        MenuCircleButton(Icons.Default.Download, "Download page", enabled = onPage) {
+                            showMenu = false
+                            saveCurrentPage()
+                        }
+                        MenuCircleButton(Icons.Default.Refresh, "Reload", enabled = onPage, dark = true) {
+                            showMenu = false
+                            activeWebView()?.reload()
+                        }
+                    }
+                }
+            }
+        }
+
+        if (showAddToGroup) {
+            AlertDialog(
+                onDismissRequest = { showAddToGroup = false },
+                containerColor = Surface,
+                title = { Text("Add tab to group", color = TextMain) },
+                text = {
+                    Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clickable {
+                                    showAddToGroup = false
+                                    val gid = groupCounter++
+                                    tabGroups[activeId] = gid
+                                    groupUpdated[gid] = System.currentTimeMillis()
+                                    editGroupKey = gid
+                                }
+                                .padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Add, null, tint = TextMain)
+                            Spacer(Modifier.width(14.dp))
+                            Text("New group", color = TextMain, fontSize = 16.sp)
+                        }
+                        tabGroups.values.distinct().forEach { gid ->
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .clickable {
+                                        showAddToGroup = false
+                                        tabGroups[activeId] = gid
+                                        groupUpdated[gid] = System.currentTimeMillis()
+                                    }
+                                    .padding(vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(Modifier.size(22.dp).clip(CircleShape).background(groupColorOf(gid)))
+                                Spacer(Modifier.width(14.dp))
+                                Text(
+                                    groupLabel(groupNames, gid, tabs.count { tabGroups[it.id] == gid }),
+                                    color = TextMain, fontSize = 16.sp
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = { TextButton(onClick = { showAddToGroup = false }) { Text("Cancel", color = TextMain) } }
+            )
+        }
+
+        if (showRecent) {
+            AlertDialog(
+                onDismissRequest = { showRecent = false },
+                containerColor = Surface,
+                title = { Text("Recent tabs", color = TextMain) },
+                text = {
+                    if (recentClosed.isEmpty()) {
+                        Text("No recently closed tabs", color = TextMuted)
+                    } else {
+                        Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                            recentClosed.toList().forEach { (t, u) ->
+                                Column(
+                                    Modifier.fillMaxWidth()
+                                        .clickable {
+                                            showRecent = false
+                                            openUrlInNewTab(u)
+                                        }
+                                        .padding(vertical = 8.dp)
+                                ) {
+                                    Text(t.ifBlank { u }, color = TextMain, fontSize = 15.sp, maxLines = 1)
+                                    Text(prettyAddress(u), color = TextMuted, fontSize = 12.sp, maxLines = 1)
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { recentClosed.clear(); showRecent = false }) { Text("Clear", color = Accent) }
+                },
+                dismissButton = { TextButton(onClick = { showRecent = false }) { Text("Close", color = TextMain) } }
+            )
+        }
+
+        colorPickKey?.let { ck -> GroupColorPickerDialog(ck) { colorPickKey = null } }
+
         if (confirmCloseAll) {
             AlertDialog(
                 onDismissRequest = { confirmCloseAll = false },
@@ -2169,6 +2608,7 @@ private fun GroupCard(
     onOpen: () -> Unit,
     onUngroup: () -> Unit,
     onCloseGroup: () -> Unit,
+    onPickColor: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var menuOpen by remember { mutableStateOf(false) }
@@ -2187,7 +2627,7 @@ private fun GroupCard(
     ) {
         Row(Modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically) {
             Spacer(Modifier.width(4.dp))
-            Box(Modifier.size(20.dp).clip(CircleShape).background(color))
+            Box(Modifier.size(20.dp).clip(CircleShape).background(color).clickable { onPickColor() })
             Spacer(Modifier.width(9.dp))
             Text(
                 name,
@@ -2283,6 +2723,7 @@ private fun TabSwitcher(
     var query by remember { mutableStateOf("") }
     var openGroupKey by remember { mutableStateOf(openGroupRequest) }
     var renameKey by remember { mutableStateOf<Long?>(null) }
+    var colorKey by remember { mutableStateOf<Long?>(null) }
     var settling by remember { mutableStateOf<Settle?>(null) }
     val settleAnim = remember { Animatable(0f) }
     val scope = rememberCoroutineScope()
@@ -2591,7 +3032,8 @@ private fun TabSwitcher(
                 onOpen = { openGroupKey = it },
                 onRename = { renameKey = it },
                 onUngroup = { onDropOutside(it) },
-                onCloseGroup = { e -> e.tabs.toList().forEach { onClose(it) } }
+                onCloseGroup = { e -> e.tabs.toList().forEach { onClose(it) } },
+                onPickColor = { colorKey = it }
             ) else LazyVerticalGrid(
                 state = gridState,
                 userScrollEnabled = dragKey == null,
@@ -2676,6 +3118,7 @@ private fun TabSwitcher(
                                 color = groupColorFor(entry.key),
                                 name = groupLabel(groupNames, entry.key, entry.tabs.size),
                                 onRename = { renameKey = entry.key },
+                                onPickColor = { colorKey = entry.key },
                                 hovered = false,
                                 onOpen = { openGroupKey = entry.key },
                                 onUngroup = { onDropOutside(entry.key) },
@@ -2771,6 +3214,7 @@ private fun TabSwitcher(
             onDismiss = { openGroupKey = null },
             onNewTab = { onNewTabInGroup(openEntry.key) },
             onEdit = { renameKey = openEntry.key },
+            onPickColor = { colorKey = openEntry.key },
             onUngroup = { onDropOutside(openEntry.key) },
             onCloseGroup = { openEntry.tabs.toList().forEach { onClose(it) } },
             onSelect = onSelect,
@@ -2792,6 +3236,8 @@ private fun TabSwitcher(
             onSearchWeb = onSearchWeb
         )
     }
+
+    colorKey?.let { ck -> GroupColorPickerDialog(ck) { colorKey = null } }
 
     renameKey?.let { rk ->
         GroupEditDialog(
@@ -2815,6 +3261,7 @@ private fun GroupPopupOverlay(
     onDismiss: () -> Unit,
     onNewTab: () -> Unit,
     onEdit: () -> Unit,
+    onPickColor: () -> Unit,
     onUngroup: () -> Unit,
     onCloseGroup: () -> Unit,
     onSelect: (BrowserTab) -> Unit,
@@ -2848,7 +3295,7 @@ private fun GroupPopupOverlay(
                     IconButton(onClick = onDismiss) {
                         Icon(Icons.Default.ArrowBack, "Back", tint = TextMain)
                     }
-                    Box(Modifier.size(22.dp).clip(CircleShape).background(color))
+                    Box(Modifier.size(22.dp).clip(CircleShape).background(color).clickable { onPickColor() })
                     Spacer(Modifier.width(12.dp))
                     Text(
                         label,
@@ -2917,6 +3364,100 @@ private fun GroupPopupOverlay(
                 }
             }
         }
+    }
+}
+
+// Tap a group's color circle any time to pick another color.
+@Composable
+private fun GroupColorPickerDialog(key: Long, onDismiss: () -> Unit) {
+    val current = GroupColorStore[key] ?: (key % GroupColors.size).toInt()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Surface,
+        title = { Text("Group color", color = TextMain) },
+        text = {
+            Column {
+                GroupColors.indices.chunked(4).forEach { rowIdx ->
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        modifier = Modifier.padding(bottom = 14.dp)
+                    ) {
+                        rowIdx.forEach { i ->
+                            Box(
+                                Modifier.size(46.dp).clip(CircleShape)
+                                    .background(GroupColors[i])
+                                    .clickable {
+                                        GroupColorStore[key] = i
+                                        onDismiss()
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (current == i) {
+                                    Icon(Icons.Default.Check, null, tint = GroupInk, modifier = Modifier.size(24.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = TextMain) } }
+    )
+}
+
+// Menu building blocks (Brave-style menu).
+@Composable
+private fun MenuRow(
+    icon: ImageVector,
+    label: String,
+    enabled: Boolean = true,
+    trailing: (@Composable () -> Unit)? = null,
+    onClick: () -> Unit
+) {
+    val tint = if (enabled) TextMain else TextMuted.copy(alpha = 0.5f)
+    Row(
+        Modifier.fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = tint, modifier = Modifier.size(24.dp))
+        Spacer(Modifier.width(22.dp))
+        Text(label, color = tint, fontSize = 17.sp, maxLines = 1, modifier = Modifier.weight(1f))
+        if (trailing != null) trailing()
+    }
+}
+
+@Composable
+private fun MenuDivider() {
+    HorizontalDivider(Modifier.padding(horizontal = 20.dp, vertical = 6.dp), color = Surface3)
+}
+
+@Composable
+private fun MenuCircleButton(
+    icon: ImageVector,
+    desc: String,
+    enabled: Boolean,
+    dark: Boolean = false,
+    highlight: Boolean = false,
+    onClick: () -> Unit
+) {
+    Box(
+        Modifier.size(46.dp).clip(CircleShape)
+            .background(if (dark) Color(0xFF15171A) else Color(0xFF3F4249))
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            icon, desc,
+            tint = when {
+                !enabled -> TextMuted.copy(alpha = 0.5f)
+                highlight -> Accent
+                else -> TextMain
+            },
+            modifier = Modifier.size(22.dp)
+        )
     }
 }
 
@@ -3320,7 +3861,8 @@ private fun GroupListSection(
     onOpen: (Long) -> Unit,
     onRename: (Long) -> Unit,
     onUngroup: (Long) -> Unit,
-    onCloseGroup: (TabEntry) -> Unit
+    onCloseGroup: (TabEntry) -> Unit,
+    onPickColor: (Long) -> Unit
 ) {
     LazyColumn(
         Modifier.fillMaxSize().padding(horizontal = 17.dp),
@@ -3374,7 +3916,10 @@ private fun GroupListSection(
                 Spacer(Modifier.width(16.dp))
                 Column(Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(14.dp).clip(CircleShape).background(groupColorOf(entry.key)))
+                        Box(
+                            Modifier.size(14.dp).clip(CircleShape).background(groupColorOf(entry.key))
+                                .clickable { onPickColor(entry.key) }
+                        )
                         Spacer(Modifier.width(10.dp))
                         Text(
                             groupLabel(names, entry.key, count),
@@ -3438,12 +3983,12 @@ private fun PagePreview(
     tint: Color = Surface2
 ) {
     val host = hostOf(tab.url)
-    val thumb = ThumbStore[tab.id]
+    val thumb = ThumbStore[tab.id] ?: if (tab.url == "swift://home") HomeThumbStore else null
     Box(
         modifier.clip(RoundedCornerShape(if (compact) 10.dp else 12.dp)).background(tint),
         contentAlignment = Alignment.Center
     ) {
-        if (tab.url == "swift://home" || host.isEmpty()) {
+        if ((tab.url == "swift://home" || host.isEmpty()) && thumb == null) {
             Icon(
                 Icons.Default.Home, null,
                 tint = TextMuted.copy(alpha = 0.5f),
