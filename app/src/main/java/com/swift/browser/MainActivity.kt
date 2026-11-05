@@ -1385,19 +1385,6 @@ private fun SwiftBrowserApp() {
                     Text("SHIELDS", color = Accent, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                     Icon(Icons.Default.ChevronRight, null, tint = TextMuted, modifier = Modifier.size(15.dp))
                 }
-                if (!isHome && pageUrl.startsWith("http")) {
-                    IconButton(
-                        onClick = { toggleBookmark() },
-                        modifier = Modifier.size(32.dp)
-                    ) {
-                        Icon(
-                            if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
-                            contentDescription = "Toggle bookmark",
-                            tint = if (isBookmarked) Accent else TextMuted,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
-                }
             }
             }
 
@@ -1747,14 +1734,20 @@ private fun SwiftBrowserApp() {
                 }
 
                 // BOOKMARKS
+                val canBookmarkPage = !isHome && pageUrl.startsWith("http")
                 ToolbarButton(
-                    Icons.Default.BookmarkBorder,
-                    "Bookmarks",
-                    selected = address == "swift://bookmarks"
+                    if (canBookmarkPage && isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
+                    "Bookmark this page",
+                    selected = canBookmarkPage && isBookmarked
                 ) {
-                    address = "swift://bookmarks"
-                    showTabs = false
-                    showSuggestions = false
+                    if (canBookmarkPage) {
+                        toggleBookmark()
+                    } else {
+                        // Not on a web page: nothing to save, so open the list instead.
+                        address = "swift://bookmarks"
+                        showTabs = false
+                        showSuggestions = false
+                    }
                 }
 
                 // SEARCH
@@ -1917,10 +1910,6 @@ private fun SwiftBrowserApp() {
                             Icons.Default.ArrowForward, "Forward",
                             enabled = onPage && activeWebView()?.canGoForward() == true
                         ) { showMenu = false; activeWebView()?.goForward() }
-                        MenuCircleButton(
-                            if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
-                            "Bookmark", enabled = onPage, highlight = isBookmarked
-                        ) { showMenu = false; toggleBookmark() }
                         MenuCircleButton(Icons.Default.Share, "Share", enabled = onPage) {
                             showMenu = false
                             sharePage(context, pageUrl)
@@ -2745,6 +2734,16 @@ private fun TabSwitcher(
     var gridTopLeft by remember { mutableStateOf(Offset.Zero) }
     var hoverZone by remember { mutableIntStateOf(0) } // -1 = before target, 0 = merge, 1 = after target
     var dragSizePx by remember { mutableStateOf(Offset.Zero) }
+    // Vector from the finger to the held card's centre at pick-up, so the card
+    // stays exactly where it was and simply shrinks around the finger (Brave).
+    var grabDelta by remember { mutableStateOf(Offset.Zero) }
+    var bandKey by remember { mutableStateOf<Long?>(null) }
+    var bandSince by remember { mutableLongStateOf(0L) }
+    val holdScale by animateFloatAsState(
+        targetValue = if (dragKey != null) 0.84f else 1f,
+        animationSpec = tween(140),
+        label = "hold"
+    )
     var gridHeight by remember { mutableIntStateOf(0) }
     var gridWidth by remember { mutableIntStateOf(0) }
     var lastMoveSig by remember { mutableStateOf("") }
@@ -2827,6 +2826,10 @@ private fun TabSwitcher(
         )
     }
 
+    // Where the (shrunk) held card is drawn: shrinks toward the finger, no jump.
+    fun heldVisualCenter(): Offset =
+        heldCenter(dragPos + grabDelta) - grabDelta * (1f - holdScale)
+
     // Moves the held card to a new slot right away; the others shift to make room.
     fun liveMove(src: Long, target: Long, after: Boolean) {
         val sig = "$src>$target>$after"
@@ -2864,23 +2867,45 @@ private fun TabSwitcher(
             }
             return
         }
-        val fx = (p.x - r.left) / r.width
-        when {
-            fx < 0.35f -> {
-                hoverKey = null
-                hoverZone = 0
-                liveMove(src, t, false)
+        // Brave-style: judge by how much the held card covers another card.
+        // About half way over a card -> group them. Lingering at the edge -> reorder.
+        val vc = heldVisualCenter()
+        val hw = dragSizePx.x * holdScale / 2f
+        val hh = dragSizePx.y * holdScale / 2f
+        val held = Rect(vc.x - hw, vc.y - hh, vc.x + hw, vc.y + hh)
+        var bestKey: Long? = null
+        var bestRatio = 0f
+        cardBounds.forEach { (key, rect) ->
+            if (key == src || key == NEW_TAB_KEY) return@forEach
+            val w = minOf(held.right, rect.right) - maxOf(held.left, rect.left)
+            val h = minOf(held.bottom, rect.bottom) - maxOf(held.top, rect.top)
+            if (w > 0f && h > 0f) {
+                val ratio = (w * h) / (rect.width * rect.height)
+                if (ratio > bestRatio) { bestRatio = ratio; bestKey = key }
             }
-            fx > 0.65f -> {
-                hoverKey = null
-                hoverZone = 0
-                liveMove(src, t, true)
+        }
+        val bk = bestKey
+        val br = bk?.let { cardBounds[it] }
+        if (bk != null && br != null && bestRatio >= 0.40f) {
+            hoverKey = bk
+            hoverZone = 0
+            bandKey = null
+            lastMoveSig = ""
+            return
+        }
+        hoverKey = null
+        hoverZone = 0
+        if (bk != null && br != null && bestRatio >= 0.12f) {
+            val now = System.currentTimeMillis()
+            if (bandKey != bk) { bandKey = bk; bandSince = now }
+            if (now - bandSince >= 300) {
+                val dx = vc.x - br.center.x
+                val dy = vc.y - br.center.y
+                val after = if (kotlin.math.abs(dy) > br.height * 0.25f) dy > 0 else dx > 0
+                liveMove(src, bk, after)
             }
-            else -> {
-                hoverKey = t
-                hoverZone = 0
-                lastMoveSig = ""
-            }
+        } else {
+            bandKey = null
         }
     }
 
@@ -2889,7 +2914,7 @@ private fun TabSwitcher(
         val mergeRect = merge?.let { cardBounds[it] }
         if (dragDistance > 40f && merge != null && merge != NEW_TAB_KEY && mergeRect != null) {
             // Merge: the held card flies into the target, then groups with it.
-            settling = Settle(key, merge, heldCenter(dragPos), mergeRect.center)
+            settling = Settle(key, merge, heldVisualCenter(), mergeRect.center)
             hoverKey = null
             hoverZone = 0
             scope.launch {
@@ -2929,10 +2954,8 @@ private fun TabSwitcher(
                     rel > gridHeight - edge -> ((rel - (gridHeight - edge)).coerceAtMost(edge) / edge) * 34f
                     else -> 0f
                 }
-                if (delta != 0f) {
-                    gridState.dispatchRawDelta(delta)
-                    dragKey?.let { latestHover(it) }
-                }
+                if (delta != 0f) gridState.dispatchRawDelta(delta)
+                dragKey?.let { latestHover(it) }
             }
             delay(16)
         }
@@ -3080,6 +3103,8 @@ private fun TabSwitcher(
                                     dragDistance = 0f
                                     dragSizePx = if (r != null) Offset(r.width, r.height) else Offset.Zero
                                     dragPos = if (r != null) Offset(r.left + offset.x, r.top + offset.y) else Offset.Zero
+                                    grabDelta = if (r != null) r.center - dragPos else Offset.Zero
+                                    bandKey = null
                                     hoverKey = null
                                     hoverZone = 0
                                 },
@@ -3164,7 +3189,7 @@ private fun TabSwitcher(
                             st.from.x + (st.to.x - st.from.x) * p,
                             st.from.y + (st.to.y - st.from.y) * p
                         )
-                    } else heldCenter(dragPos)
+                    } else heldVisualCenter()
                     Box(
                         Modifier
                             .offset {
@@ -3175,7 +3200,7 @@ private fun TabSwitcher(
                             }
                             .size(wDp, hDp)
                             .graphicsLayer {
-                                val sc = if (st != null) 1f - 0.7f * p else 1.04f
+                                val sc = if (st != null) holdScale * (1f - 0.7f * p) else holdScale
                                 scaleX = sc
                                 scaleY = sc
                                 alpha = if (st != null) 1f - 0.9f * p else 0.96f
