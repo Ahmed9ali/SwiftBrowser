@@ -95,6 +95,7 @@ import androidx.compose.ui.unit.IntOffset
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
@@ -756,6 +757,8 @@ private fun SwiftBrowserApp() {
         val idx = if (after) rest.indexOfLast { it.id in tgtIds } + 1 else rest.indexOfFirst { it.id in tgtIds }
         if (idx < 0) return
         rest.addAll(idx.coerceIn(0, rest.size), moving)
+        // Called live while dragging: ignore moves that change nothing.
+        if (rest.map { it.id } == tabs.map { it.id }) return
         tabs.clear()
         tabs.addAll(rest)
     }
@@ -2302,6 +2305,11 @@ private fun TabSwitcher(
     var hoverZone by remember { mutableIntStateOf(0) } // -1 = before target, 0 = merge, 1 = after target
     var dragSizePx by remember { mutableStateOf(Offset.Zero) }
     var gridHeight by remember { mutableIntStateOf(0) }
+    var gridWidth by remember { mutableIntStateOf(0) }
+    var lastMoveSig by remember { mutableStateOf("") }
+    var lastMoveAt by remember { mutableLongStateOf(0L) }
+    var moveCooling by remember { mutableStateOf(false) }
+    val lastPos = remember { HashMap<Long, Offset>() }
     val gridState = rememberLazyGridState()
     val density = LocalDensity.current
     val slackPx = with(density) { 7.dp.toPx() }
@@ -2359,61 +2367,108 @@ private fun TabSwitcher(
 
     fun groupColorFor(key: Long): Color = groupColorOf(key)
 
-    // Where the held card is relative to the card under it: edges reorder,
-    // the middle merges into a group.
+    // Keep the finger / held card inside the list area (never over the header).
+    fun clampToGrid(p: Offset): Offset {
+        if (gridWidth <= 0 || gridHeight <= 0) return p
+        return Offset(
+            p.x.coerceIn(gridTopLeft.x, gridTopLeft.x + gridWidth),
+            p.y.coerceIn(gridTopLeft.y + 1f, gridTopLeft.y + gridHeight - 1f)
+        )
+    }
+
+    fun heldCenter(p: Offset): Offset {
+        val hw = dragSizePx.x / 2f
+        val hh = dragSizePx.y / 2f
+        fun cl(v: Float, lo: Float, hi: Float) = if (hi < lo) lo else v.coerceIn(lo, hi)
+        return Offset(
+            cl(p.x, gridTopLeft.x + hw, gridTopLeft.x + gridWidth - hw),
+            cl(p.y, gridTopLeft.y + hh, gridTopLeft.y + gridHeight - hh)
+        )
+    }
+
+    // Moves the held card to a new slot right away; the others shift to make room.
+    fun liveMove(src: Long, target: Long, after: Boolean) {
+        val sig = "$src>$target>$after"
+        val now = System.currentTimeMillis()
+        if (sig == lastMoveSig || now - lastMoveAt < 220) return
+        lastMoveSig = sig
+        lastMoveAt = now
+        moveCooling = true
+        onReorder(src, target, after)
+        scope.launch {
+            delay(180)
+            moveCooling = false
+        }
+    }
+
+    // Edges of a card: the others shift and the held card takes that slot.
+    // Middle of a card: merge into a group.
     fun updateHover(src: Long) {
         if (dragDistance <= 24f) {
             hoverKey = null
             hoverZone = 0
             return
         }
-        val t = targetUnder(dragPos, src)
-        hoverKey = t
+        val p = clampToGrid(dragPos)
+        val t = targetUnder(p, src)
         val r = t?.let { cardBounds[it] }
-        hoverZone = if (r == null) 0 else {
-            val fx = (dragPos.x - r.left) / r.width
-            when {
-                fx < 0.28f -> -1
-                fx > 0.72f -> 1
-                else -> 0
+        if (t == null || r == null) {
+            hoverKey = null
+            hoverZone = 0
+            // Empty space below the last card: move to the end.
+            val last = filtered.lastOrNull()
+            val lr = last?.let { cardBounds[it.key] }
+            if (last != null && lr != null && last.key != src && p.y > lr.bottom) {
+                liveMove(src, last.key, true)
+            }
+            return
+        }
+        val fx = (p.x - r.left) / r.width
+        when {
+            fx < 0.35f -> {
+                hoverKey = null
+                hoverZone = 0
+                liveMove(src, t, false)
+            }
+            fx > 0.65f -> {
+                hoverKey = null
+                hoverZone = 0
+                liveMove(src, t, true)
+            }
+            else -> {
+                hoverKey = t
+                hoverZone = 0
+                lastMoveSig = ""
             }
         }
     }
 
     fun finishDrag(key: Long) {
-        val dist = dragDistance
-        val target = if (dist > 40f) targetUnder(dragPos, key) else null
-        val targetRect = target?.let { cardBounds[it] }
-        val zone = hoverZone
-        val relY = dragPos.y - gridTopLeft.y
-        if (target != null && target != NEW_TAB_KEY && targetRect != null && zone == 0) {
+        val merge = hoverKey
+        val mergeRect = merge?.let { cardBounds[it] }
+        if (dragDistance > 40f && merge != null && merge != NEW_TAB_KEY && mergeRect != null) {
             // Merge: the held card flies into the target, then groups with it.
-            settling = Settle(key, target, dragPos, targetRect.center)
+            settling = Settle(key, merge, heldCenter(dragPos), mergeRect.center)
             hoverKey = null
             hoverZone = 0
             scope.launch {
                 settleAnim.snapTo(0f)
                 settleAnim.animateTo(1f, tween(240))
-                onGroup(key, target)
+                onGroup(key, merge)
                 settling = null
                 dragKey = null
                 dragDistance = 0f
             }
             return
         }
-        if (target != null && target != NEW_TAB_KEY && zone != 0) {
-            onReorder(key, target, zone > 0)
-        } else if (dist > 40f && target == null && relY >= 0f && relY <= gridHeight.toFloat()) {
-            // Dropped in empty space inside the list: move to the end.
-            val last = filtered.lastOrNull()?.key
-            if (last != null && last != key) onReorder(key, last, true)
-        }
         dragKey = null
         hoverKey = null
         hoverZone = 0
         dragDistance = 0f
+        lastMoveSig = ""
     }
     val latestFinish by rememberUpdatedState({ k: Long -> finishDrag(k) })
+    val latestHover by rememberUpdatedState({ k: Long -> updateHover(k) })
 
     // Opening the overview shows the tab you are on, not the top of the list.
     LaunchedEffect(Unit) {
@@ -2426,7 +2481,7 @@ private fun TabSwitcher(
         if (dragKey == null) return@LaunchedEffect
         val edge = with(density) { 96.dp.toPx() }
         while (true) {
-            if (settling == null) {
+            if (settling == null && !moveCooling) {
                 val rel = dragPos.y - gridTopLeft.y
                 val delta = when {
                     rel < edge -> -((edge - rel).coerceAtMost(edge) / edge) * 34f
@@ -2435,7 +2490,7 @@ private fun TabSwitcher(
                 }
                 if (delta != 0f) {
                     gridState.dispatchRawDelta(delta)
-                    dragKey?.let { updateHover(it) }
+                    dragKey?.let { latestHover(it) }
                 }
             }
             delay(16)
@@ -2509,6 +2564,7 @@ private fun TabSwitcher(
                 .onGloballyPositioned {
                     gridTopLeft = it.positionInRoot()
                     gridHeight = it.size.height
+                    gridWidth = it.size.width
                 }
                 .pointerInput(Unit) {
                     // Follows the finger for the whole drag (even if the held card scrolls
@@ -2522,7 +2578,7 @@ private fun TabSwitcher(
                             val newPos = gridTopLeft + change.position
                             dragDistance += (newPos - dragPos).getDistance()
                             dragPos = newPos
-                            updateHover(key)
+                            latestHover(key)
                             if (!change.pressed) latestFinish(key)
                         }
                     }
@@ -2564,14 +2620,16 @@ private fun TabSwitcher(
 
                     // Items that scroll away must not leave stale drop targets behind.
                     DisposableEffect(entry.key) {
-                        onDispose { cardBounds.remove(entry.key) }
+                        onDispose {
+                            cardBounds.remove(entry.key)
+                            lastPos.remove(entry.key)
+                        }
                     }
 
                     // A long press only STARTS the drag here; the list itself follows the
                     // finger and finishes the drop, so dragging works across scrolling.
                     val dragModifier = Modifier
                         .alpha(if (dragKey == entry.key) 0f else 1f)
-                        .onGloballyPositioned { cardBounds[entry.key] = it.boundsInRoot() }
                         .pointerInput(entry.key) {
                             detectDragGesturesAfterLongPress(
                                 onDragStart = { offset ->
@@ -2589,9 +2647,28 @@ private fun TabSwitcher(
                             )
                         }
 
+                    // When cards shift to make room, each one slides from its old slot.
+                    val moveAnim = remember { Animatable(Offset.Zero, Offset.VectorConverter) }
                     Box(
                         Modifier.fillMaxWidth().height(196.dp)
-                            .graphicsLayer { scaleX = cardScale; scaleY = cardScale }
+                            .onGloballyPositioned { c ->
+                                val r = c.boundsInRoot()
+                                cardBounds[entry.key] = r
+                                val old = lastPos[entry.key]
+                                lastPos[entry.key] = r.topLeft
+                                if (moveCooling && old != null && (old - r.topLeft).getDistance() > 1f) {
+                                    scope.launch {
+                                        moveAnim.snapTo(old - r.topLeft)
+                                        moveAnim.animateTo(Offset.Zero, tween(200))
+                                    }
+                                }
+                            }
+                            .graphicsLayer {
+                                translationX = moveAnim.value.x
+                                translationY = moveAnim.value.y
+                                scaleX = cardScale
+                                scaleY = cardScale
+                            }
                     ) {
                         if (entry.isGroup) {
                             GroupCard(
@@ -2615,18 +2692,6 @@ private fun TabSwitcher(
                                 onClose = { onClose(activeMember) },
                                 onRemoveFromGroup = null,
                                 modifier = dragModifier
-                            )
-                        }
-                        // Reorder marker: shows where the held card will be placed.
-                        if (isHovered && hoverZone != 0) {
-                            Box(
-                                Modifier
-                                    .align(if (hoverZone < 0) Alignment.CenterStart else Alignment.CenterEnd)
-                                    .offset(x = if (hoverZone < 0) (-8).dp else 8.dp)
-                                    .width(4.dp)
-                                    .fillMaxHeight(0.9f)
-                                    .clip(RoundedCornerShape(2.dp))
-                                    .background(Accent)
                             )
                         }
                     }
@@ -2656,7 +2721,7 @@ private fun TabSwitcher(
                             st.from.x + (st.to.x - st.from.x) * p,
                             st.from.y + (st.to.y - st.from.y) * p
                         )
-                    } else dragPos
+                    } else heldCenter(dragPos)
                     Box(
                         Modifier
                             .offset {
