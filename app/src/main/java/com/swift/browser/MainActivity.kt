@@ -233,6 +233,30 @@ private const val LANG_JS = """
 })()
 """
 
+// Desktop site: Chrome-style. Forces a wide layout viewport (pages that ask for
+// width=device-width otherwise snap back to the phone layout) and hides the
+// "I'm a phone" signals that sites check from JavaScript.
+private const val DESKTOP_JS = """
+(function(){
+ try{
+  Object.defineProperty(Navigator.prototype,'maxTouchPoints',{get:function(){return 0;},configurable:true});
+  Object.defineProperty(Navigator.prototype,'userAgentData',{get:function(){return undefined;},configurable:true});
+  Object.defineProperty(Navigator.prototype,'platform',{get:function(){return 'Linux x86_64';},configurable:true});
+ }catch(e){}
+ function fix(){
+  var h=document.head||document.documentElement; if(!h) return;
+  var ms=document.querySelectorAll('meta[name=viewport]');
+  if(!ms.length){var m=document.createElement('meta');m.name='viewport';m.content='width=1100';h.appendChild(m);return;}
+  for(var i=0;i<ms.length;i++){ if(ms[i].content!=='width=1100') ms[i].content='width=1100'; }
+ }
+ fix();
+ if(!window.__swiftDeskObs){
+  window.__swiftDeskObs=new MutationObserver(fix);
+  window.__swiftDeskObs.observe(document.head||document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['content']});
+ }
+})();
+"""
+
 // Translates the page where it is (Google's translate element), no page change.
 private const val TRANSLATE_JS = """
 (function(tl){
@@ -516,6 +540,7 @@ private fun SwiftBrowserApp() {
     var findIndex by remember { mutableIntStateOf(0) }
     val desktopSites = remember { mutableStateMapOf<Long, Boolean>() }
     var translateOffer by remember { mutableStateOf<Pair<Long, String>?>(null) }
+    var translateDone by remember { mutableStateOf<Pair<Long, String>?>(null) }
     var translateMenu by remember { mutableStateOf(false) }
     val downloadStore = remember { DownloadStore(context) }
     val recentClosed = remember { mutableStateListOf<Pair<String, String>>() }
@@ -975,26 +1000,64 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    fun translatePageInPlace() {
-        val wv = activeWebView() ?: return
-        val original = pageUrl
-        translateOffer = null
-        translateMenu = false
-        Toast.makeText(context, "Translating\u2026", Toast.LENGTH_SHORT).show()
-        wv.evaluateJavascript(TRANSLATE_JS.replace("__TL__", deviceLang()), null)
-        // If the site blocks the translate script, fall back to Google's translate page.
+    fun applyDesktopJs(view: WebView?, tabId: Long) {
+        if (desktopSites[tabId] == true) view?.evaluateJavascript(DESKTOP_JS, null)
+    }
+
+    fun translateFallbackUrl(original: String) =
+        "https://translate.google.com/translate?sl=auto&tl=" + deviceLang() + "&u=" + Uri.encode(original)
+
+    // Waits until Google has really translated the page, then shows "Page translated / Undo".
+    fun pollTranslate(wv: WebView, original: String, src: Array<String>, tries: Int) {
         Handler(Looper.getMainLooper()).postDelayed({
             if (pageUrl == original) {
-                wv.evaluateJavascript("window.__swiftTrOk===1") { ok ->
-                    if (ok != "true" && pageUrl == original) {
-                        load(
-                            "https://translate.google.com/translate?sl=auto&tl=" +
-                                deviceLang() + "&u=" + Uri.encode(original)
-                        )
+                wv.evaluateJavascript(
+                    "(window.__swiftTrOk===1&&document.documentElement.className.indexOf('translated')>=0)"
+                ) { ok ->
+                    if (pageUrl == original) {
+                        when {
+                            ok == "true" -> translateDone = activeId to src[0]
+                            tries >= 20 -> wv.evaluateJavascript("window.__swiftTrOk===1") { ok2 ->
+                                // The site blocked the translate script: use Google's translate page.
+                                if (ok2 != "true" && pageUrl == original) load(translateFallbackUrl(original))
+                            }
+                            else -> pollTranslate(wv, original, src, tries + 1)
+                        }
                     }
                 }
             }
-        }, 7000)
+        }, 400)
+    }
+
+    fun translatePageInPlace() {
+        val wv = activeWebView() ?: return
+        val original = pageUrl
+        val src = arrayOf(translateOffer?.second ?: "")
+        translateOffer = null
+        translateDone = null
+        translateMenu = false
+        Toast.makeText(context, "Translating\u2026", Toast.LENGTH_SHORT).show()
+        // Read the source language before the page changes, then translate.
+        wv.evaluateJavascript(LANG_JS) { raw ->
+            if (src[0].isEmpty()) src[0] = raw?.trim('"')?.lowercase().orEmpty().let { if (it == "null") "" else it }
+        }
+        wv.evaluateJavascript(TRANSLATE_JS.replace("__TL__", deviceLang()), null)
+        pollTranslate(wv, original, src, 0)
+    }
+
+    fun undoTranslate() {
+        val wv = activeWebView() ?: return
+        translateDone = null
+        wv.evaluateJavascript(
+            "(function(){var c=document.querySelector('select.goog-te-combo');" +
+                "if(c){c.value='';c.dispatchEvent(new Event('change'));}})()", null
+        )
+        // If the page still shows translated text, a reload always restores the original.
+        Handler(Looper.getMainLooper()).postDelayed({
+            wv.evaluateJavascript("document.documentElement.className.indexOf('translated')>=0") { r ->
+                if (r == "true") wv.reload()
+            }
+        }, 900)
     }
 
     fun refreshNavigation() {
@@ -1043,6 +1106,7 @@ private fun SwiftBrowserApp() {
                 }
 
                 override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                    if (newProgress in 15..95) applyDesktopJs(view, tabId)
                     if (newProgress >= 100) refreshLayouts[tabId]?.endRefresh()
                     if (tabId == activeId && view?.url?.startsWith("about:") != true) {
                         loadProgress = newProgress
@@ -1095,6 +1159,8 @@ private fun SwiftBrowserApp() {
                 ) {
                     if (url == null || url.startsWith("about:")) return
                     if (translateOffer?.first == tabId) translateOffer = null
+                    if (translateDone?.first == tabId) translateDone = null
+                    applyDesktopJs(view, tabId)
                     firstParty[tabId] = url
                     val oldHost = hostOf(tabs.firstOrNull { it.id == tabId }?.url ?: "")
                     if (hostOf(url) != oldHost) FaviconStore.remove(tabId)
@@ -1106,8 +1172,13 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
+                override fun onPageCommitVisible(view: WebView?, url: String?) {
+                    applyDesktopJs(view, tabId)
+                }
+
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (url == null || url.startsWith("about:")) return
+                    applyDesktopJs(view, tabId)
                     updateTabById(tabId, url = url)
                     refreshLayouts[tabId]?.endRefresh()
                     val title = tabs.firstOrNull { it.id == tabId }?.title ?: url
@@ -1637,33 +1708,56 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                // Brave-style translate offer: small card on top of the page, goes away by itself.
-                val offer = translateOffer
-                LaunchedEffect(offer) {
-                    if (offer != null) {
-                        delay(9000)
-                        if (translateOffer == offer) translateOffer = null
+                // Brave-style translate card: "Translate page?" first, then "Page translated / Undo".
+                // Goes away by itself, or swipe it up.
+                val banner = translateDone ?: translateOffer
+                val bannerDone = translateDone != null
+                LaunchedEffect(banner) {
+                    if (banner != null) {
+                        delay(if (bannerDone) 8000 else 9000)
+                        if (translateDone == banner) translateDone = null
+                        if (translateOffer == banner) translateOffer = null
                     }
                 }
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = offer != null && offer.first == activeId && !showTabs && !showSuggestions &&
+                    visible = banner != null && banner.first == activeId && !showTabs && !showSuggestions &&
                         address != "swift://bookmarks" && address != "swift://history" &&
                         address != "swift://downloads",
                     enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { -it }),
                     exit = fadeOut(tween(120)) + slideOutVertically(targetOffsetY = { -it }),
                     modifier = Modifier.align(Alignment.TopCenter)
                 ) {
-                    val code = offer?.second ?: ""
-                    val from = java.util.Locale(code).getDisplayLanguage().ifBlank { code }
+                    val code = banner?.second ?: ""
+                    val fromName = java.util.Locale(code).getDisplayLanguage()
+                    val from = fromName.ifBlank { "Detected language" }
                     val to = java.util.Locale(deviceLang()).getDisplayLanguage()
+                    var swipeY by remember(banner) { mutableFloatStateOf(0f) }
                     Row(
                         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
+                            .graphicsLayer {
+                                translationY = swipeY
+                                alpha = (1f + swipeY / 260f).coerceIn(0f, 1f)
+                            }
+                            .pointerInput(banner) {
+                                androidx.compose.foundation.gestures.detectVerticalDragGestures(
+                                    onDragEnd = {
+                                        if (swipeY < -50f) {
+                                            translateOffer = null
+                                            translateDone = null
+                                        } else swipeY = 0f
+                                    },
+                                    onDragCancel = { swipeY = 0f }
+                                ) { _, dy -> swipeY = (swipeY + dy).coerceAtMost(0f) }
+                            }
                             .clip(RoundedCornerShape(20.dp)).background(Surface)
                             .padding(start = 16.dp, top = 10.dp, bottom = 10.dp, end = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text("Translate page?", color = TextMain, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                if (bannerDone) "Page translated" else "Translate page?",
+                                color = TextMain, fontSize = 15.sp, fontWeight = FontWeight.Medium
+                            )
                             Text("$from to $to", color = TextMuted, fontSize = 12.sp)
                         }
                         Box {
@@ -1674,20 +1768,25 @@ private fun SwiftBrowserApp() {
                                 BrowserMenuItem("Never translate this site", Icons.Default.Block) {
                                     translateMenu = false
                                     translateOffer = null
+                                    translateDone = null
                                     val sp = context.getSharedPreferences("swift_translate", Context.MODE_PRIVATE)
                                     val set = (sp.getStringSet("never", emptySet()) ?: emptySet()).toMutableSet()
                                     set.add(hostOf(pageUrl))
                                     sp.edit().putStringSet("never", set).apply()
                                 }
-                                BrowserMenuItem("Not now", Icons.Default.Close) {
+                                BrowserMenuItem("Dismiss", Icons.Default.Close) {
                                     translateMenu = false
                                     translateOffer = null
+                                    translateDone = null
                                 }
                             }
                         }
                         Box(Modifier.width(1.dp).height(28.dp).background(Surface3))
-                        TextButton(onClick = { translatePageInPlace() }) {
-                            Text("Translate", color = Accent, fontWeight = FontWeight.Bold)
+                        TextButton(onClick = { if (bannerDone) undoTranslate() else translatePageInPlace() }) {
+                            Text(
+                                if (bannerDone) "Undo" else "Translate",
+                                color = Accent, fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }
