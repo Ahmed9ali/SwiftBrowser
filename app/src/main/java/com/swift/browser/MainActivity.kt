@@ -1028,6 +1028,17 @@ private fun SwiftBrowserApp() {
     // trip the host's bot check (the Brave captcha in the screenshot). If the
     // widget can't run on a page we say so and leave the page untouched.
 
+    // The widget was blocked (strict site policy) or the network never
+    // delivered it. Tell the user and leave the page as it was, so the
+    // in-place attempt (or a retry) is never destroyed by a navigation.
+    // NOTE: declared before pollTranslate() so the two call sites below
+    // resolve cleanly (Kotlin requires local functions to be declared first).
+    fun failTranslate() {
+        translateOffer = null
+        translateDone = null
+        Toast.makeText(context, "Couldn't translate this page", Toast.LENGTH_SHORT).show()
+    }
+
     // Waits until Google has really translated the page, then shows "Page translated / Undo".
     // The widget library is several MB from translate.google.com, so on slow
     // networks it can take far longer than a few seconds to arrive — keep
@@ -1055,15 +1066,6 @@ private fun SwiftBrowserApp() {
                 }
             }
         }, 400)
-    }
-
-    // The widget was blocked (strict site policy) or the network never
-    // delivered it. Tell the user and leave the page as it was, so the
-    // in-place attempt (or a retry) is never destroyed by a navigation.
-    fun failTranslate() {
-        translateOffer = null
-        translateDone = null
-        Toast.makeText(context, "Couldn't translate this page", Toast.LENGTH_SHORT).show()
     }
 
     fun translatePageInPlace() {
