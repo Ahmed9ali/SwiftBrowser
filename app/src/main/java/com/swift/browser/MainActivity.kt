@@ -76,6 +76,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -1739,7 +1740,7 @@ private fun SwiftBrowserApp() {
                                 alpha = (1f + swipeY / 260f).coerceIn(0f, 1f)
                             }
                             .pointerInput(banner) {
-                                androidx.compose.foundation.gestures.detectVerticalDragGestures(
+                                detectDragGestures(
                                     onDragEnd = {
                                         if (swipeY < -50f) {
                                             translateOffer = null
@@ -1747,7 +1748,10 @@ private fun SwiftBrowserApp() {
                                         } else swipeY = 0f
                                     },
                                     onDragCancel = { swipeY = 0f }
-                                ) { _, dy -> swipeY = (swipeY + dy).coerceAtMost(0f) }
+                                ) { change, dragAmount ->
+                                    change.consume()
+                                    swipeY = (swipeY + dragAmount.y).coerceAtMost(0f)
+                                }
                             }
                             .clip(RoundedCornerShape(20.dp)).background(Surface)
                             .padding(start = 16.dp, top = 10.dp, bottom = 10.dp, end = 6.dp),
