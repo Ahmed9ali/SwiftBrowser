@@ -258,27 +258,42 @@ private const val DESKTOP_JS = """
 })();
 """
 
-// Translates the page where it is (Google's translate element), no page change.
+// Translates the page where it is (Google's translate element): no page change,
+// no reload, and never the translate.goog proxy page. Safe to run repeatedly —
+// the widget library loads once per page and re-running just re-issues the
+// translation instead of injecting duplicate scripts.
 private const val TRANSLATE_JS = """
 (function(tl){
- window.__swiftTrOk=0;
- window.googleTranslateElementInit=function(){
-  new google.translate.TranslateElement({pageLanguage:'auto',includedLanguages:tl,autoDisplay:false},'__swift_te');
+ function applyLang(){
   var n=0,iv=setInterval(function(){
    var c=document.querySelector('select.goog-te-combo');
-   if(c){c.value=tl;c.dispatchEvent(new Event('change'));window.__swiftTrOk=1;clearInterval(iv);}
-   else if(++n>60) clearInterval(iv);
+   if(c){clearInterval(iv);c.value=tl;c.dispatchEvent(new Event('change'));window.__swiftTrOk=1;}
+   else if(++n>160) clearInterval(iv);
   },150);
+ }
+ window.googleTranslateElementInit=function(){
+  if(window.__swiftTrInited){applyLang();return;}
+  window.__swiftTrInited=1;
+  try{
+   new google.translate.TranslateElement({pageLanguage:'auto',includedLanguages:tl,autoDisplay:false},'__swift_te');
+   applyLang();
+  }catch(e){}
  };
  if(!document.getElementById('__swift_te')){
-  var d=document.createElement('div'); d.id='__swift_te'; d.style.display='none'; document.body.appendChild(d);
+  var d=document.createElement('div'); d.id='__swift_te'; d.style.display='none';
+  (document.body||document.documentElement).appendChild(d);
   var st=document.createElement('style');
   st.textContent='.skiptranslate>iframe,.goog-te-banner-frame,#goog-gt-tt,.goog-tooltip,.VIpgJd-ZVi9od-aZ2wEe-wOHMyf{display:none!important}body{top:0!important;position:static!important}';
-  document.head.appendChild(st);
+  (document.head||document.documentElement).appendChild(st);
  }
+ if(window.google&&google.translate){window.__swiftTrOk=0;applyLang();return;}
+ if(window.__swiftTrLoading)return;
+ window.__swiftTrLoading=1;window.__swiftTrOk=0;
  var s=document.createElement('script');
  s.src='https://translate.google.com/translate_a/element.js?cb=googleTranslateElementInit';
- document.body.appendChild(s);
+ s.onload=function(){window.__swiftTrLoading=0;};
+ s.onerror=function(){window.__swiftTrLoading=0;window.__swiftTrFail=1;};
+ (document.body||document.documentElement).appendChild(s);
 })('__TL__');
 """
 
@@ -543,6 +558,9 @@ private fun SwiftBrowserApp() {
     var translateOffer by remember { mutableStateOf<Pair<Long, String>?>(null) }
     var translateDone by remember { mutableStateOf<Pair<Long, String>?>(null) }
     var translateMenu by remember { mutableStateOf(false) }
+    // Page whose translate banner the user swiped away: a translation still in
+    // flight must not pop the "translated" card straight back afterwards.
+    var translateDismissedUrl by remember { mutableStateOf<String?>(null) }
     val downloadStore = remember { DownloadStore(context) }
     val recentClosed = remember { mutableStateListOf<Pair<String, String>>() }
     val pendingLoads = remember { HashMap<Long, String>() }
@@ -1005,29 +1023,47 @@ private fun SwiftBrowserApp() {
         if (desktopSites[tabId] == true) view?.evaluateJavascript(DESKTOP_JS, null)
     }
 
-    fun translateFallbackUrl(original: String) =
-        "https://translate.google.com/translate?sl=auto&tl=" + deviceLang() + "&u=" + Uri.encode(original)
+    // In-place translation never falls back to the translate.goog proxy page:
+    // that URL reloads the site through Google's proxy and its requests often
+    // trip the host's bot check (the Brave captcha in the screenshot). If the
+    // widget can't run on a page we say so and leave the page untouched.
 
     // Waits until Google has really translated the page, then shows "Page translated / Undo".
+    // The widget library is several MB from translate.google.com, so on slow
+    // networks it can take far longer than a few seconds to arrive — keep
+    // checking for up to half a minute instead of giving up early.
     fun pollTranslate(wv: WebView, original: String, src: Array<String>, tries: Int) {
         Handler(Looper.getMainLooper()).postDelayed({
-            if (pageUrl == original) {
+            if (pageUrl != original || translateDismissedUrl == original) return@postDelayed
+            wv.evaluateJavascript("window.__swiftTrFail===1") { fail ->
+                if (pageUrl == original && fail == "true") {
+                    failTranslate()
+                    return@evaluateJavascript
+                }
                 wv.evaluateJavascript(
                     "(window.__swiftTrOk===1&&document.documentElement.className.indexOf('translated')>=0)"
                 ) { ok ->
-                    if (pageUrl == original) {
-                        when {
-                            ok == "true" -> translateDone = activeId to src[0]
-                            tries >= 20 -> wv.evaluateJavascript("window.__swiftTrOk===1") { ok2 ->
-                                // The site blocked the translate script: use Google's translate page.
-                                if (ok2 != "true" && pageUrl == original) load(translateFallbackUrl(original))
-                            }
-                            else -> pollTranslate(wv, original, src, tries + 1)
+                    if (pageUrl != original || translateDismissedUrl == original) return@evaluateJavascript
+                    when {
+                        ok == "true" -> translateDone = activeId to src[0]
+                        tries >= 75 -> wv.evaluateJavascript("window.__swiftTrOk===1") { ok2 ->
+                            if (pageUrl != original || translateDismissedUrl == original) return@evaluateJavascript
+                            if (ok2 == "true") translateDone = activeId to src[0] else failTranslate()
                         }
+                        else -> pollTranslate(wv, original, src, tries + 1)
                     }
                 }
             }
         }, 400)
+    }
+
+    // The widget was blocked (strict site policy) or the network never
+    // delivered it. Tell the user and leave the page as it was, so the
+    // in-place attempt (or a retry) is never destroyed by a navigation.
+    fun failTranslate() {
+        translateOffer = null
+        translateDone = null
+        Toast.makeText(context, "Couldn't translate this page", Toast.LENGTH_SHORT).show()
     }
 
     fun translatePageInPlace() {
@@ -1037,6 +1073,7 @@ private fun SwiftBrowserApp() {
         translateOffer = null
         translateDone = null
         translateMenu = false
+        translateDismissedUrl = null
         Toast.makeText(context, "Translating\u2026", Toast.LENGTH_SHORT).show()
         // Read the source language before the page changes, then translate.
         wv.evaluateJavascript(LANG_JS) { raw ->
@@ -1131,6 +1168,15 @@ private fun SwiftBrowserApp() {
                     val req = request ?: return null
                     val url = req.url.toString()
 
+                    // The translate widget's scripts and APIs must never be
+                    // filtered: if the blocker kills them, the first in-place
+                    // translate attempt dies silently.
+                    val h = req.url.host ?: ""
+                    if (h == "translate.google.com" || h == "translate.googleapis.com" ||
+                        h.endsWith(".translate.goog") ||
+                        (h == "www.gstatic.com" && url.contains("/translate/"))
+                    ) return null
+
                     if (currentBlockingEnabled && blocker.shouldBlock(url, firstParty[tabId] ?: "")) {
                         Handler(Looper.getMainLooper()).post {
                             totalBlocked++
@@ -1161,6 +1207,7 @@ private fun SwiftBrowserApp() {
                     if (url == null || url.startsWith("about:")) return
                     if (translateOffer?.first == tabId) translateOffer = null
                     if (translateDone?.first == tabId) translateDone = null
+                    if (tabId == activeId) translateDismissedUrl = null
                     applyDesktopJs(view, tabId)
                     firstParty[tabId] = url
                     val oldHost = hostOf(tabs.firstOrNull { it.id == tabId }?.url ?: "")
@@ -1732,25 +1779,51 @@ private fun SwiftBrowserApp() {
                     val fromName = java.util.Locale(code).getDisplayLanguage()
                     val from = fromName.ifBlank { "Detected language" }
                     val to = java.util.Locale(deviceLang()).getDisplayLanguage()
-                    var swipeY by remember(banner) { mutableFloatStateOf(0f) }
+                    // Animated (never snapped) swipe offset — the Animatable is
+                    // what removes the swipe jitter; drag-cancel now springs
+                    // back smoothly instead of jumping to 0.
+                    val swipeY = remember(banner) { Animatable(0f) }
+                    val bannerScope = rememberCoroutineScope()
+                    fun dismissBanner() {
+                        // Swiping the card away also silences the "translated"
+                        // confirmation that would otherwise pop straight back.
+                        translateDismissedUrl = pageUrl
+                        translateOffer = null
+                        translateDone = null
+                    }
                     Row(
                         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
                             .graphicsLayer {
-                                translationY = swipeY
-                                alpha = (1f + swipeY / 260f).coerceIn(0f, 1f)
+                                translationY = swipeY.value
+                                alpha = (1f + swipeY.value / 260f).coerceIn(0f, 1f)
                             }
                             .pointerInput(banner) {
                                 detectDragGestures(
                                     onDragEnd = {
-                                        if (swipeY < -50f) {
-                                            translateOffer = null
-                                            translateDone = null
-                                        } else swipeY = 0f
+                                        bannerScope.launch {
+                                            if (swipeY.value < -110f) {
+                                                swipeY.animateTo(-560f, tween(160))
+                                                dismissBanner()
+                                                swipeY.snapTo(0f)
+                                            } else {
+                                                swipeY.animateTo(
+                                                    0f,
+                                                    spring(
+                                                        dampingRatio = Spring.DampingRatioNoBouncy,
+                                                        stiffness = Spring.StiffnessMedium
+                                                    )
+                                                )
+                                            }
+                                        }
                                     },
-                                    onDragCancel = { swipeY = 0f }
+                                    onDragCancel = {
+                                        bannerScope.launch { swipeY.animateTo(0f, tween(120)) }
+                                    }
                                 ) { change, dragAmount ->
                                     change.consume()
-                                    swipeY = (swipeY + dragAmount.y).coerceAtMost(0f)
+                                    bannerScope.launch {
+                                        swipeY.snapTo((swipeY.value + dragAmount.y).coerceAtMost(0f))
+                                    }
                                 }
                             }
                             .clip(RoundedCornerShape(20.dp)).background(Surface)
@@ -1771,6 +1844,7 @@ private fun SwiftBrowserApp() {
                             DropdownMenu(expanded = translateMenu, onDismissRequest = { translateMenu = false }) {
                                 BrowserMenuItem("Never translate this site", Icons.Default.Block) {
                                     translateMenu = false
+                                    translateDismissedUrl = pageUrl
                                     translateOffer = null
                                     translateDone = null
                                     val sp = context.getSharedPreferences("swift_translate", Context.MODE_PRIVATE)
@@ -1780,8 +1854,7 @@ private fun SwiftBrowserApp() {
                                 }
                                 BrowserMenuItem("Dismiss", Icons.Default.Close) {
                                     translateMenu = false
-                                    translateOffer = null
-                                    translateDone = null
+                                    dismissBanner()
                                 }
                             }
                         }
