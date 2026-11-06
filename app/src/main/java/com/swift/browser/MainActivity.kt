@@ -258,43 +258,40 @@ private const val DESKTOP_JS = """
 })();
 """
 
-// Translates the page where it is (Google's translate element): no page change,
-// no reload, and never the translate.goog proxy page. Safe to run repeatedly —
-// the widget library loads once per page and re-running just re-issues the
-// translation instead of injecting duplicate scripts.
-private const val TRANSLATE_JS = """
-(function(tl){
- function applyLang(){
-  var n=0,iv=setInterval(function(){
-   var c=document.querySelector('select.goog-te-combo');
-   if(c){clearInterval(iv);c.value=tl;c.dispatchEvent(new Event('change'));window.__swiftTrOk=1;}
-   else if(++n>160) clearInterval(iv);
-  },150);
- }
- window.googleTranslateElementInit=function(){
-  if(window.__swiftTrInited){applyLang();return;}
-  window.__swiftTrInited=1;
-  try{
-   new google.translate.TranslateElement({pageLanguage:'auto',includedLanguages:tl,autoDisplay:false},'__swift_te');
-   applyLang();
-  }catch(e){}
- };
- if(!document.getElementById('__swift_te')){
-  var d=document.createElement('div'); d.id='__swift_te'; d.style.display='none';
-  (document.body||document.documentElement).appendChild(d);
-  var st=document.createElement('style');
-  st.textContent='.skiptranslate>iframe,.goog-te-banner-frame,#goog-gt-tt,.goog-tooltip,.VIpgJd-ZVi9od-aZ2wEe-wOHMyf{display:none!important}body{top:0!important;position:static!important}';
-  (document.head||document.documentElement).appendChild(st);
- }
- if(window.google&&google.translate){window.__swiftTrOk=0;applyLang();return;}
- if(window.__swiftTrLoading)return;
- window.__swiftTrLoading=1;window.__swiftTrOk=0;
- var s=document.createElement('script');
- s.src='https://translate.google.com/translate_a/element.js?cb=googleTranslateElementInit';
- s.onload=function(){window.__swiftTrLoading=0;};
- s.onerror=function(){window.__swiftTrLoading=0;window.__swiftTrFail=1;};
- (document.body||document.documentElement).appendChild(s);
-})('__TL__');
+// Extracts text and sends it to Kotlin for ML Kit Translation
+private const val EXTRACT_TEXT_JS = """
+(function() {
+    if (!window.__swiftMlKitInit) {
+        window.__swiftMlKitInit = true;
+        window.__swiftExtractText = function(sourceLang) {
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+                acceptNode: (node) => {
+                    if (!node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+                    const parent = node.parentElement;
+                    if (!parent) return NodeFilter.FILTER_REJECT;
+                    const tag = parent.tagName.toLowerCase();
+                    if (['script', 'style', 'noscript'].includes(tag)) return NodeFilter.FILTER_REJECT;
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            });
+            const texts = [];
+            const nodes = [];
+            let n;
+            while (n = walker.nextNode()) {
+                texts.push(n.nodeValue.trim());
+                nodes.push(n);
+            }
+            window.__swiftTranslateNodes = (translatedArray) => {
+                nodes.forEach((node, i) => {
+                    if (translatedArray[i]) node.nodeValue = translatedArray[i];
+                });
+            };
+            if (window.SwiftTranslator) {
+                window.SwiftTranslator.requestTranslation(JSON.stringify(texts), sourceLang);
+            }
+        };
+    }
+})();
 """
 
 // Downloads started in this browser (ids of DownloadManager entries).
@@ -1023,81 +1020,32 @@ private fun SwiftBrowserApp() {
         if (desktopSites[tabId] == true) view?.evaluateJavascript(DESKTOP_JS, null)
     }
 
-    // In-place translation never falls back to the translate.goog proxy page:
-    // that URL reloads the site through Google's proxy and its requests often
-    // trip the host's bot check (the Brave captcha in the screenshot). If the
-    // widget can't run on a page we say so and leave the page untouched.
-
-    // The widget was blocked (strict site policy) or the network never
-    // delivered it. Tell the user and leave the page as it was, so the
-    // in-place attempt (or a retry) is never destroyed by a navigation.
-    // NOTE: declared before pollTranslate() so the two call sites below
-    // resolve cleanly (Kotlin requires local functions to be declared first).
-    fun failTranslate() {
-        translateOffer = null
-        translateDone = null
-        Toast.makeText(context, "Couldn't translate this page", Toast.LENGTH_SHORT).show()
-    }
-
-    // Waits until Google has really translated the page, then shows "Page translated / Undo".
-    // The widget library is several MB from translate.google.com, so on slow
-    // networks it can take far longer than a few seconds to arrive — keep
-    // checking for up to half a minute instead of giving up early.
-    fun pollTranslate(wv: WebView, original: String, src: Array<String>, tries: Int) {
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (pageUrl != original || translateDismissedUrl == original) return@postDelayed
-            wv.evaluateJavascript("window.__swiftTrFail===1") { fail ->
-                if (pageUrl == original && fail == "true") {
-                    failTranslate()
-                    return@evaluateJavascript
-                }
-                wv.evaluateJavascript(
-                    "(window.__swiftTrOk===1&&document.documentElement.className.indexOf('translated')>=0)"
-                ) { ok ->
-                    if (pageUrl != original || translateDismissedUrl == original) return@evaluateJavascript
-                    when {
-                        ok == "true" -> translateDone = activeId to src[0]
-                        tries >= 75 -> wv.evaluateJavascript("window.__swiftTrOk===1") { ok2 ->
-                            if (pageUrl != original || translateDismissedUrl == original) return@evaluateJavascript
-                            if (ok2 == "true") translateDone = activeId to src[0] else failTranslate()
-                        }
-                        else -> pollTranslate(wv, original, src, tries + 1)
-                    }
-                }
-            }
-        }, 400)
-    }
-
     fun translatePageInPlace() {
         val wv = activeWebView() ?: return
-        val original = pageUrl
-        val src = arrayOf(translateOffer?.second ?: "")
+        val code = translateOffer?.second ?: ""
         translateOffer = null
         translateDone = null
         translateMenu = false
         translateDismissedUrl = null
-        Toast.makeText(context, "Translating\u2026", Toast.LENGTH_SHORT).show()
-        // Read the source language before the page changes, then translate.
-        wv.evaluateJavascript(LANG_JS) { raw ->
-            if (src[0].isEmpty()) src[0] = raw?.trim('"')?.lowercase().orEmpty().let { if (it == "null") "" else it }
+        Toast.makeText(context, "Downloading language pack & Translating...", Toast.LENGTH_SHORT).show()
+        
+        // Inject the script that sends text to ML Kit
+        if (code.isNotEmpty()) {
+            wv.evaluateJavascript("window.__swiftExtractText && window.__swiftExtractText('$code');", null)
+        } else {
+            wv.evaluateJavascript(LANG_JS) { raw ->
+                val detected = raw?.trim('"')?.lowercase().orEmpty().let { if (it == "null") "" else it }
+                val src = if (detected.isEmpty()) "en" else detected
+                wv.evaluateJavascript("window.__swiftExtractText && window.__swiftExtractText('$src');", null)
+            }
         }
-        wv.evaluateJavascript(TRANSLATE_JS.replace("__TL__", deviceLang()), null)
-        pollTranslate(wv, original, src, 0)
     }
 
     fun undoTranslate() {
         val wv = activeWebView() ?: return
         translateDone = null
-        wv.evaluateJavascript(
-            "(function(){var c=document.querySelector('select.goog-te-combo');" +
-                "if(c){c.value='';c.dispatchEvent(new Event('change'));}})()", null
-        )
-        // If the page still shows translated text, a reload always restores the original.
-        Handler(Looper.getMainLooper()).postDelayed({
-            wv.evaluateJavascript("document.documentElement.className.indexOf('translated')>=0") { r ->
-                if (r == "true") wv.reload()
-            }
-        }, 900)
+        // Since ML Kit directly edits the DOM, a simple reload restores the original text
+        wv.reload()
     }
 
     fun refreshNavigation() {
@@ -1132,6 +1080,18 @@ private fun SwiftBrowserApp() {
                 }
             )
             CookieManager.getInstance().setAcceptCookie(true)
+
+            // Add the ML Kit Bridge
+            addJavascriptInterface(WebAppInterface(
+                webView = this,
+                targetLang = deviceLang(),
+                onComplete = { sourceLang ->
+                    if (tabId == activeId) translateDone = activeId to sourceLang
+                },
+                onError = { error ->
+                    Toast.makeText(ctx, error, Toast.LENGTH_LONG).show()
+                }
+            ), "SwiftTranslator")
 
             webChromeClient = object : WebChromeClient() {
                 override fun onReceivedTitle(view: WebView?, title: String?) {
@@ -1170,9 +1130,6 @@ private fun SwiftBrowserApp() {
                     val req = request ?: return null
                     val url = req.url.toString()
 
-                    // The translate widget's scripts and APIs must never be
-                    // filtered: if the blocker kills them, the first in-place
-                    // translate attempt dies silently.
                     val h = req.url.host ?: ""
                     if (h == "translate.google.com" || h == "translate.googleapis.com" ||
                         h.endsWith(".translate.goog") ||
