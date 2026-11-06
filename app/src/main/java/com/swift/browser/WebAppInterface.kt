@@ -9,13 +9,12 @@ import org.json.JSONArray
 
 class WebAppInterface(
     private val webView: WebView,
-    private val sourceLang: String,
     private val targetLang: String,
-    private val onComplete: () -> Unit,
+    private val onComplete: (String) -> Unit,
     private val onError: (String) -> Unit
 ) {
     @JavascriptInterface
-    fun requestTranslation(jsonTexts: String) {
+    fun requestTranslation(jsonTexts: String, sourceLang: String) {
         CoroutineScope(Dispatchers.Main).launch {
             try {
                 val texts = JSONArray(jsonTexts)
@@ -35,10 +34,10 @@ class WebAppInterface(
                 val resultJson = translated.toString()
                 webView.post {
                     webView.evaluateJavascript("window.__swiftTranslateNodes($resultJson);", null)
-                    onComplete()
+                    onComplete(sourceLang)
                 }
             } catch (e: Exception) {
-                onError("Couldn't download translation model. Check your connection.")
+                onError("Translation failed: ${e.message}")
             }
         }
     }
