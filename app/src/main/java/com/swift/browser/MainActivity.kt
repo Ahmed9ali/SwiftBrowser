@@ -219,34 +219,85 @@ private var HomeThumbStore by mutableStateOf<Bitmap?>(null)
 private const val DESKTOP_UA =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-// Reading mode: replaces the page with clean, dark article text (toggle).
-private const val READER_JS = """
+// Page language detection (for the auto translate offer): html lang first, then
+// the dominant non-Latin script of the visible text.
+private const val LANG_JS = """
 (function(){
- var id='__swift_reader';
- var ex=document.getElementById(id);
- if(ex){ex.remove();return 'off';}
- var root=document.querySelector('article')||document.querySelector('main')||document.querySelector('[role=main]')||document.body;
- var out=document.createElement('div'); out.id=id;
- out.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;overflow:auto;background:#101114;color:#e8e8ea;padding:20px 18px 60px;font:18px/1.7 Roboto,sans-serif';
- var wrap=document.createElement('div'); wrap.style.cssText='max-width:720px;margin:0 auto';
- var title=document.createElement('h1'); title.textContent=document.title; title.style.cssText='font-size:26px;line-height:1.3;margin:0 0 16px'; wrap.appendChild(title);
- var count=0;
- root.querySelectorAll('h1,h2,h3,h4,p,li,blockquote,pre,img').forEach(function(n){
-  if(n.closest('nav,header,footer,aside,form')) return;
-  var t=n.tagName.toLowerCase();
-  if(t==='img'){ if(n.naturalWidth<160) return; var im=document.createElement('img'); im.src=n.currentSrc||n.src; im.style.cssText='max-width:100%;height:auto;border-radius:10px;margin:12px 0'; wrap.appendChild(im); return; }
-  var txt=(n.innerText||'').trim();
-  if(!txt||(t==='p'&&txt.length<25)) return;
-  var e=document.createElement(t==='li'?'p':t);
-  e.textContent=(t==='li'?'\u2022 ':'')+txt;
-  e.style.cssText='margin:0 0 14px';
-  if(t.charAt(0)==='h'){e.style.fontSize='22px';e.style.marginTop='22px';}
-  wrap.appendChild(e); count++;
- });
- if(count<3) return 'none';
- out.appendChild(wrap); document.body.appendChild(out); return 'on';
-})();
+ var l=(document.documentElement.lang||'').toLowerCase().split('-')[0].split('_')[0];
+ var t=((document.body&&document.body.innerText)||'').slice(0,1500);
+ var sc=[['zh',/[\u4e00-\u9fff]/g],['ja',/[\u3040-\u30ff]/g],['ko',/[\uac00-\ud7af]/g],['ru',/[\u0400-\u04ff]/g],['ar',/[\u0600-\u06ff]/g],['hi',/[\u0900-\u097f]/g],['th',/[\u0e00-\u0e7f]/g],['he',/[\u0590-\u05ff]/g],['el',/[\u0370-\u03ff]/g]];
+ var best='',bn=0;
+ sc.forEach(function(s){var m=t.match(s[1]);var n=m?m.length:0;if(n>bn){bn=n;best=s[0];}});
+ if(bn>=20&&bn>t.length*0.15){ if(best==='zh'&&/[\u3040-\u30ff]/.test(t)) best='ja'; return best; }
+ return (l&&l.length>=2&&l.length<=3)?l:'';
+})()
 """
+
+// Translates the page where it is (Google's translate element), no page change.
+private const val TRANSLATE_JS = """
+(function(tl){
+ window.__swiftTrOk=0;
+ window.googleTranslateElementInit=function(){
+  new google.translate.TranslateElement({pageLanguage:'auto',includedLanguages:tl,autoDisplay:false},'__swift_te');
+  var n=0,iv=setInterval(function(){
+   var c=document.querySelector('select.goog-te-combo');
+   if(c){c.value=tl;c.dispatchEvent(new Event('change'));window.__swiftTrOk=1;clearInterval(iv);}
+   else if(++n>60) clearInterval(iv);
+  },150);
+ };
+ if(!document.getElementById('__swift_te')){
+  var d=document.createElement('div'); d.id='__swift_te'; d.style.display='none'; document.body.appendChild(d);
+  var st=document.createElement('style');
+  st.textContent='.skiptranslate>iframe,.goog-te-banner-frame,#goog-gt-tt,.goog-tooltip,.VIpgJd-ZVi9od-aZ2wEe-wOHMyf{display:none!important}body{top:0!important;position:static!important}';
+  document.head.appendChild(st);
+ }
+ var s=document.createElement('script');
+ s.src='https://translate.google.com/translate_a/element.js?cb=googleTranslateElementInit';
+ document.body.appendChild(s);
+})('__TL__');
+"""
+
+// Downloads started in this browser (ids of DownloadManager entries).
+private class DownloadStore(context: Context) {
+    private val prefs = context.getSharedPreferences("swift_downloads", Context.MODE_PRIVATE)
+    fun ids(): List<Long> =
+        (prefs.getString("ids", "") ?: "").split(",").mapNotNull { it.toLongOrNull() }
+    fun add(id: Long) {
+        prefs.edit().putString("ids", (ids() + id).distinct().joinToString(",")).apply()
+    }
+    fun remove(id: Long) {
+        prefs.edit().putString("ids", ids().filter { it != id }.joinToString(",")).apply()
+    }
+}
+
+private data class DlItem(
+    val id: Long, val title: String, val status: Int,
+    val done: Long, val total: Long, val mime: String?
+)
+
+private fun queryDownloads(context: Context, ids: List<Long>): List<DlItem> {
+    if (ids.isEmpty()) return emptyList()
+    val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+    val out = ArrayList<DlItem>()
+    runCatching {
+        dm.query(DownloadManager.Query().setFilterById(*ids.toLongArray())).use { c ->
+            while (c.moveToNext()) {
+                fun col(n: String) = c.getColumnIndexOrThrow(n)
+                out.add(
+                    DlItem(
+                        c.getLong(col(DownloadManager.COLUMN_ID)),
+                        c.getString(col(DownloadManager.COLUMN_TITLE)) ?: "File",
+                        c.getInt(col(DownloadManager.COLUMN_STATUS)),
+                        c.getLong(col(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)),
+                        c.getLong(col(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)),
+                        c.getString(col(DownloadManager.COLUMN_MEDIA_TYPE))
+                    )
+                )
+            }
+        }
+    }
+    return out.sortedByDescending { it.id }
+}
 
 // Per-tab favicons and page thumbnails (shown in tab cards and the group bar).
 private val FaviconStore = mutableStateMapOf<Long, Bitmap>()
@@ -464,6 +515,9 @@ private fun SwiftBrowserApp() {
     var findMatches by remember { mutableIntStateOf(0) }
     var findIndex by remember { mutableIntStateOf(0) }
     val desktopSites = remember { mutableStateMapOf<Long, Boolean>() }
+    var translateOffer by remember { mutableStateOf<Pair<Long, String>?>(null) }
+    var translateMenu by remember { mutableStateOf(false) }
+    val downloadStore = remember { DownloadStore(context) }
     val recentClosed = remember { mutableStateListOf<Pair<String, String>>() }
     val pendingLoads = remember { HashMap<Long, String>() }
     val webArea = remember { android.graphics.Rect() }
@@ -519,12 +573,10 @@ private fun SwiftBrowserApp() {
     }
 
     // Snapshot of the homepage exactly as it is on screen (needs Android 8+).
-    fun captureHomeThumb(id: Long, onDone: () -> Unit = {}) {
-        val activity = context as? android.app.Activity
-        if (Build.VERSION.SDK_INT < 26 || activity == null || webArea.isEmpty) {
-            onDone()
-            return
-        }
+    fun captureHomeThumb(id: Long) {
+        if (Build.VERSION.SDK_INT < 26) return
+        val activity = context as? android.app.Activity ?: return
+        if (webArea.isEmpty) return
         try {
             val src = android.graphics.Rect(webArea)
             val full = Bitmap.createBitmap(src.width(), src.height(), Bitmap.Config.ARGB_8888)
@@ -538,13 +590,11 @@ private fun SwiftBrowserApp() {
                         ThumbStore[id] = scaled
                         HomeThumbStore = scaled
                     }
-                    onDone()
                 },
                 Handler(Looper.getMainLooper())
             )
         } catch (e: Exception) {
             // Thumbnails are best effort.
-            onDone()
         }
     }
 
@@ -681,14 +731,6 @@ private fun SwiftBrowserApp() {
     fun scheduleSave() {
         saveHandler.removeCallbacks(saveTask)
         saveHandler.postDelayed(saveTask, 4000)
-    }
-
-    // While the homepage is visible, keep a snapshot of it for the tab overview.
-    LaunchedEffect(isHome, showTabs, addressFocused, showMenu, showShield, activeId) {
-        if (isHome && !showTabs && !addressFocused && !showMenu && !showShield) {
-            delay(900)
-            captureHomeThumb(activeId)
-        }
     }
 
     fun updateActiveTab(url: String = pageUrl, title: String = pageTitle, count: Int = blockedCount) {
@@ -916,6 +958,45 @@ private fun SwiftBrowserApp() {
         Toast.makeText(context, "All tabs closed", Toast.LENGTH_SHORT).show()
     }
 
+    fun deviceLang(): String = java.util.Locale.getDefault().language
+
+    // Like Brave: after a page loads, offer to translate it if it isn't in your language.
+    fun offerTranslateIfNeeded(view: WebView?, tabId: Long, url: String) {
+        val host = hostOf(url)
+        if (host.endsWith("translate.goog") || host.contains("translate.google")) return
+        val never = context.getSharedPreferences("swift_translate", Context.MODE_PRIVATE)
+            .getStringSet("never", emptySet()) ?: emptySet()
+        if (host in never) return
+        view?.evaluateJavascript(LANG_JS) { raw ->
+            val code = raw?.trim('"')?.lowercase().orEmpty()
+            if (code.isNotEmpty() && code != "null" && code != deviceLang() && tabId == activeId) {
+                translateOffer = tabId to code
+            }
+        }
+    }
+
+    fun translatePageInPlace() {
+        val wv = activeWebView() ?: return
+        val original = pageUrl
+        translateOffer = null
+        translateMenu = false
+        Toast.makeText(context, "Translating\u2026", Toast.LENGTH_SHORT).show()
+        wv.evaluateJavascript(TRANSLATE_JS.replace("__TL__", deviceLang()), null)
+        // If the site blocks the translate script, fall back to Google's translate page.
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (pageUrl == original) {
+                wv.evaluateJavascript("window.__swiftTrOk===1") { ok ->
+                    if (ok != "true" && pageUrl == original) {
+                        load(
+                            "https://translate.google.com/translate?sl=auto&tl=" +
+                                deviceLang() + "&u=" + Uri.encode(original)
+                        )
+                    }
+                }
+            }
+        }, 7000)
+    }
+
     fun refreshNavigation() {
         canGoBack = activeWebView()?.canGoBack() == true
         canGoForward = activeWebView()?.canGoForward() == true
@@ -1013,6 +1094,7 @@ private fun SwiftBrowserApp() {
                     favicon: android.graphics.Bitmap?
                 ) {
                     if (url == null || url.startsWith("about:")) return
+                    if (translateOffer?.first == tabId) translateOffer = null
                     firstParty[tabId] = url
                     val oldHost = hostOf(tabs.firstOrNull { it.id == tabId }?.url ?: "")
                     if (hostOf(url) != oldHost) FaviconStore.remove(tabId)
@@ -1037,6 +1119,7 @@ private fun SwiftBrowserApp() {
                     }
                     if (!currentPrivateMode) store.addHistory(title, url)
                     Handler(Looper.getMainLooper()).postDelayed({ captureThumb(tabId) }, 700)
+                    if (tabId == activeId && url.startsWith("http")) offerTranslateIfNeeded(view, tabId, url)
                     scheduleSave()
                 }
             }
@@ -1050,8 +1133,9 @@ private fun SwiftBrowserApp() {
                         .setTitle(filename)
                         .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                         .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
-                    (ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-                    Toast.makeText(ctx, "Download started", Toast.LENGTH_SHORT).show()
+                    val dlId = (ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+                    downloadStore.add(dlId)
+                    Toast.makeText(ctx, "Download started \u2014 see Menu > Downloads", Toast.LENGTH_SHORT).show()
                 }.onFailure {
                     Toast.makeText(ctx, "Download failed", Toast.LENGTH_SHORT).show()
                 }
@@ -1104,7 +1188,7 @@ private fun SwiftBrowserApp() {
             showShield -> showShield = false
             showTabs -> showTabs = false
             showSuggestions -> showSuggestions = false
-            address == "swift://bookmarks" || address == "swift://history" ->
+            address == "swift://bookmarks" || address == "swift://history" || address == "swift://downloads" ->
                 address = if (isHome) "" else pageUrl
             canGoBackReal() -> {
                 activeWebView()?.goBack()
@@ -1140,17 +1224,23 @@ private fun SwiftBrowserApp() {
         val wv = activeWebView() ?: return
         val on = !(desktopSites[activeId] ?: false)
         desktopSites[activeId] = on
-        wv.settings.userAgentString = if (on) DESKTOP_UA else null
+        // Setting the UA to null does not restore the phone UA on WebView, so
+        // switch back to the real default explicitly.
+        wv.settings.userAgentString =
+            if (on) DESKTOP_UA else android.webkit.WebSettings.getDefaultUserAgent(context)
         wv.settings.useWideViewPort = on
         wv.settings.loadWithOverviewMode = on
-        wv.reload()
-    }
-
-    fun toggleReadingMode() {
-        activeWebView()?.evaluateJavascript(READER_JS) { result ->
-            if (result?.contains("none") == true) {
-                Toast.makeText(context, "Reading mode isn't available for this page", Toast.LENGTH_SHORT).show()
-            }
+        wv.settings.setSupportZoom(true)
+        wv.settings.builtInZoomControls = true
+        wv.settings.displayZoomControls = false
+        wv.clearCache(true)
+        // Sites like m.youtube.com stay mobile whatever the UA says: use the main host.
+        val u = wv.url ?: pageUrl
+        val h = hostOf(u)
+        if (on && (h.startsWith("m.") || h.startsWith("mobile."))) {
+            wv.loadUrl(u.replaceFirst("://" + h, "://www." + h.substringAfter('.')))
+        } else {
+            wv.loadUrl(u)
         }
     }
 
@@ -1397,19 +1487,6 @@ private fun SwiftBrowserApp() {
                     Text("SHIELDS", color = Accent, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                     Icon(Icons.Default.ChevronRight, null, tint = TextMuted, modifier = Modifier.size(15.dp))
                 }
-                if (!isHome && pageUrl.startsWith("http")) {
-                    IconButton(
-                        onClick = { toggleBookmark() },
-                        modifier = Modifier.size(32.dp)
-                    ) {
-                        Icon(
-                            if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
-                            contentDescription = "Toggle bookmark",
-                            tint = if (isBookmarked) Accent else TextMuted,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
-                }
             }
             }
 
@@ -1435,7 +1512,8 @@ private fun SwiftBrowserApp() {
                     key(tab.id) {
                         val isCurrent = tab.id == activeId
                         val pageVisible = isCurrent && !isHome && !showTabs &&
-                            address != "swift://bookmarks" && address != "swift://history"
+                            address != "swift://bookmarks" && address != "swift://history" &&
+                            address != "swift://downloads"
                         AndroidView(
                             modifier = Modifier
                                 .fillMaxSize()
@@ -1485,7 +1563,8 @@ private fun SwiftBrowserApp() {
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = isHome && !showTabs && address != "swift://bookmarks" && address != "swift://history",
+                    visible = isHome && !showTabs && address != "swift://bookmarks" && address != "swift://history" &&
+                        address != "swift://downloads",
                     enter = fadeIn(tween(180)) + slideInVertically(initialOffsetY = { it / 18 }),
                     exit = fadeOut(tween(120)),
                     modifier = Modifier.fillMaxSize()
@@ -1544,6 +1623,73 @@ private fun SwiftBrowserApp() {
                         onOpen = { load(it) },
                         onClose = { address = if (isHome) "" else pageUrl }
                     )
+                }
+
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = address == "swift://downloads",
+                    enter = fadeIn(tween(150)),
+                    exit = fadeOut(tween(100)),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    DownloadsPanel(
+                        store = downloadStore,
+                        onClose = { address = if (isHome) "" else pageUrl }
+                    )
+                }
+
+                // Brave-style translate offer: small card on top of the page, goes away by itself.
+                val offer = translateOffer
+                LaunchedEffect(offer) {
+                    if (offer != null) {
+                        delay(9000)
+                        if (translateOffer == offer) translateOffer = null
+                    }
+                }
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = offer != null && offer.first == activeId && !showTabs && !showSuggestions &&
+                        address != "swift://bookmarks" && address != "swift://history" &&
+                        address != "swift://downloads",
+                    enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { -it }),
+                    exit = fadeOut(tween(120)) + slideOutVertically(targetOffsetY = { -it }),
+                    modifier = Modifier.align(Alignment.TopCenter)
+                ) {
+                    val code = offer?.second ?: ""
+                    val from = java.util.Locale(code).getDisplayLanguage().ifBlank { code }
+                    val to = java.util.Locale(deviceLang()).getDisplayLanguage()
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
+                            .clip(RoundedCornerShape(20.dp)).background(Surface)
+                            .padding(start = 16.dp, top = 10.dp, bottom = 10.dp, end = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Translate page?", color = TextMain, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                            Text("$from to $to", color = TextMuted, fontSize = 12.sp)
+                        }
+                        Box {
+                            IconButton(onClick = { translateMenu = true }, modifier = Modifier.size(40.dp)) {
+                                Icon(Icons.Default.Settings, "Translate options", tint = TextMuted)
+                            }
+                            DropdownMenu(expanded = translateMenu, onDismissRequest = { translateMenu = false }) {
+                                BrowserMenuItem("Never translate this site", Icons.Default.Block) {
+                                    translateMenu = false
+                                    translateOffer = null
+                                    val sp = context.getSharedPreferences("swift_translate", Context.MODE_PRIVATE)
+                                    val set = (sp.getStringSet("never", emptySet()) ?: emptySet()).toMutableSet()
+                                    set.add(hostOf(pageUrl))
+                                    sp.edit().putStringSet("never", set).apply()
+                                }
+                                BrowserMenuItem("Not now", Icons.Default.Close) {
+                                    translateMenu = false
+                                    translateOffer = null
+                                }
+                            }
+                        }
+                        Box(Modifier.width(1.dp).height(28.dp).background(Surface3))
+                        TextButton(onClick = { translatePageInPlace() }) {
+                            Text("Translate", color = Accent, fontWeight = FontWeight.Bold)
+                        }
+                    }
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
@@ -1759,14 +1905,20 @@ private fun SwiftBrowserApp() {
                 }
 
                 // BOOKMARKS
+                val canBookmarkPage = !isHome && pageUrl.startsWith("http")
                 ToolbarButton(
-                    Icons.Default.BookmarkBorder,
-                    "Bookmarks",
-                    selected = address == "swift://bookmarks"
+                    if (canBookmarkPage && isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
+                    "Bookmark this page",
+                    selected = canBookmarkPage && isBookmarked
                 ) {
-                    address = "swift://bookmarks"
-                    showTabs = false
-                    showSuggestions = false
+                    if (canBookmarkPage) {
+                        toggleBookmark()
+                    } else {
+                        // Not on a web page: nothing to save, so open the list instead.
+                        address = "swift://bookmarks"
+                        showTabs = false
+                        showSuggestions = false
+                    }
                 }
 
                 // SEARCH
@@ -1782,20 +1934,12 @@ private fun SwiftBrowserApp() {
 
                 // TABS
                 TabCountButton(tabs.size, showTabs) {
-                    val wasFocused = addressFocused
+                    if (!showTabs) captureThumb(activeId)
+                    showTabs = !showTabs
                     showShield = false
                     showSuggestions = false
                     keyboardController?.hide()
                     focusManager.clearFocus()
-                    if (showTabs) {
-                        showTabs = false
-                    } else if (isHome && !wasFocused) {
-                        // Snapshot the homepage first, then open the overview.
-                        captureHomeThumb(activeId) { showTabs = true }
-                    } else {
-                        captureThumb(activeId)
-                        showTabs = true
-                    }
                 }
 
                 // SETTINGS (menu lives here now, not in the top bar)
@@ -1866,7 +2010,10 @@ private fun SwiftBrowserApp() {
                         }
                         MenuRow(Icons.Default.Download, "Downloads") {
                             showMenu = false
-                            runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
+                            showTabs = false
+                            showShield = false
+                            address = "swift://downloads"
+                            showSuggestions = false
                         }
                         MenuRow(Icons.Default.Bookmarks, "Bookmarks") {
                             showMenu = false
@@ -1887,14 +2034,7 @@ private fun SwiftBrowserApp() {
                             }
                             MenuRow(Icons.Default.Translate, "Translate\u2026") {
                                 showMenu = false
-                                load(
-                                    "https://translate.google.com/translate?sl=auto&tl=" +
-                                        java.util.Locale.getDefault().language + "&u=" + Uri.encode(pageUrl)
-                                )
-                            }
-                            MenuRow(Icons.Default.Description, "Show Reading mode") {
-                                showMenu = false
-                                toggleReadingMode()
+                                translatePageInPlace()
                             }
                             MenuRow(Icons.Default.AddToHomeScreen, "Install and create shortcut") {
                                 showMenu = false
@@ -1937,10 +2077,6 @@ private fun SwiftBrowserApp() {
                             Icons.Default.ArrowForward, "Forward",
                             enabled = onPage && activeWebView()?.canGoForward() == true
                         ) { showMenu = false; activeWebView()?.goForward() }
-                        MenuCircleButton(
-                            if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
-                            "Bookmark", enabled = onPage, highlight = isBookmarked
-                        ) { showMenu = false; toggleBookmark() }
                         MenuCircleButton(Icons.Default.Share, "Share", enabled = onPage) {
                             showMenu = false
                             sharePage(context, pageUrl)
@@ -2765,6 +2901,16 @@ private fun TabSwitcher(
     var gridTopLeft by remember { mutableStateOf(Offset.Zero) }
     var hoverZone by remember { mutableIntStateOf(0) } // -1 = before target, 0 = merge, 1 = after target
     var dragSizePx by remember { mutableStateOf(Offset.Zero) }
+    // Vector from the finger to the held card's centre at pick-up, so the card
+    // stays exactly where it was and simply shrinks around the finger (Brave).
+    var grabDelta by remember { mutableStateOf(Offset.Zero) }
+    var bandKey by remember { mutableStateOf<Long?>(null) }
+    var bandSince by remember { mutableLongStateOf(0L) }
+    val holdScale by animateFloatAsState(
+        targetValue = if (dragKey != null) 0.84f else 1f,
+        animationSpec = tween(140),
+        label = "hold"
+    )
     var gridHeight by remember { mutableIntStateOf(0) }
     var gridWidth by remember { mutableIntStateOf(0) }
     var lastMoveSig by remember { mutableStateOf("") }
@@ -2847,6 +2993,10 @@ private fun TabSwitcher(
         )
     }
 
+    // Where the (shrunk) held card is drawn: shrinks toward the finger, no jump.
+    fun heldVisualCenter(): Offset =
+        heldCenter(dragPos + grabDelta) - grabDelta * (1f - holdScale)
+
     // Moves the held card to a new slot right away; the others shift to make room.
     fun liveMove(src: Long, target: Long, after: Boolean) {
         val sig = "$src>$target>$after"
@@ -2884,23 +3034,45 @@ private fun TabSwitcher(
             }
             return
         }
-        val fx = (p.x - r.left) / r.width
-        when {
-            fx < 0.35f -> {
-                hoverKey = null
-                hoverZone = 0
-                liveMove(src, t, false)
+        // Brave-style: judge by how much the held card covers another card.
+        // About half way over a card -> group them. Lingering at the edge -> reorder.
+        val vc = heldVisualCenter()
+        val hw = dragSizePx.x * holdScale / 2f
+        val hh = dragSizePx.y * holdScale / 2f
+        val held = Rect(vc.x - hw, vc.y - hh, vc.x + hw, vc.y + hh)
+        var bestKey: Long? = null
+        var bestRatio = 0f
+        cardBounds.forEach { (key, rect) ->
+            if (key == src || key == NEW_TAB_KEY) return@forEach
+            val w = minOf(held.right, rect.right) - maxOf(held.left, rect.left)
+            val h = minOf(held.bottom, rect.bottom) - maxOf(held.top, rect.top)
+            if (w > 0f && h > 0f) {
+                val ratio = (w * h) / (rect.width * rect.height)
+                if (ratio > bestRatio) { bestRatio = ratio; bestKey = key }
             }
-            fx > 0.65f -> {
-                hoverKey = null
-                hoverZone = 0
-                liveMove(src, t, true)
+        }
+        val bk = bestKey
+        val br = bk?.let { cardBounds[it] }
+        if (bk != null && br != null && bestRatio >= 0.40f) {
+            hoverKey = bk
+            hoverZone = 0
+            bandKey = null
+            lastMoveSig = ""
+            return
+        }
+        hoverKey = null
+        hoverZone = 0
+        if (bk != null && br != null && bestRatio >= 0.12f) {
+            val now = System.currentTimeMillis()
+            if (bandKey != bk) { bandKey = bk; bandSince = now }
+            if (now - bandSince >= 300) {
+                val dx = vc.x - br.center.x
+                val dy = vc.y - br.center.y
+                val after = if (kotlin.math.abs(dy) > br.height * 0.25f) dy > 0 else dx > 0
+                liveMove(src, bk, after)
             }
-            else -> {
-                hoverKey = t
-                hoverZone = 0
-                lastMoveSig = ""
-            }
+        } else {
+            bandKey = null
         }
     }
 
@@ -2909,7 +3081,7 @@ private fun TabSwitcher(
         val mergeRect = merge?.let { cardBounds[it] }
         if (dragDistance > 40f && merge != null && merge != NEW_TAB_KEY && mergeRect != null) {
             // Merge: the held card flies into the target, then groups with it.
-            settling = Settle(key, merge, heldCenter(dragPos), mergeRect.center)
+            settling = Settle(key, merge, heldVisualCenter(), mergeRect.center)
             hoverKey = null
             hoverZone = 0
             scope.launch {
@@ -2949,10 +3121,8 @@ private fun TabSwitcher(
                     rel > gridHeight - edge -> ((rel - (gridHeight - edge)).coerceAtMost(edge) / edge) * 34f
                     else -> 0f
                 }
-                if (delta != 0f) {
-                    gridState.dispatchRawDelta(delta)
-                    dragKey?.let { latestHover(it) }
-                }
+                if (delta != 0f) gridState.dispatchRawDelta(delta)
+                dragKey?.let { latestHover(it) }
             }
             delay(16)
         }
@@ -3100,6 +3270,8 @@ private fun TabSwitcher(
                                     dragDistance = 0f
                                     dragSizePx = if (r != null) Offset(r.width, r.height) else Offset.Zero
                                     dragPos = if (r != null) Offset(r.left + offset.x, r.top + offset.y) else Offset.Zero
+                                    grabDelta = if (r != null) r.center - dragPos else Offset.Zero
+                                    bandKey = null
                                     hoverKey = null
                                     hoverZone = 0
                                 },
@@ -3184,7 +3356,7 @@ private fun TabSwitcher(
                             st.from.x + (st.to.x - st.from.x) * p,
                             st.from.y + (st.to.y - st.from.y) * p
                         )
-                    } else heldCenter(dragPos)
+                    } else heldVisualCenter()
                     Box(
                         Modifier
                             .offset {
@@ -3195,7 +3367,7 @@ private fun TabSwitcher(
                             }
                             .size(wDp, hDp)
                             .graphicsLayer {
-                                val sc = if (st != null) 1f - 0.7f * p else 1.04f
+                                val sc = if (st != null) holdScale * (1f - 0.7f * p) else holdScale
                                 scaleX = sc
                                 scaleY = sc
                                 alpha = if (st != null) 1f - 0.9f * p else 0.96f
@@ -3718,6 +3890,91 @@ private fun TabSearchScreen(
                             )
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DownloadsPanel(store: DownloadStore, onClose: () -> Unit) {
+    val context = LocalContext.current
+    var items by remember { mutableStateOf(emptyList<DlItem>()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            items = withContext(Dispatchers.IO) { queryDownloads(context, store.ids()) }
+            delay(1000)
+        }
+    }
+    fun open(item: DlItem) {
+        runCatching {
+            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            val uri = dm.getUriForDownloadedFile(item.id) ?: error("missing")
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(uri, item.mime ?: "*/*")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }.onFailure { Toast.makeText(context, "Can't open this file", Toast.LENGTH_SHORT).show() }
+    }
+    Column(Modifier.fillMaxSize().background(Bg).padding(17.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Downloads", color = TextMain, fontSize = 23.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            IconButton(onClick = {
+                runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            }) { Icon(Icons.Default.FolderOpen, "Open in Files", tint = TextMuted) }
+            IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Close", tint = TextMain) }
+        }
+        if (items.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("No downloads yet", color = TextMuted, fontSize = 13.sp)
+            }
+        } else {
+            LazyColumn {
+                items(items, key = { it.id }) { item ->
+                    val done = item.status == DownloadManager.STATUS_SUCCESSFUL
+                    val failed = item.status == DownloadManager.STATUS_FAILED
+                    val frac = if (item.total > 0) (item.done.toFloat() / item.total).coerceIn(0f, 1f) else 0f
+                    val size = android.text.format.Formatter.formatShortFileSize(
+                        context, if (done) item.total.coerceAtLeast(item.done) else item.done
+                    )
+                    Row(
+                        Modifier.fillMaxWidth().clickable(enabled = done) { open(item) }.padding(vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            if (failed) Icons.Default.ErrorOutline else Icons.Default.Download, null,
+                            tint = if (failed) Color(0xFFE5484D) else Accent
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(item.title, color = TextMain, fontSize = 13.sp, maxLines = 2)
+                            Text(
+                                when {
+                                    done -> size
+                                    failed -> "Download failed"
+                                    item.status == DownloadManager.STATUS_PAUSED -> "Paused \u00b7 $size"
+                                    item.status == DownloadManager.STATUS_PENDING -> "Waiting\u2026"
+                                    else -> (if (item.total > 0) "${(frac * 100).toInt()}% \u00b7 " else "") + size
+                                },
+                                color = TextMuted, fontSize = 11.sp
+                            )
+                            if (!done && !failed) {
+                                Spacer(Modifier.height(6.dp))
+                                Box(Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp)).background(Surface3)) {
+                                    Box(Modifier.fillMaxWidth(frac).fillMaxHeight().background(Accent))
+                                }
+                            }
+                        }
+                        IconButton(onClick = {
+                            runCatching {
+                                (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).remove(item.id)
+                            }
+                            store.remove(item.id)
+                            items = items.filter { it.id != item.id }
+                        }) { Icon(Icons.Default.Delete, "Delete", tint = TextMuted) }
+                    }
+                    HorizontalDivider(color = Surface3.copy(alpha = .45f))
                 }
             }
         }
