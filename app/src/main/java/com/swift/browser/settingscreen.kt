@@ -1,6 +1,8 @@
 package com.swift.browser
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
 import android.webkit.CookieManager
@@ -13,12 +15,14 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -26,6 +30,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -35,9 +40,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -48,13 +57,13 @@ import kotlin.math.roundToInt
 
 // Same palette as the browser (file-private there, so repeated here).
 private val SBg = Color(0xFF101114)
+private val SRowBg = Color(0xFF23262B)
 private val SSurface = Color(0xFF1A1C20)
-private val SSurface2 = Color(0xFF25282E)
 private val SSurface3 = Color(0xFF30343B)
 private val SAccent = Color(0xFFFF6B35)
-private val SAccentSoft = Color(0x33FF6B35)
 private val SText = Color(0xFFF4F4F5)
 private val SMuted = Color(0xFF9A9DA5)
+private val SIcon = Color(0xFFD7D9DE)
 
 // =====================================================================
 //  Saved settings. Every value is persisted and survives restarts.
@@ -83,6 +92,8 @@ class AppSettings(context: Context) {
         private set
     var loadImages by mutableStateOf(sp.getBoolean("images", true))
         private set
+    var blockAutoplay by mutableStateOf(sp.getBoolean("noAutoplay", true))
+        private set
     var textZoom by mutableIntStateOf(sp.getInt("zoom", 100))
         private set
     var translateOffer by mutableStateOf(sp.getBoolean("tOffer", true))
@@ -102,6 +113,7 @@ class AppSettings(context: Context) {
     fun putSafeBrowsing(v: Boolean) { safeBrowsing = v; sp.edit().putBoolean("safe", v).apply() }
     fun putJavascript(v: Boolean) { javascript = v; sp.edit().putBoolean("js", v).apply() }
     fun putLoadImages(v: Boolean) { loadImages = v; sp.edit().putBoolean("images", v).apply() }
+    fun putBlockAutoplay(v: Boolean) { blockAutoplay = v; sp.edit().putBoolean("noAutoplay", v).apply() }
     fun putTextZoom(v: Int) { textZoom = v; sp.edit().putInt("zoom", v).apply() }
     fun putTranslateOffer(v: Boolean) { translateOffer = v; sp.edit().putBoolean("tOffer", v).apply() }
     fun putTranslateAuto(v: Boolean) { translateAuto = v; sp.edit().putBoolean("tAuto", v).apply() }
@@ -126,17 +138,50 @@ class AppSettings(context: Context) {
         s.javaScriptEnabled = javascript
         s.loadsImagesAutomatically = loadImages
         s.textZoom = textZoom
+        s.mediaPlaybackRequiresUserGesture = blockAutoplay
         if (Build.VERSION.SDK_INT >= 26) s.safeBrowsingEnabled = safeBrowsing
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, !blockThirdPartyCookies)
     }
 }
 
 // =====================================================================
-//  The Settings page
+//  Settings search index (the "Search settings" bar at the top)
+// =====================================================================
+private data class SettingHit(
+    val title: String,
+    val where: String,
+    val keywords: String,
+    val target: String,
+    val icon: ImageVector
+)
+
+private fun settingIndex(): List<SettingHit> = listOf(
+    SettingHit("Search engine", "Settings", "search engine brave google duckduckgo bing", "dialog:search", Icons.Default.Search),
+    SettingHit("Block ads and trackers", "Privacy and security", "ads trackers block shields", "privacy", Icons.Default.Shield),
+    SettingHit("Private browsing", "Privacy and security", "private incognito history", "privacy", Icons.Default.VisibilityOff),
+    SettingHit("Block third-party cookies", "Privacy and security", "cookies third party tracking", "privacy", Icons.Default.Lock),
+    SettingHit("Safe Browsing", "Privacy and security", "safe browsing dangerous phishing malware", "privacy", Icons.Default.Shield),
+    SettingHit("Clear browsing data", "Privacy and security", "clear delete cookies cache history data", "privacy", Icons.Default.DeleteSweep),
+    SettingHit("JavaScript", "Site settings", "javascript js scripts", "site", Icons.Default.Code),
+    SettingHit("Load images", "Site settings", "images pictures data saver", "site", Icons.Default.Image),
+    SettingHit("Block autoplay", "Site settings", "autoplay media video audio sound", "site", Icons.Default.PlayArrow),
+    SettingHit("Text size", "Accessibility", "text size zoom font accessibility", "access", Icons.Default.TextFields),
+    SettingHit("Translate pages", "Languages", "translate translation offer automatic auto", "languages", Icons.Default.Translate),
+    SettingHit("Download languages", "Languages", "language download delete offline pack model", "languages", Icons.Default.Download),
+    SettingHit("Never translate these sites", "Languages", "never translate sites", "never", Icons.Default.Block),
+    SettingHit("Password Manager", "Passwords and autofill", "password manager saved logins save passwords", "passwords", Icons.Default.Key),
+    SettingHit("Autofill services", "Passwords and autofill", "autofill service bitwarden google", "action:autofill", Icons.Default.Key),
+    SettingHit("Downloads", "Browser", "downloads files", "action:downloads", Icons.Default.Download),
+    SettingHit("Set as default browser", "Browser", "default browser links", "action:default", Icons.Default.Public)
+)
+
+// =====================================================================
+//  The Settings screen: a full page with categories, like Brave
 // =====================================================================
 @Composable
 fun SettingsScreen(
     settings: AppSettings,
+    passwords: PasswordStore,
     blockingEnabled: Boolean,
     onBlockingChange: (Boolean) -> Unit,
     privateMode: Boolean,
@@ -145,170 +190,49 @@ fun SettingsScreen(
     onClearCache: () -> Unit,
     onClearHistory: (() -> Unit)?,
     onOpenPrivacyDashboard: () -> Unit,
+    onOpenDownloads: () -> Unit,
     onSetDefaultBrowser: () -> Unit,
-    onClose: () -> Unit
-) {
-    var page by remember { mutableStateOf("main") }
-    BackHandler(enabled = page != "main") { page = "main" }
-
-    Box(Modifier.fillMaxSize().background(SBg)) {
-        when (page) {
-            "languages" -> LanguagesPage(settings) { page = "main" }
-            "never" -> NeverTranslatePage { page = "main" }
-            else -> MainPage(
-                settings = settings,
-                blockingEnabled = blockingEnabled,
-                onBlockingChange = onBlockingChange,
-                privateMode = privateMode,
-                onPrivateChange = onPrivateChange,
-                onWebSettingsChanged = onWebSettingsChanged,
-                onClearCache = onClearCache,
-                onClearHistory = onClearHistory,
-                onOpenPrivacyDashboard = onOpenPrivacyDashboard,
-                onSetDefaultBrowser = onSetDefaultBrowser,
-                openLanguages = { page = "languages" },
-                openNever = { page = "never" },
-                onClose = onClose
-            )
-        }
-    }
-}
-
-@Composable
-private fun MainPage(
-    settings: AppSettings,
-    blockingEnabled: Boolean,
-    onBlockingChange: (Boolean) -> Unit,
-    privateMode: Boolean,
-    onPrivateChange: (Boolean) -> Unit,
-    onWebSettingsChanged: () -> Unit,
-    onClearCache: () -> Unit,
-    onClearHistory: (() -> Unit)?,
-    onOpenPrivacyDashboard: () -> Unit,
-    onSetDefaultBrowser: () -> Unit,
-    openLanguages: () -> Unit,
-    openNever: () -> Unit,
+    onOpenAutofillSettings: () -> Unit,
     onClose: () -> Unit
 ) {
     val context = LocalContext.current
+    var page by remember { mutableStateOf("main") }
     var dialog by remember { mutableStateOf<String?>(null) }
-    var zoom by remember { mutableFloatStateOf(settings.textZoom.toFloat()) }
-    val neverCount = remember {
-        (context.getSharedPreferences("swift_translate", Context.MODE_PRIVATE)
-            .getStringSet("never", emptySet()) ?: emptySet()).size
+    var query by remember { mutableStateOf("") }
+
+    val back = { page = if (page == "never") "languages" else "main" }
+    BackHandler(enabled = page != "main") { back() }
+    BackHandler(enabled = page == "main" && query.isNotEmpty()) { query = "" }
+
+    fun go(target: String) {
+        when {
+            target.startsWith("dialog:") -> dialog = target.removePrefix("dialog:")
+            target == "action:autofill" -> onOpenAutofillSettings()
+            target == "action:downloads" -> onOpenDownloads()
+            target == "action:default" -> onSetDefaultBrowser()
+            else -> { page = target; query = "" }
+        }
     }
-    val version = remember {
-        runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull() ?: "1.0"
-    }
 
-    Column(Modifier.fillMaxSize()) {
-        PageHeader("Settings", onClose)
-        Column(
-            Modifier.weight(1f).verticalScroll(rememberScrollState())
-                .padding(horizontal = 17.dp).padding(bottom = 28.dp)
-        ) {
-            SectionLabel("SEARCH")
-            SCard {
-                SRow(
-                    Icons.Default.Search, "Search engine",
-                    AppSettings.ENGINES.firstOrNull { it.first == settings.searchEngine }?.second ?: "Brave Search",
-                    onClick = { dialog = "search" }
-                ) { Chevron() }
-            }
-
-            SectionLabel("PRIVACY AND SECURITY")
-            SCard {
-                SRow(Icons.Default.Shield, "Privacy dashboard", "Trackers blocked and protection status", onClick = onOpenPrivacyDashboard) { Chevron() }
-                SDivider()
-                SRow(Icons.Default.Block, "Block ads and trackers", "Blocks known tracking domains") {
-                    SSwitch(blockingEnabled) { onBlockingChange(it) }
-                }
-                SDivider()
-                SRow(Icons.Default.VisibilityOff, "Private browsing", "Does not save history; clears cookies when turned on") {
-                    SSwitch(privateMode) { onPrivateChange(it) }
-                }
-                SDivider()
-                SRow(Icons.Default.Lock, "Block third-party cookies", "Stops cross-site tracking cookies") {
-                    SSwitch(settings.blockThirdPartyCookies) {
-                        settings.putBlockThirdPartyCookies(it); onWebSettingsChanged()
-                    }
-                }
-                SDivider()
-                SRow(Icons.Default.Shield, "Safe Browsing", "Warns about dangerous sites") {
-                    SSwitch(settings.safeBrowsing) { settings.putSafeBrowsing(it); onWebSettingsChanged() }
-                }
-                SDivider()
-                SRow(Icons.Default.DeleteSweep, "Clear browsing data", "Cookies, site data, cache", onClick = { dialog = "clear" }) { Chevron() }
-            }
-
-            SectionLabel("CONTENT")
-            SCard {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.TextFields, null, tint = SAccent)
-                        Spacer(Modifier.width(12.dp))
-                        Text("Text size", color = SText, fontSize = 14.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
-                        Text("${zoom.roundToInt()}%", color = SMuted, fontSize = 13.sp)
-                    }
-                    Slider(
-                        value = zoom,
-                        onValueChange = { zoom = it },
-                        onValueChangeFinished = {
-                            settings.putTextZoom(zoom.roundToInt())
-                            onWebSettingsChanged()
-                        },
-                        valueRange = 50f..200f,
-                        steps = 14,
-                        colors = SliderDefaults.colors(
-                            thumbColor = SAccent, activeTrackColor = SAccent, inactiveTrackColor = SSurface3
-                        )
-                    )
-                }
-                SDivider()
-                SRow(Icons.Default.Image, "Load images", "Turn off to save data") {
-                    SSwitch(settings.loadImages) { settings.putLoadImages(it); onWebSettingsChanged() }
-                }
-                SDivider()
-                SRow(Icons.Default.Code, "JavaScript", "Turning this off breaks most sites and page translation") {
-                    SSwitch(settings.javascript) { settings.putJavascript(it); onWebSettingsChanged() }
-                }
-            }
-
-            SectionLabel("TRANSLATION (ON YOUR DEVICE)")
-            SCard {
-                SRow(Icons.Default.Translate, "Offer to translate pages", "Shows a card when a page is in another language") {
-                    SSwitch(settings.translateOffer) { settings.putTranslateOffer(it) }
-                }
-                SDivider()
-                SRow(Icons.Default.Language, "Translate automatically", "Only for languages already downloaded") {
-                    SSwitch(settings.translateAuto) { settings.putTranslateAuto(it) }
-                }
-                SDivider()
-                SRow(
-                    Icons.Default.Translate, "Translate pages to",
-                    TranslateEngine.displayName(settings.translateTarget),
-                    onClick = { dialog = "target" }
-                ) { Chevron() }
-                SDivider()
-                SRow(Icons.Default.Wifi, "Download language packs on Wi-Fi only", "Each pack is about ${TranslateEngine.MODEL_MB} MB") {
-                    SSwitch(settings.wifiOnlyModels) { settings.putWifiOnlyModels(it) }
-                }
-                SDivider()
-                SRow(Icons.Default.Download, "Languages", "Download or delete offline languages", onClick = openLanguages) { Chevron() }
-                SDivider()
-                SRow(
-                    Icons.Default.Block, "Never translate these sites",
-                    if (neverCount == 0) "No sites" else "$neverCount sites",
-                    onClick = openNever
-                ) { Chevron() }
-            }
-
-            SectionLabel("BROWSER")
-            SCard {
-                SRow(Icons.Default.Public, "Set as default browser", null, onClick = onSetDefaultBrowser) { Chevron() }
-                SDivider()
-                SRow(Icons.Default.Info, "About Swift Browser", "Version $version") {}
-            }
+    Box(Modifier.fillMaxSize().background(SBg)) {
+        when (page) {
+            "privacy" -> PrivacyPage(
+                settings, blockingEnabled, onBlockingChange, privateMode, onPrivateChange,
+                onWebSettingsChanged, onOpenPrivacyDashboard, { dialog = "clear" }, back
+            )
+            "site" -> SitePage(settings, onWebSettingsChanged, back)
+            "access" -> AccessibilityPage(settings, onWebSettingsChanged, back)
+            "languages" -> LanguagesPage(settings, { page = "never" }, { dialog = "target" }, back)
+            "never" -> NeverTranslatePage(back)
+            "passwords" -> PasswordsPage(passwords, back)
+            else -> MainPage(
+                settings = settings,
+                passwords = passwords,
+                query = query,
+                onQuery = { query = it },
+                onGo = { go(it) },
+                onClose = onClose
+            )
         }
     }
 
@@ -347,17 +271,238 @@ private fun MainPage(
     }
 }
 
+@Composable
+private fun MainPage(
+    settings: AppSettings,
+    passwords: PasswordStore,
+    query: String,
+    onQuery: (String) -> Unit,
+    onGo: (String) -> Unit,
+    onClose: () -> Unit
+) {
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onClose) { Icon(Icons.Default.ArrowBack, "Back", tint = SText) }
+            Spacer(Modifier.width(4.dp))
+            Text("Settings", color = SText, fontSize = 24.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+            IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Close", tint = SText) }
+        }
+
+        // Search settings
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp).height(52.dp)
+                .clip(RoundedCornerShape(28.dp)).background(SRowBg).padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.Search, null, tint = SIcon)
+            Spacer(Modifier.width(14.dp))
+            Box(Modifier.weight(1f)) {
+                if (query.isEmpty()) Text("Search settings", color = SMuted, fontSize = 16.sp)
+                BasicTextField(
+                    value = query,
+                    onValueChange = onQuery,
+                    singleLine = true,
+                    textStyle = TextStyle(color = SText, fontSize = 16.sp),
+                    cursorBrush = SolidColor(SAccent),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            if (query.isNotEmpty()) {
+                IconButton(onClick = { onQuery("") }, modifier = Modifier.size(24.dp)) {
+                    Icon(Icons.Default.Close, "Clear", tint = SMuted)
+                }
+            }
+        }
+
+        Column(
+            Modifier.weight(1f).verticalScroll(rememberScrollState())
+                .padding(horizontal = 14.dp).padding(top = 6.dp, bottom = 28.dp)
+        ) {
+            val q = query.trim().lowercase()
+            if (q.isNotEmpty()) {
+                val hits = settingIndex().filter { (it.title + " " + it.where + " " + it.keywords).lowercase().contains(q) }
+                if (hits.isEmpty()) {
+                    Text("No settings found", color = SMuted, fontSize = 14.sp, modifier = Modifier.padding(20.dp))
+                } else {
+                    CardGroup {
+                        hits.forEach { h ->
+                            item { SRow(h.icon, h.title, h.where, onClick = { onGo(h.target) }) { Chevron() } }
+                        }
+                    }
+                }
+            } else {
+                CardGroup {
+                    item {
+                        SRow(
+                            Icons.Default.Search, "Search engine",
+                            AppSettings.ENGINES.firstOrNull { it.first == settings.searchEngine }?.second ?: "Brave Search",
+                            onClick = { onGo("dialog:search") }
+                        ) { Chevron() }
+                    }
+                    item { SRow(Icons.Default.Shield, "Privacy and security", null, onClick = { onGo("privacy") }) { Chevron() } }
+                    item { SRow(Icons.Default.Public, "Site settings", null, onClick = { onGo("site") }) { Chevron() } }
+                    item { SRow(Icons.Default.Accessibility, "Accessibility", null, onClick = { onGo("access") }) { Chevron() } }
+                    item {
+                        SRow(
+                            Icons.Default.Translate, "Languages",
+                            "Translate pages to " + TranslateEngine.displayName(settings.translateTarget),
+                            onClick = { onGo("languages") }
+                        ) { Chevron() }
+                    }
+                }
+
+                SectionLabel("Passwords and autofill")
+                CardGroup {
+                    item {
+                        SRow(
+                            Icons.Default.Key, "Password Manager",
+                            if (passwords.logins.isEmpty()) "Nothing saved yet" else "${passwords.logins.size} saved",
+                            onClick = { onGo("passwords") }
+                        ) { Chevron() }
+                    }
+                    item {
+                        SRow(Icons.Default.Edit, "Autofill services", "Use another password app", onClick = { onGo("action:autofill") }) { Chevron() }
+                    }
+                }
+
+                SectionLabel("Browser")
+                CardGroup {
+                    item { SRow(Icons.Default.Download, "Downloads", null, onClick = { onGo("action:downloads") }) { Chevron() } }
+                    item { SRow(Icons.Default.Public, "Set as default browser", null, onClick = { onGo("action:default") }) { Chevron() } }
+                    item { AboutRow() }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AboutRow() {
+    val context = LocalContext.current
+    val version = remember {
+        runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull() ?: "1.0"
+    }
+    SRow(Icons.Default.Info, "About Swift Browser", "Version $version") {}
+}
+
 // =====================================================================
-//  Languages: download and delete offline translation languages
+//  Category pages
 // =====================================================================
 @Composable
-private fun LanguagesPage(settings: AppSettings, onBack: () -> Unit) {
+private fun PrivacyPage(
+    settings: AppSettings,
+    blockingEnabled: Boolean,
+    onBlockingChange: (Boolean) -> Unit,
+    privateMode: Boolean,
+    onPrivateChange: (Boolean) -> Unit,
+    onWebSettingsChanged: () -> Unit,
+    onOpenPrivacyDashboard: () -> Unit,
+    onClearData: () -> Unit,
+    onBack: () -> Unit
+) {
+    PageScaffold("Privacy and security", onBack) {
+        CardGroup {
+            item { SRow(Icons.Default.Shield, "Privacy dashboard", "Trackers blocked and protection status", onClick = onOpenPrivacyDashboard) { Chevron() } }
+            item { SRow(Icons.Default.Block, "Block ads and trackers", "Blocks known tracking domains") { SSwitch(blockingEnabled) { onBlockingChange(it) } } }
+            item { SRow(Icons.Default.VisibilityOff, "Private browsing", "Doesn't save history; clears cookies when turned on") { SSwitch(privateMode) { onPrivateChange(it) } } }
+            item {
+                SRow(Icons.Default.Lock, "Block third-party cookies", "Stops cross-site tracking cookies") {
+                    SSwitch(settings.blockThirdPartyCookies) { settings.putBlockThirdPartyCookies(it); onWebSettingsChanged() }
+                }
+            }
+            item {
+                SRow(Icons.Default.Shield, "Safe Browsing", "Warns about dangerous sites") {
+                    SSwitch(settings.safeBrowsing) { settings.putSafeBrowsing(it); onWebSettingsChanged() }
+                }
+            }
+            item { SRow(Icons.Default.DeleteSweep, "Clear browsing data", "Cookies, site data, cache", onClick = onClearData) { Chevron() } }
+        }
+    }
+}
+
+@Composable
+private fun SitePage(settings: AppSettings, onWebSettingsChanged: () -> Unit, onBack: () -> Unit) {
+    PageScaffold("Site settings", onBack) {
+        CardGroup {
+            item {
+                SRow(Icons.Default.Code, "JavaScript", "Turning this off breaks most sites and page translation") {
+                    SSwitch(settings.javascript) { settings.putJavascript(it); onWebSettingsChanged() }
+                }
+            }
+            item {
+                SRow(Icons.Default.Image, "Load images", "Turn off to save data") {
+                    SSwitch(settings.loadImages) { settings.putLoadImages(it); onWebSettingsChanged() }
+                }
+            }
+            item {
+                SRow(Icons.Default.PlayArrow, "Block autoplay", "Video and audio start only when you tap play") {
+                    SSwitch(settings.blockAutoplay) { settings.putBlockAutoplay(it); onWebSettingsChanged() }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AccessibilityPage(settings: AppSettings, onWebSettingsChanged: () -> Unit, onBack: () -> Unit) {
+    var zoom by remember { mutableFloatStateOf(settings.textZoom.toFloat()) }
+    PageScaffold("Accessibility", onBack) {
+        CardGroup {
+            item {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.TextFields, null, tint = SIcon)
+                        Spacer(Modifier.width(16.dp))
+                        Text("Text size", color = SText, fontSize = 16.sp, modifier = Modifier.weight(1f))
+                        Text("${zoom.roundToInt()}%", color = SMuted, fontSize = 14.sp)
+                    }
+                    Slider(
+                        value = zoom,
+                        onValueChange = { zoom = it },
+                        onValueChangeFinished = {
+                            settings.putTextZoom(zoom.roundToInt())
+                            onWebSettingsChanged()
+                        },
+                        valueRange = 50f..200f,
+                        steps = 14,
+                        colors = SliderDefaults.colors(
+                            thumbColor = SAccent, activeTrackColor = SAccent, inactiveTrackColor = SSurface3
+                        )
+                    )
+                    Text(
+                        "This is how page text will look.",
+                        color = SText, fontSize = (16f * zoom / 100f).sp,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Languages: translation options + download / delete offline languages
+// ---------------------------------------------------------------------
+@Composable
+private fun LanguagesPage(
+    settings: AppSettings,
+    openNever: () -> Unit,
+    openTarget: () -> Unit,
+    onBack: () -> Unit
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var downloaded by remember { mutableStateOf<Set<String>?>(null) }
     val busy = remember { mutableStateMapOf<String, String>() }
     var query by remember { mutableStateOf("") }
     var confirmDelete by remember { mutableStateOf<String?>(null) }
+    val neverCount = remember {
+        (context.getSharedPreferences("swift_translate", Context.MODE_PRIVATE)
+            .getStringSet("never", emptySet()) ?: emptySet()).size
+    }
 
     LaunchedEffect(Unit) {
         downloaded = runCatching { TranslateEngine.downloadedLanguages() }.getOrDefault(emptySet())
@@ -378,7 +523,7 @@ private fun LanguagesPage(settings: AppSettings, onBack: () -> Unit) {
     fun download(lang: String) {
         if (!TranslateEngine.isOnline(context)) { toast("No internet connection"); return }
         if (settings.wifiOnlyModels && !TranslateEngine.isOnWifi(context)) {
-            toast("Wi-Fi only is on. Connect to Wi-Fi or turn it off in Settings.")
+            toast("Wi-Fi only is on. Connect to Wi-Fi or turn it off in Languages settings.")
             return
         }
         scope.launch {
@@ -416,23 +561,55 @@ private fun LanguagesPage(settings: AppSettings, onBack: () -> Unit) {
 
     Column(Modifier.fillMaxSize()) {
         PageHeader("Languages", onBack)
-        LazyColumn(Modifier.weight(1f).padding(horizontal = 17.dp), contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 28.dp)) {
+        LazyColumn(
+            Modifier.weight(1f).padding(horizontal = 14.dp),
+            contentPadding = PaddingValues(bottom = 28.dp)
+        ) {
+            item(key = "options") {
+                CardGroup {
+                    item {
+                        SRow(Icons.Default.Translate, "Offer to translate pages", "Shows a card when a page is in another language") {
+                            SSwitch(settings.translateOffer) { settings.putTranslateOffer(it) }
+                        }
+                    }
+                    item {
+                        SRow(Icons.Default.Language, "Translate automatically", "Only for languages already downloaded") {
+                            SSwitch(settings.translateAuto) { settings.putTranslateAuto(it) }
+                        }
+                    }
+                    item {
+                        SRow(
+                            Icons.Default.Translate, "Translate pages to",
+                            TranslateEngine.displayName(settings.translateTarget), onClick = openTarget
+                        ) { Chevron() }
+                    }
+                    item {
+                        SRow(Icons.Default.Wifi, "Download on Wi-Fi only", "Each language is about ${TranslateEngine.MODEL_MB} MB") {
+                            SSwitch(settings.wifiOnlyModels) { settings.putWifiOnlyModels(it) }
+                        }
+                    }
+                    item {
+                        SRow(
+                            Icons.Default.Block, "Never translate these sites",
+                            if (neverCount == 0) "No sites" else "$neverCount sites", onClick = openNever
+                        ) { Chevron() }
+                    }
+                }
+            }
+            item(key = "label-offline") { SectionLabel("Offline languages") }
             item(key = "info") {
-                Column(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(SSurface).padding(14.dp)
-                ) {
-                    Text("Translation runs on your device", color = SText, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(SRowBg).padding(16.dp)) {
+                    Text("Translation runs on your device", color = SText, fontSize = 15.sp, fontWeight = FontWeight.Medium)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "Download a language once and it works offline. Each one is about ${TranslateEngine.MODEL_MB} MB, " +
-                            "and English is added automatically as the bridge language.",
-                        color = SMuted, fontSize = 12.sp
+                        "Download a language once and it works offline. English is added automatically as the bridge language.",
+                        color = SMuted, fontSize = 13.sp
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
                         if (downloaded == null) "Checking downloaded languages..."
                         else "${have.size} downloaded, about ${have.size * TranslateEngine.MODEL_MB} MB used",
-                        color = SAccent, fontSize = 12.sp, fontWeight = FontWeight.Medium
+                        color = SAccent, fontSize = 13.sp, fontWeight = FontWeight.Medium
                     )
                 }
                 Spacer(Modifier.height(12.dp))
@@ -445,7 +622,7 @@ private fun LanguagesPage(settings: AppSettings, onBack: () -> Unit) {
                     placeholder = { Text("Search languages", color = SMuted) },
                     leadingIcon = { Icon(Icons.Default.Search, null, tint = SMuted) },
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(14.dp),
+                    shape = RoundedCornerShape(28.dp),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = SText, unfocusedTextColor = SText,
                         focusedBorderColor = SAccent, unfocusedBorderColor = SSurface3,
@@ -455,17 +632,17 @@ private fun LanguagesPage(settings: AppSettings, onBack: () -> Unit) {
             }
             if (query.isBlank()) {
                 if (haveList.isNotEmpty()) {
-                    item(key = "label-have") { SectionLabel("DOWNLOADED") }
+                    item(key = "label-have") { SectionLabel("Downloaded") }
                     items(haveList, key = { "d-" + it.first }) { (code, name) ->
                         LangRow(name, true, busy[code], { download(code) }, { confirmDelete = code })
                     }
                 }
-                item(key = "label-all") { SectionLabel("AVAILABLE") }
+                item(key = "label-all") { SectionLabel("Available") }
                 items(availableList, key = { "a-" + it.first }) { (code, name) ->
                     LangRow(name, false, busy[code], { download(code) }, { confirmDelete = code })
                 }
             } else {
-                item(key = "label-results") { SectionLabel("RESULTS") }
+                item(key = "label-results") { SectionLabel("Results") }
                 items(matches, key = { "m-" + it.first }) { (code, name) ->
                     LangRow(name, code in have, busy[code], { download(code) }, { confirmDelete = code })
                 }
@@ -484,12 +661,8 @@ private fun LanguagesPage(settings: AppSettings, onBack: () -> Unit) {
                     color = SMuted, fontSize = 13.sp
                 )
             },
-            confirmButton = {
-                TextButton(onClick = { confirmDelete = null; delete(lang) }) { Text("Delete", color = SAccent) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDelete = null }) { Text("Cancel", color = SMuted) }
-            }
+            confirmButton = { TextButton(onClick = { confirmDelete = null; delete(lang) }) { Text("Delete", color = SAccent) } },
+            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Cancel", color = SMuted) } }
         )
     }
 }
@@ -502,9 +675,9 @@ private fun LangRow(
     onDownload: () -> Unit,
     onDelete: () -> Unit
 ) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp, horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
-            Text(name, color = SText, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(name, color = SText, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
                 when {
                     busy == "download" -> "Downloading..."
@@ -512,7 +685,7 @@ private fun LangRow(
                     isDownloaded -> "Ready offline"
                     else -> "About ${TranslateEngine.MODEL_MB} MB"
                 },
-                color = if (isDownloaded && busy == null) SAccent else SMuted, fontSize = 11.sp
+                color = if (isDownloaded && busy == null) SAccent else SMuted, fontSize = 12.sp
             )
         }
         when {
@@ -523,9 +696,6 @@ private fun LangRow(
     }
 }
 
-// =====================================================================
-//  Sites the user chose never to translate
-// =====================================================================
 @Composable
 private fun NeverTranslatePage(onBack: () -> Unit) {
     val context = LocalContext.current
@@ -537,13 +707,13 @@ private fun NeverTranslatePage(onBack: () -> Unit) {
         PageHeader("Never translate", onBack)
         if (sites.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No sites yet", color = SMuted, fontSize = 13.sp)
+                Text("No sites yet", color = SMuted, fontSize = 14.sp)
             }
         } else {
-            LazyColumn(Modifier.padding(horizontal = 17.dp)) {
+            LazyColumn(Modifier.padding(horizontal = 18.dp)) {
                 items(sites.toList(), key = { it }) { host ->
                     Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(host, color = SText, fontSize = 14.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(host, color = SText, fontSize = 15.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         IconButton(onClick = {
                             sites.remove(host)
                             sp.edit().putStringSet("never", sites.toSet()).apply()
@@ -555,33 +725,287 @@ private fun NeverTranslatePage(onBack: () -> Unit) {
     }
 }
 
+// ---------------------------------------------------------------------
+//  Password Manager
+// ---------------------------------------------------------------------
+private fun copySensitive(context: Context, label: String, text: String) {
+    val clip = ClipData.newPlainText(label, text)
+    if (Build.VERSION.SDK_INT >= 33) {
+        clip.description.extras = android.os.PersistableBundle().apply {
+            putBoolean("android.content.extra.IS_SENSITIVE", true)
+        }
+    }
+    context.getSystemService(ClipboardManager::class.java).setPrimaryClip(clip)
+    Toast.makeText(context, "$label copied", Toast.LENGTH_SHORT).show()
+}
+
+@Composable
+private fun PasswordsPage(passwords: PasswordStore, onBack: () -> Unit) {
+    var viewing by remember { mutableStateOf<SavedLogin?>(null) }
+    var editing by remember { mutableStateOf<SavedLogin?>(null) }
+    var adding by remember { mutableStateOf(false) }
+    val sorted = passwords.logins.sortedWith(compareBy({ it.host }, { it.username.lowercase() }))
+
+    Column(Modifier.fillMaxSize()) {
+        PageHeader("Password Manager", onBack)
+        LazyColumn(Modifier.weight(1f).padding(horizontal = 14.dp), contentPadding = PaddingValues(bottom = 28.dp)) {
+            item(key = "options") {
+                CardGroup {
+                    item {
+                        SRow(Icons.Default.Key, "Offer to save passwords", "Asks after you sign in to a site") {
+                            SSwitch(passwords.offerToSave) { passwords.putOfferToSave(it) }
+                        }
+                    }
+                    item {
+                        SRow(Icons.Default.Edit, "Fill in saved passwords", "Only on secure (HTTPS) sites") {
+                            SSwitch(passwords.autoFill) { passwords.putAutoFill(it) }
+                        }
+                    }
+                    item {
+                        SRow(Icons.Default.Add, "Add password", null, onClick = { adding = true }) { Chevron() }
+                    }
+                }
+            }
+            item(key = "label-saved") { SectionLabel("Saved passwords") }
+            if (sorted.isEmpty()) {
+                item(key = "empty") {
+                    Text(
+                        "Passwords you save are encrypted on this device and never leave it.",
+                        color = SMuted, fontSize = 14.sp, modifier = Modifier.padding(16.dp)
+                    )
+                }
+            } else {
+                item(key = "list") {
+                    CardGroup {
+                        sorted.forEach { l ->
+                            item {
+                                SRow(
+                                    Icons.Default.Key, l.host,
+                                    if (l.username.isBlank()) "No username" else l.username,
+                                    onClick = { viewing = l }
+                                ) { Chevron() }
+                            }
+                        }
+                    }
+                }
+            }
+            if (passwords.neverHosts.isNotEmpty()) {
+                item(key = "label-never") { SectionLabel("Never saved") }
+                items(passwords.neverHosts.toList(), key = { "n-" + it }) { host ->
+                    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp, horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(host, color = SText, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                        IconButton(onClick = { passwords.removeNever(host) }) { Icon(Icons.Default.Close, "Remove", tint = SMuted) }
+                    }
+                }
+            }
+        }
+    }
+
+    viewing?.let { login ->
+        LoginDetailDialog(
+            login = login,
+            onDismiss = { viewing = null },
+            onEdit = { editing = login; viewing = null },
+            onDelete = { passwords.delete(login.id); viewing = null }
+        )
+    }
+    if (adding) {
+        LoginEditDialog(
+            initial = null,
+            onDismiss = { adding = false },
+            onSave = { host, user, pass -> passwords.save(PasswordStore.hostKey("https://$host").ifEmpty { host }, user, pass); adding = false }
+        )
+    }
+    editing?.let { login ->
+        LoginEditDialog(
+            initial = login,
+            onDismiss = { editing = null },
+            onSave = { host, user, pass ->
+                passwords.edit(login.id, PasswordStore.hostKey("https://$host").ifEmpty { host }, user, pass)
+                editing = null
+            }
+        )
+    }
+}
+
+@Composable
+private fun LoginDetailDialog(login: SavedLogin, onDismiss: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit) {
+    val context = LocalContext.current
+    var show by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = SSurface,
+        title = { Text(login.host, color = SText, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text("Username", color = SMuted, fontSize = 12.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        login.username.ifBlank { "(none)" }, color = SText, fontSize = 15.sp,
+                        modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                    if (login.username.isNotBlank()) {
+                        IconButton(onClick = { copySensitive(context, "Username", login.username) }) {
+                            Icon(Icons.Default.ContentCopy, "Copy username", tint = SMuted)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("Password", color = SMuted, fontSize = 12.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (show) login.password else "\u2022".repeat(minOf(login.password.length, 12)),
+                        color = SText, fontSize = 15.sp, modifier = Modifier.weight(1f),
+                        maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                    IconButton(onClick = { show = !show }) {
+                        Icon(if (show) Icons.Default.VisibilityOff else Icons.Default.Visibility, "Show or hide", tint = SMuted)
+                    }
+                    IconButton(onClick = { copySensitive(context, "Password", login.password) }) {
+                        Icon(Icons.Default.ContentCopy, "Copy password", tint = SMuted)
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onEdit) { Text("Edit", color = SAccent) } },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onDelete) { Text("Delete", color = SMuted) }
+                TextButton(onClick = onDismiss) { Text("Close", color = SMuted) }
+            }
+        }
+    )
+}
+
+@Composable
+private fun LoginEditDialog(
+    initial: SavedLogin?,
+    onDismiss: () -> Unit,
+    onSave: (host: String, user: String, pass: String) -> Unit
+) {
+    var host by remember { mutableStateOf(initial?.host ?: "") }
+    var user by remember { mutableStateOf(initial?.username ?: "") }
+    var pass by remember { mutableStateOf(initial?.password ?: "") }
+    var show by remember { mutableStateOf(false) }
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedTextColor = SText, unfocusedTextColor = SText,
+        focusedBorderColor = SAccent, unfocusedBorderColor = SSurface3,
+        focusedLabelColor = SAccent, unfocusedLabelColor = SMuted, cursorColor = SAccent
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = SSurface,
+        title = { Text(if (initial == null) "Add password" else "Edit password", color = SText, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(host, { host = it }, label = { Text("Website (example.com)") }, singleLine = true, colors = fieldColors)
+                OutlinedTextField(user, { user = it }, label = { Text("Username") }, singleLine = true, colors = fieldColors)
+                OutlinedTextField(
+                    pass, { pass = it }, label = { Text("Password") }, singleLine = true, colors = fieldColors,
+                    visualTransformation = if (show) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { show = !show }) {
+                            Icon(if (show) Icons.Default.VisibilityOff else Icons.Default.Visibility, "Show or hide", tint = SMuted)
+                        }
+                    }
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = host.isNotBlank() && pass.isNotEmpty(),
+                onClick = { onSave(host.trim(), user.trim(), pass) }
+            ) { Text("Save", color = SAccent) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = SMuted) } }
+    )
+}
+
+/** "Save password?" asked right after a sign-in. */
+@Composable
+fun SavePasswordDialog(
+    pending: PendingLogin,
+    onSave: () -> Unit,
+    onNever: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = SSurface,
+        title = {
+            Text(if (pending.isUpdate) "Update password?" else "Save password?", color = SText, fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Column {
+                Text(pending.host, color = SText, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                Text(pending.username.ifBlank { "No username" }, color = SMuted, fontSize = 14.sp)
+                Text("\u2022".repeat(minOf(pending.password.length, 12)), color = SMuted, fontSize = 14.sp)
+            }
+        },
+        confirmButton = {
+            Row {
+                TextButton(onClick = onNever) { Text("Never", color = SMuted) }
+                TextButton(onClick = onDismiss) { Text("Not now", color = SMuted) }
+                TextButton(onClick = onSave) { Text(if (pending.isUpdate) "Update" else "Save", color = SAccent) }
+            }
+        }
+    )
+}
+
 // =====================================================================
-//  Small building blocks
+//  Building blocks
 // =====================================================================
+@Composable
+private fun PageScaffold(title: String, onBack: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+    Column(Modifier.fillMaxSize()) {
+        PageHeader(title, onBack)
+        Column(
+            Modifier.weight(1f).verticalScroll(rememberScrollState())
+                .padding(horizontal = 14.dp).padding(top = 6.dp, bottom = 28.dp),
+            content = content
+        )
+    }
+}
+
 @Composable
 private fun PageHeader(title: String, onBack: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Back", tint = SText) }
-        Text(title, color = SText, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.width(4.dp))
+        Text(title, color = SText, fontSize = 22.sp, fontWeight = FontWeight.Medium)
     }
 }
 
 @Composable
 private fun SectionLabel(text: String) {
     Text(
-        text, color = SMuted, fontSize = 11.sp, fontWeight = FontWeight.Bold,
-        modifier = Modifier.padding(top = 20.dp, bottom = 8.dp, start = 4.dp)
+        text, color = SMuted, fontSize = 14.sp, fontWeight = FontWeight.Medium,
+        modifier = Modifier.padding(top = 22.dp, bottom = 8.dp, start = 12.dp)
     )
 }
 
-@Composable
-private fun SCard(content: @Composable () -> Unit) {
-    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(SSurface)) { content() }
+private class CardScope {
+    val rows = mutableListOf<@Composable () -> Unit>()
+    fun item(row: @Composable () -> Unit) { rows.add(row) }
 }
 
+/** Rows as separate rounded cards with a thin gap, like Brave's settings list. */
 @Composable
-private fun SDivider() {
-    HorizontalDivider(color = SSurface3.copy(alpha = .6f), modifier = Modifier.padding(start = 50.dp))
+private fun CardGroup(content: CardScope.() -> Unit) {
+    val rows = CardScope().apply(content).rows
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        rows.forEachIndexed { i, row ->
+            val big = 22.dp
+            val small = 6.dp
+            val first = i == 0
+            val last = i == rows.lastIndex
+            val shape = RoundedCornerShape(
+                topStart = if (first) big else small, topEnd = if (first) big else small,
+                bottomStart = if (last) big else small, bottomEnd = if (last) big else small
+            )
+            Box(Modifier.fillMaxWidth().clip(shape).background(SRowBg)) { row() }
+        }
+    }
 }
 
 @Composable
@@ -593,16 +1017,16 @@ private fun SRow(
     trailing: @Composable () -> Unit
 ) {
     Row(
-        Modifier.fillMaxWidth()
+        Modifier.fillMaxWidth().heightIn(min = 64.dp)
             .then(if (onClick != null) Modifier.clickable { onClick() } else Modifier)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+            .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Icon(icon, null, tint = SAccent)
-        Spacer(Modifier.width(12.dp))
+        Icon(icon, null, tint = SIcon)
+        Spacer(Modifier.width(18.dp))
         Column(Modifier.weight(1f)) {
-            Text(title, color = SText, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            if (subtitle != null) Text(subtitle, color = SMuted, fontSize = 11.sp)
+            Text(title, color = SText, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (subtitle != null) Text(subtitle, color = SMuted, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
         Spacer(Modifier.width(8.dp))
         trailing()
@@ -648,7 +1072,7 @@ private fun ChoiceDialog(
                             colors = RadioButtonDefaults.colors(selectedColor = SAccent, unselectedColor = SMuted)
                         )
                         Spacer(Modifier.width(6.dp))
-                        Text(label, color = SText, fontSize = 14.sp)
+                        Text(label, color = SText, fontSize = 15.sp)
                     }
                 }
             }
@@ -678,10 +1102,9 @@ private fun ClearDataDialog(
             }
         },
         confirmButton = {
-            TextButton(
-                enabled = cookies || cache || history,
-                onClick = { onConfirm(cookies, cache, history) }
-            ) { Text("Clear", color = SAccent) }
+            TextButton(enabled = cookies || cache || history, onClick = { onConfirm(cookies, cache, history) }) {
+                Text("Clear", color = SAccent)
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = SMuted) } }
     )
@@ -699,6 +1122,6 @@ private fun CheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Uni
             colors = CheckboxDefaults.colors(checkedColor = SAccent, uncheckedColor = SMuted)
         )
         Spacer(Modifier.width(6.dp))
-        Text(label, color = SText, fontSize = 14.sp)
+        Text(label, color = SText, fontSize = 15.sp)
     }
 }

@@ -97,6 +97,8 @@ import androidx.compose.ui.unit.IntOffset
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animate
+import kotlinx.coroutines.Job
 import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.Spring
@@ -218,8 +220,35 @@ private class BookmarkStore(context: Context, legacy: () -> List<Pair<String, St
 // Last snapshot of the homepage: every home tab shows it in the tab overview.
 private var HomeThumbStore by mutableStateOf<Bitmap?>(null)
 
-private const val DESKTOP_UA =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+// Desktop user agent: same Chrome version as this phone's WebView (a stale version
+// next to modern features makes some sites distrust the browser and show errors).
+private fun desktopUserAgent(context: Context): String {
+    val def = android.webkit.WebSettings.getDefaultUserAgent(context)
+    val major = Regex("Chrome/(\\d+)").find(def)?.groupValues?.get(1) ?: "124"
+    return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$major.0.0.0 Safari/537.36"
+}
+
+// Only well-known mobile hosts are swapped for their desktop host. Every other site is
+// simply reloaded at the same address with the desktop user agent (like Chrome does);
+// guessing "www." for unknown sites sent some of them to a 404 page.
+private fun desktopEquivalent(url: String, desktop: Boolean): String {
+    if (!desktop) return url
+    return runCatching {
+        val uri = Uri.parse(url)
+        val host = uri.host ?: return url
+        val newHost = when {
+            host == "m.youtube.com" -> "www.youtube.com"
+            host.endsWith(".m.wikipedia.org") -> host.replace(".m.wikipedia.org", ".wikipedia.org")
+            host == "m.facebook.com" || host == "mbasic.facebook.com" || host == "touch.facebook.com" -> "www.facebook.com"
+            host == "mobile.twitter.com" -> "twitter.com"
+            host == "mobile.x.com" -> "x.com"
+            host == "m.imdb.com" -> "www.imdb.com"
+            host == "m.reddit.com" -> "www.reddit.com"
+            else -> host
+        }
+        if (newHost == host) url else uri.buildUpon().authority(newHost).build().toString()
+    }.getOrDefault(url)
+}
 
 // Page language detection (for the auto translate offer): html lang first, then
 // the dominant non-Latin script of the visible text.
@@ -236,20 +265,39 @@ private const val LANG_JS = """
 """
 
 // Desktop site: Chrome-style. Forces a wide layout viewport (pages that ask for
-// width=device-width otherwise snap back to the phone layout) and hides the
-// "I'm a phone" signals that sites check from JavaScript.
+// width=device-width otherwise snap back to the phone layout) and hides every
+// "I'm a phone" signal sites check from JavaScript: touch, screen size, pointer media queries.
 private const val DESKTOP_JS = """
 (function(){
  try{
-  Object.defineProperty(Navigator.prototype,'maxTouchPoints',{get:function(){return 0;},configurable:true});
-  Object.defineProperty(Navigator.prototype,'userAgentData',{get:function(){return undefined;},configurable:true});
-  Object.defineProperty(Navigator.prototype,'platform',{get:function(){return 'Linux x86_64';},configurable:true});
+  var d=function(o,k,v){try{Object.defineProperty(o,k,{get:function(){return v;},configurable:true});}catch(e){}};
+  d(Navigator.prototype,'maxTouchPoints',0);
+  d(Navigator.prototype,'userAgentData',undefined);
+  d(Navigator.prototype,'platform','Linux x86_64');
+  d(Navigator.prototype,'vendor','Google Inc.');
+  d(Screen.prototype,'width',1920);
+  d(Screen.prototype,'height',1080);
+  d(Screen.prototype,'availWidth',1920);
+  d(Screen.prototype,'availHeight',1040);
+  d(window,'orientation',undefined);
+  try{delete window.ontouchstart;}catch(e){}
+  if(!window.__swiftMM){
+   window.__swiftMM=true;
+   var mm=window.matchMedia.bind(window);
+   window.matchMedia=function(q){
+    try{
+     if(/(any-)?pointer\s*:\s*(coarse|none)|(any-)?hover\s*:\s*none/.test(q)) return mm('not all');
+     if(/(any-)?pointer\s*:\s*fine|(any-)?hover\s*:\s*hover/.test(q)) return mm('all');
+    }catch(e){}
+    return mm(q);
+   };
+  }
  }catch(e){}
  function fix(){
   var h=document.head||document.documentElement; if(!h) return;
   var ms=document.querySelectorAll('meta[name=viewport]');
-  if(!ms.length){var m=document.createElement('meta');m.name='viewport';m.content='width=1100';h.appendChild(m);return;}
-  for(var i=0;i<ms.length;i++){ if(ms[i].content!=='width=1100') ms[i].content='width=1100'; }
+  if(!ms.length){var m=document.createElement('meta');m.name='viewport';m.content='width=1280';h.appendChild(m);return;}
+  for(var i=0;i<ms.length;i++){ if(ms[i].content!=='width=1280') ms[i].content='width=1280'; }
  }
  fix();
  if(!window.__swiftDeskObs){
@@ -527,6 +575,9 @@ private fun SwiftBrowserApp() {
     // Page whose translate banner the user swiped away: a translation still in
     // flight must not pop the "translated" card straight back afterwards.
     var translateDismissedUrl by remember { mutableStateOf<String?>(null) }
+    var contextMenu by remember { mutableStateOf<ContextTarget?>(null) }
+    var pendingLogin by remember { mutableStateOf<PendingLogin?>(null) }
+    val passwordStore = remember { PasswordStore(context) }
     val downloadStore = remember { DownloadStore(context) }
     val recentClosed = remember { mutableStateListOf<Pair<String, String>>() }
     val pendingLoads = remember { HashMap<Long, String>() }
@@ -1113,6 +1164,42 @@ private fun SwiftBrowserApp() {
             // Saved settings: text size, JavaScript, images, Safe Browsing, third-party cookies.
             appSettings.applyTo(this)
 
+            // Password Manager: the page reports sign-in submits (never reads anything back).
+            addJavascriptInterface(PasswordBridge(this) { host, user, pass ->
+                if (host.isNotEmpty() && passwordStore.offerToSave && !currentPrivateMode && !passwordStore.isNever(host)) {
+                    val existing = passwordStore.find(host, user)
+                    if (existing == null || existing.password != pass) {
+                        pendingLogin = PendingLogin(host, user, pass, existing != null)
+                    }
+                }
+            }, "SwiftPasswords")
+
+            // Press and hold on a link or image: Brave-style menu.
+            setOnLongClickListener { v ->
+                val wv = v as WebView
+                val hit = wv.hitTestResult
+                val type = hit.type
+                val extra = hit.extra
+                val isLink = type == WebView.HitTestResult.SRC_ANCHOR_TYPE ||
+                    type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
+                val isImage = type == WebView.HitTestResult.IMAGE_TYPE ||
+                    type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
+                if ((!isLink && !isImage) || extra == null || extra.startsWith("javascript:")) {
+                    return@setOnLongClickListener false
+                }
+                wv.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                val msg = Handler(Looper.getMainLooper()) { m ->
+                    val href = m.data?.getString("url")?.takeIf { it.isNotBlank() }
+                    val title = m.data?.getString("title")?.takeIf { it.isNotBlank() }
+                    val linkUrl = if (isLink) (href ?: if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE) extra else null) else null
+                    val imageUrl = if (isImage) extra else null
+                    if (linkUrl != null || imageUrl != null) contextMenu = ContextTarget(linkUrl, title, imageUrl)
+                    true
+                }.obtainMessage()
+                wv.requestFocusNodeHref(msg)
+                true
+            }
+
             webChromeClient = object : WebChromeClient() {
                 override fun onReceivedTitle(view: WebView?, title: String?) {
                     val t = title ?: return
@@ -1218,6 +1305,17 @@ private fun SwiftBrowserApp() {
                     if (!currentPrivateMode) store.addHistory(title, url)
                     Handler(Looper.getMainLooper()).postDelayed({ captureThumb(tabId) }, 700)
                     if (tabId == activeId && url.startsWith("http")) offerTranslateIfNeeded(view, tabId, url)
+                    if (url.startsWith("http")) {
+                        if (passwordStore.offerToSave) view?.evaluateJavascript(PASSWORD_CAPTURE_JS, null)
+                        if (passwordStore.autoFill && url.startsWith("https://")) {
+                            val saved = passwordStore.loginsFor(PasswordStore.hostKey(url)).maxByOrNull { it.updated }
+                            if (saved != null) {
+                                val fill = passwordFillJs(saved.username, saved.password)
+                                view?.evaluateJavascript(fill, null)
+                                Handler(Looper.getMainLooper()).postDelayed({ view?.evaluateJavascript(fill, null) }, 1200)
+                            }
+                        }
+                    }
                     scheduleSave()
                 }
             }
@@ -1305,6 +1403,42 @@ private fun SwiftBrowserApp() {
         load(u)
     }
 
+    // Opens next to the current tab and groups the two (joins the group it is in, if any).
+    fun openUrlInNewTabInGroup(u: String) {
+        val source = activeId
+        openUrlInNewTab(u)
+        handleGroupDrop(activeId, source)
+    }
+
+    fun openUrlInPrivateTab(u: String) {
+        privateMode = true
+        openUrlInNewTab(u)
+    }
+
+    // Downloads a link or image straight from the menu.
+    fun downloadFromUrl(u: String) {
+        if (!u.startsWith("http")) {
+            Toast.makeText(context, "This link can't be downloaded", Toast.LENGTH_SHORT).show()
+            return
+        }
+        runCatching {
+            val ua = activeWebView()?.settings?.userAgentString ?: android.webkit.WebSettings.getDefaultUserAgent(context)
+            val filename = URLUtil.guessFileName(u, null, null)
+            val request = DownloadManager.Request(Uri.parse(u))
+                .addRequestHeader("User-Agent", ua)
+                .addRequestHeader("Referer", pageUrl)
+                .setTitle(filename)
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
+            CookieManager.getInstance().getCookie(u)?.let { request.addRequestHeader("Cookie", it) }
+            val id = (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+            downloadStore.add(id)
+            Toast.makeText(context, "Download started \u2014 see Menu > Downloads", Toast.LENGTH_SHORT).show()
+        }.onFailure {
+            Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     LaunchedEffect(MainActivity.pendingUrl) {
         val u = MainActivity.pendingUrl
         if (u != null) {
@@ -1326,21 +1460,14 @@ private fun SwiftBrowserApp() {
         // Setting the UA to null does not restore the phone UA on WebView, so
         // switch back to the real default explicitly.
         wv.settings.userAgentString =
-            if (on) DESKTOP_UA else android.webkit.WebSettings.getDefaultUserAgent(context)
+            if (on) desktopUserAgent(context) else android.webkit.WebSettings.getDefaultUserAgent(context)
         wv.settings.useWideViewPort = on
         wv.settings.loadWithOverviewMode = on
         wv.settings.setSupportZoom(true)
         wv.settings.builtInZoomControls = true
         wv.settings.displayZoomControls = false
         wv.clearCache(true)
-        // Sites like m.youtube.com stay mobile whatever the UA says: use the main host.
-        val u = wv.url ?: pageUrl
-        val h = hostOf(u)
-        if (on && (h.startsWith("m.") || h.startsWith("mobile."))) {
-            wv.loadUrl(u.replaceFirst("://" + h, "://www." + h.substringAfter('.')))
-        } else {
-            wv.loadUrl(u)
-        }
+        wv.loadUrl(desktopEquivalent(wv.url ?: pageUrl, on))
     }
 
     // Clears cookies, storage and cache of the current site and closes its tabs.
@@ -1440,7 +1567,7 @@ private fun SwiftBrowserApp() {
             // Browser top bar: just the address pill, app logo inside it
             // (like Brave's lion inside its omnibox).
             // Hidden in the tab overview — Brave has no address bar there.
-            if (!showTabs) {
+            if (!showTabs && address != "swift://settings") {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1562,7 +1689,7 @@ private fun SwiftBrowserApp() {
 
             // Small protection strip opens the detailed shield dashboard.
             // Hidden in the tabs overview, like Brave.
-            if (!showTabs) {
+            if (!showTabs && address != "swift://settings") {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 1.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1744,6 +1871,7 @@ private fun SwiftBrowserApp() {
                 ) {
                     SettingsScreen(
                         settings = appSettings,
+                        passwords = passwordStore,
                         blockingEnabled = blockingEnabled,
                         onBlockingChange = { blockingEnabled = it; appSettings.putBlockTrackers(it) },
                         privateMode = privateMode,
@@ -1763,12 +1891,52 @@ private fun SwiftBrowserApp() {
                             address = if (isHome) "" else pageUrl
                             showShield = true
                         },
+                        onOpenDownloads = { address = "swift://downloads" },
                         onSetDefaultBrowser = {
                             runCatching {
                                 context.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
                             }
                         },
+                        onOpenAutofillSettings = {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(android.provider.Settings.ACTION_REQUEST_SET_AUTOFILL_SERVICE)
+                                        .setData(Uri.parse("package:" + context.packageName))
+                                )
+                            }.onFailure {
+                                Toast.makeText(context, "Autofill settings aren't available on this device", Toast.LENGTH_SHORT).show()
+                            }
+                        },
                         onClose = { address = if (isHome) "" else pageUrl }
+                    )
+                }
+
+                contextMenu?.let { target ->
+                    PageContextMenu(
+                        target = target,
+                        referer = pageUrl,
+                        onDismiss = { contextMenu = null },
+                        onOpenInNewTab = { openUrlInNewTab(it) },
+                        onOpenInGroup = { openUrlInNewTabInGroup(it) },
+                        onOpenPrivate = { openUrlInPrivateTab(it) },
+                        onDownload = { downloadFromUrl(it) },
+                        onAddBookmark = { title, link ->
+                            bookmarkStore.add(title, link)
+                            bookmarkRefresh++
+                            Toast.makeText(context, "Added to bookmarks", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                }
+                pendingLogin?.let { pending ->
+                    SavePasswordDialog(
+                        pending = pending,
+                        onSave = {
+                            passwordStore.save(pending.host, pending.username, pending.password)
+                            pendingLogin = null
+                            Toast.makeText(context, "Password saved", Toast.LENGTH_SHORT).show()
+                        },
+                        onNever = { passwordStore.addNever(pending.host); pendingLogin = null },
+                        onDismiss = { pendingLogin = null }
                     )
                 }
 
@@ -1776,8 +1944,12 @@ private fun SwiftBrowserApp() {
                 // Goes away by itself, or swipe it up.
                 val banner = translateDone ?: translateOffer
                 val bannerDone = translateDone != null
+                // Set when the card was swiped away: it is already off screen, so it must not
+                // play the normal slide-out (that was the jump you saw).
+                var bannerSwiped by remember { mutableStateOf(false) }
                 LaunchedEffect(banner) {
                     if (banner != null) {
+                        bannerSwiped = false
                         delay(if (bannerDone) 8000 else 9000)
                         if (translateDone == banner) translateDone = null
                         if (translateOffer == banner) translateOffer = null
@@ -1788,18 +1960,19 @@ private fun SwiftBrowserApp() {
                         address != "swift://bookmarks" && address != "swift://history" &&
                         address != "swift://downloads" && address != "swift://settings",
                     enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { -it }),
-                    exit = fadeOut(tween(120)) + slideOutVertically(targetOffsetY = { -it }),
+                    exit = if (bannerSwiped) androidx.compose.animation.ExitTransition.None
+                    else fadeOut(tween(120)) + slideOutVertically(targetOffsetY = { -it }),
                     modifier = Modifier.align(Alignment.TopCenter)
                 ) {
                     val code = banner?.second ?: ""
                     val fromName = java.util.Locale(code).getDisplayLanguage()
                     val from = fromName.ifBlank { "Detected language" }
                     val to = java.util.Locale(deviceLang()).getDisplayLanguage()
-                    // Animated (never snapped) swipe offset — the Animatable is
-                    // what removes the swipe jitter; drag-cancel now springs
-                    // back smoothly instead of jumping to 0.
-                    val swipeY = remember(banner) { Animatable(0f) }
+                    // The swipe offset is a plain state, so the card follows the finger exactly
+                    // (no coroutine per drag step). Letting go animates it back or off the top.
+                    var swipeY by remember(banner) { mutableFloatStateOf(0f) }
                     val bannerScope = rememberCoroutineScope()
+                    var settleJob by remember(banner) { mutableStateOf<Job?>(null) }
                     fun dismissBanner() {
                         // Swiping the card away also silences the "translated"
                         // confirmation that would otherwise pop straight back.
@@ -1810,36 +1983,37 @@ private fun SwiftBrowserApp() {
                     Row(
                         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
                             .graphicsLayer {
-                                translationY = swipeY.value
-                                alpha = (1f + swipeY.value / 260f).coerceIn(0f, 1f)
+                                translationY = swipeY
+                                alpha = (1f + swipeY / 260f).coerceIn(0f, 1f)
                             }
                             .pointerInput(banner) {
                                 detectDragGestures(
+                                    onDragStart = { settleJob?.cancel() },
                                     onDragEnd = {
-                                        bannerScope.launch {
-                                            if (swipeY.value < -110f) {
-                                                swipeY.animateTo(-560f, tween(160))
+                                        settleJob = bannerScope.launch {
+                                            if (swipeY < -80f) {
+                                                animate(swipeY, -480f, animationSpec = tween(130)) { v, _ -> swipeY = v }
+                                                bannerSwiped = true
                                                 dismissBanner()
-                                                swipeY.snapTo(0f)
                                             } else {
-                                                swipeY.animateTo(
-                                                    0f,
-                                                    spring(
+                                                animate(
+                                                    swipeY, 0f,
+                                                    animationSpec = spring(
                                                         dampingRatio = Spring.DampingRatioNoBouncy,
                                                         stiffness = Spring.StiffnessMedium
                                                     )
-                                                )
+                                                ) { v, _ -> swipeY = v }
                                             }
                                         }
                                     },
                                     onDragCancel = {
-                                        bannerScope.launch { swipeY.animateTo(0f, tween(120)) }
+                                        settleJob = bannerScope.launch {
+                                            animate(swipeY, 0f, animationSpec = tween(120)) { v, _ -> swipeY = v }
+                                        }
                                     }
                                 ) { change, dragAmount ->
                                     change.consume()
-                                    bannerScope.launch {
-                                        swipeY.snapTo((swipeY.value + dragAmount.y).coerceAtMost(0f))
-                                    }
+                                    swipeY = (swipeY + dragAmount.y).coerceAtMost(0f)
                                 }
                             }
                             .clip(RoundedCornerShape(20.dp)).background(Surface)
@@ -2054,7 +2228,9 @@ private fun SwiftBrowserApp() {
 
             // Bottom bar — Brave-style. In the tab overview it becomes the
             // overview bar: "+" centered, settings at the right.
-            if (showTabs) {
+            if (address == "swift://settings") {
+                // Settings is a full screen page: no toolbar, like Brave.
+            } else if (showTabs) {
                 Box(
                     Modifier
                         .fillMaxWidth()
@@ -3172,22 +3348,26 @@ private fun TabSwitcher(
 
     fun groupColorFor(key: Long): Color = groupColorOf(key)
 
-    // Keep the finger / held card inside the list area (never over the header).
+    // The finger / held card may travel a little past the list on every side, so a
+    // tab can be dragged all the way to the left, top, right or bottom edge.
     fun clampToGrid(p: Offset): Offset {
         if (gridWidth <= 0 || gridHeight <= 0) return p
+        val m = with(density) { 64.dp.toPx() }
         return Offset(
-            p.x.coerceIn(gridTopLeft.x, gridTopLeft.x + gridWidth),
-            p.y.coerceIn(gridTopLeft.y + 1f, gridTopLeft.y + gridHeight - 1f)
+            p.x.coerceIn(gridTopLeft.x - m, gridTopLeft.x + gridWidth + m),
+            p.y.coerceIn(gridTopLeft.y - m, gridTopLeft.y + gridHeight + m)
         )
     }
 
     fun heldCenter(p: Offset): Offset {
         val hw = dragSizePx.x / 2f
         val hh = dragSizePx.y / 2f
+        val overX = hw * 0.7f
+        val overY = hh * 0.7f
         fun cl(v: Float, lo: Float, hi: Float) = if (hi < lo) lo else v.coerceIn(lo, hi)
         return Offset(
-            cl(p.x, gridTopLeft.x + hw, gridTopLeft.x + gridWidth - hw),
-            cl(p.y, gridTopLeft.y + hh, gridTopLeft.y + gridHeight - hh)
+            cl(p.x, gridTopLeft.x + hw - overX, gridTopLeft.x + gridWidth - hw + overX),
+            cl(p.y, gridTopLeft.y + hh - overY, gridTopLeft.y + gridHeight - hh + overY)
         )
     }
 
@@ -3210,6 +3390,30 @@ private fun TabSwitcher(
         }
     }
 
+    // Held card dragged past the edge of the list (left, top, right or bottom) takes the
+    // first / last slot there. Only uses cards that are on screen, never stale positions.
+    fun edgeSlot(src: Long): Pair<Long, Boolean>? {
+        val onScreen = gridState.layoutInfo.visibleItemsInfo.map { it.key }.toSet()
+        val rects = filtered.filter { it.key != src && it.key in onScreen }
+            .mapNotNull { e -> cardBounds[e.key]?.let { e.key to it } }
+        if (rects.isEmpty()) return null
+        val vc = heldVisualCenter()
+        val first = filtered.firstOrNull { it.key != src }
+        val last = filtered.lastOrNull { it.key != src }
+        val firstRect = first?.let { f -> rects.firstOrNull { it.first == f.key }?.second }
+        val lastRect = last?.let { l -> rects.firstOrNull { it.first == l.key }?.second }
+        if (first != null && firstRect != null && vc.y < firstRect.top) return first.key to false
+        if (last != null && lastRect != null && vc.y > lastRect.bottom) return last.key to true
+        val row = rects.filter { vc.y >= it.second.top && vc.y <= it.second.bottom }
+        if (row.isNotEmpty()) {
+            val left = row.minByOrNull { it.second.left }!!
+            val right = row.maxByOrNull { it.second.right }!!
+            if (vc.x < left.second.left) return left.first to false
+            if (vc.x > right.second.right) return right.first to true
+        }
+        return null
+    }
+
     // Edges of a card: the others shift and the held card takes that slot.
     // Middle of a card: merge into a group.
     fun updateHover(src: Long) {
@@ -3219,6 +3423,14 @@ private fun TabSwitcher(
             return
         }
         val p = clampToGrid(dragPos)
+        val edge = edgeSlot(src)
+        if (edge != null) {
+            hoverKey = null
+            hoverZone = 0
+            bandKey = null
+            liveMove(src, edge.first, edge.second)
+            return
+        }
         val t = targetUnder(p, src)
         val r = t?.let { cardBounds[it] }
         if (t == null || r == null) {
