@@ -96,17 +96,17 @@ class AppSettings(context: Context) {
     )
         private set
 
-    fun setSearchEngine(v: String) { searchEngine = v; sp.edit().putString("search", v).apply() }
-    fun setBlockTrackers(v: Boolean) { blockTrackers = v; sp.edit().putBoolean("block", v).apply() }
-    fun setBlockThirdPartyCookies(v: Boolean) { blockThirdPartyCookies = v; sp.edit().putBoolean("block3p", v).apply() }
-    fun setSafeBrowsing(v: Boolean) { safeBrowsing = v; sp.edit().putBoolean("safe", v).apply() }
-    fun setJavascript(v: Boolean) { javascript = v; sp.edit().putBoolean("js", v).apply() }
-    fun setLoadImages(v: Boolean) { loadImages = v; sp.edit().putBoolean("images", v).apply() }
-    fun setTextZoom(v: Int) { textZoom = v; sp.edit().putInt("zoom", v).apply() }
-    fun setTranslateOffer(v: Boolean) { translateOffer = v; sp.edit().putBoolean("tOffer", v).apply() }
-    fun setTranslateAuto(v: Boolean) { translateAuto = v; sp.edit().putBoolean("tAuto", v).apply() }
-    fun setWifiOnlyModels(v: Boolean) { wifiOnlyModels = v; sp.edit().putBoolean("tWifi", v).apply() }
-    fun setTranslateTarget(v: String) { translateTarget = v; sp.edit().putString("tTarget", v).apply() }
+    fun putSearchEngine(v: String) { searchEngine = v; sp.edit().putString("search", v).apply() }
+    fun putBlockTrackers(v: Boolean) { blockTrackers = v; sp.edit().putBoolean("block", v).apply() }
+    fun putBlockThirdPartyCookies(v: Boolean) { blockThirdPartyCookies = v; sp.edit().putBoolean("block3p", v).apply() }
+    fun putSafeBrowsing(v: Boolean) { safeBrowsing = v; sp.edit().putBoolean("safe", v).apply() }
+    fun putJavascript(v: Boolean) { javascript = v; sp.edit().putBoolean("js", v).apply() }
+    fun putLoadImages(v: Boolean) { loadImages = v; sp.edit().putBoolean("images", v).apply() }
+    fun putTextZoom(v: Int) { textZoom = v; sp.edit().putInt("zoom", v).apply() }
+    fun putTranslateOffer(v: Boolean) { translateOffer = v; sp.edit().putBoolean("tOffer", v).apply() }
+    fun putTranslateAuto(v: Boolean) { translateAuto = v; sp.edit().putBoolean("tAuto", v).apply() }
+    fun putWifiOnlyModels(v: Boolean) { wifiOnlyModels = v; sp.edit().putBoolean("tWifi", v).apply() }
+    fun putTranslateTarget(v: String) { translateTarget = v; sp.edit().putString("tTarget", v).apply() }
 
     /** Search address for the chosen engine. */
     fun searchUrl(query: String): String {
@@ -230,12 +230,12 @@ private fun MainPage(
                 SDivider()
                 SRow(Icons.Default.Lock, "Block third-party cookies", "Stops cross-site tracking cookies") {
                     SSwitch(settings.blockThirdPartyCookies) {
-                        settings.setBlockThirdPartyCookies(it); onWebSettingsChanged()
+                        settings.putBlockThirdPartyCookies(it); onWebSettingsChanged()
                     }
                 }
                 SDivider()
                 SRow(Icons.Default.Shield, "Safe Browsing", "Warns about dangerous sites") {
-                    SSwitch(settings.safeBrowsing) { settings.setSafeBrowsing(it); onWebSettingsChanged() }
+                    SSwitch(settings.safeBrowsing) { settings.putSafeBrowsing(it); onWebSettingsChanged() }
                 }
                 SDivider()
                 SRow(Icons.Default.DeleteSweep, "Clear browsing data", "Cookies, site data, cache", onClick = { dialog = "clear" }) { Chevron() }
@@ -254,7 +254,7 @@ private fun MainPage(
                         value = zoom,
                         onValueChange = { zoom = it },
                         onValueChangeFinished = {
-                            settings.setTextZoom(zoom.roundToInt())
+                            settings.putTextZoom(zoom.roundToInt())
                             onWebSettingsChanged()
                         },
                         valueRange = 50f..200f,
@@ -266,22 +266,22 @@ private fun MainPage(
                 }
                 SDivider()
                 SRow(Icons.Default.Image, "Load images", "Turn off to save data") {
-                    SSwitch(settings.loadImages) { settings.setLoadImages(it); onWebSettingsChanged() }
+                    SSwitch(settings.loadImages) { settings.putLoadImages(it); onWebSettingsChanged() }
                 }
                 SDivider()
                 SRow(Icons.Default.Code, "JavaScript", "Turning this off breaks most sites and page translation") {
-                    SSwitch(settings.javascript) { settings.setJavascript(it); onWebSettingsChanged() }
+                    SSwitch(settings.javascript) { settings.putJavascript(it); onWebSettingsChanged() }
                 }
             }
 
             SectionLabel("TRANSLATION (ON YOUR DEVICE)")
             SCard {
                 SRow(Icons.Default.Translate, "Offer to translate pages", "Shows a card when a page is in another language") {
-                    SSwitch(settings.translateOffer) { settings.setTranslateOffer(it) }
+                    SSwitch(settings.translateOffer) { settings.putTranslateOffer(it) }
                 }
                 SDivider()
                 SRow(Icons.Default.Language, "Translate automatically", "Only for languages already downloaded") {
-                    SSwitch(settings.translateAuto) { settings.setTranslateAuto(it) }
+                    SSwitch(settings.translateAuto) { settings.putTranslateAuto(it) }
                 }
                 SDivider()
                 SRow(
@@ -291,7 +291,7 @@ private fun MainPage(
                 ) { Chevron() }
                 SDivider()
                 SRow(Icons.Default.Wifi, "Download language packs on Wi-Fi only", "Each pack is about ${TranslateEngine.MODEL_MB} MB") {
-                    SSwitch(settings.wifiOnlyModels) { settings.setWifiOnlyModels(it) }
+                    SSwitch(settings.wifiOnlyModels) { settings.putWifiOnlyModels(it) }
                 }
                 SDivider()
                 SRow(Icons.Default.Download, "Languages", "Download or delete offline languages", onClick = openLanguages) { Chevron() }
@@ -317,7 +317,7 @@ private fun MainPage(
             title = "Search engine",
             options = AppSettings.ENGINES,
             selected = settings.searchEngine,
-            onSelect = { settings.setSearchEngine(it); dialog = null },
+            onSelect = { settings.putSearchEngine(it); dialog = null },
             onDismiss = { dialog = null }
         )
         "target" -> ChoiceDialog(
@@ -326,7 +326,7 @@ private fun MainPage(
                 TranslateEngine.supportedLanguages().map { it to TranslateEngine.displayName(it) }.sortedBy { it.second }
             },
             selected = settings.translateTarget,
-            onSelect = { settings.setTranslateTarget(it); dialog = null },
+            onSelect = { settings.putTranslateTarget(it); dialog = null },
             onDismiss = { dialog = null }
         )
         "clear" -> ClearDataDialog(

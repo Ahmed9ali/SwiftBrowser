@@ -1745,7 +1745,7 @@ private fun SwiftBrowserApp() {
                     SettingsScreen(
                         settings = appSettings,
                         blockingEnabled = blockingEnabled,
-                        onBlockingChange = { blockingEnabled = it; appSettings.setBlockTrackers(it) },
+                        onBlockingChange = { blockingEnabled = it; appSettings.putBlockTrackers(it) },
                         privateMode = privateMode,
                         onPrivateChange = { enable ->
                             privateMode = enable
@@ -1963,7 +1963,7 @@ private fun SwiftBrowserApp() {
                         enabled = blockingEnabled,
                         blockedCount = blockedCount,
                         privateMode = privateMode,
-                        onEnabledChange = { blockingEnabled = it; appSettings.setBlockTrackers(it) },
+                        onEnabledChange = { blockingEnabled = it; appSettings.putBlockTrackers(it) },
                         onPrivateChange = {
                             privateMode = it
                             if (it) {
