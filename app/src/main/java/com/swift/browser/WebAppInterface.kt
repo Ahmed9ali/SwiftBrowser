@@ -2,43 +2,74 @@ package com.swift.browser
 
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 
+/**
+ * Bridge between the injected page script (TRANSLATE_JS) and the on-device
+ * translator. The page sends small batches of text; results go straight back.
+ * Registered on each tab's WebView under the name "SwiftTranslator".
+ */
 class WebAppInterface(
     private val webView: WebView,
-    private val targetLang: String,
-    private val onComplete: (String) -> Unit,
+    private val getTarget: () -> String,
+    private val onFirstApplied: (String) -> Unit,
     private val onError: (String) -> Unit
 ) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var lastErrorAt = 0L
+
     @JavascriptInterface
-    fun requestTranslation(jsonTexts: String, sourceLang: String) {
-        CoroutineScope(Dispatchers.Main).launch {
-            try {
-                val texts = JSONArray(jsonTexts)
-                val translated = JSONArray()
-                val translator = MlKitTranslator(sourceLang, targetLang)
-                
-                // 1. Download the offline language file
-                translator.prepareModel()
+    fun translateBatch(id: Int, jsonTexts: String, sourceLang: String) {
+        scope.launch {
+            val src = TranslateEngine.normalize(sourceLang) ?: return@launch
+            val tgt = getTarget()
+            val texts = runCatching { JSONArray(jsonTexts) }.getOrNull() ?: return@launch
+            val out = JSONArray()
+            var failed = 0
+            var firstError: Exception? = null
 
-                // 2. Translate each text node
-                for (i in 0 until texts.length()) {
-                    translated.put(translator.translate(texts.getString(i)))
+            for (i in 0 until texts.length()) {
+                val original = texts.optString(i)
+                val result = try {
+                    TranslateEngine.translate(src, tgt, original)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    failed++
+                    if (firstError == null) firstError = e
+                    original // keep the original text for this piece
                 }
-                translator.close()
+                out.put(result)
+            }
 
-                // 3. Send translated text back to JavaScript
-                val resultJson = translated.toString()
-                webView.post {
-                    webView.evaluateJavascript("window.__swiftTranslateNodes($resultJson);", null)
-                    onComplete(sourceLang)
+            if (texts.length() > 0 && failed == texts.length()) {
+                val now = System.currentTimeMillis()
+                if (now - lastErrorAt > 5000) {
+                    lastErrorAt = now
+                    onError("Translation failed: ${firstError?.message ?: "unknown error"}")
                 }
-            } catch (e: Exception) {
-                onError("Translation failed: ${e.message}")
+            }
+
+            runCatching {
+                webView.evaluateJavascript("window.__swiftTr&&window.__swiftTr.apply($id,$out);", null)
             }
         }
+    }
+
+    /** Called by the page once the first batch has been written back. */
+    @JavascriptInterface
+    fun onFirstDone(sourceLang: String) {
+        scope.launch { onFirstApplied(sourceLang) }
+    }
+
+    /** Stop pending work (call when the tab's WebView is destroyed). */
+    fun destroy() {
+        scope.cancel()
     }
 }

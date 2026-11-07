@@ -108,6 +108,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -258,41 +259,7 @@ private const val DESKTOP_JS = """
 })();
 """
 
-// Extracts text and sends it to Kotlin for ML Kit Translation
-private const val EXTRACT_TEXT_JS = """
-(function() {
-    if (!window.__swiftMlKitInit) {
-        window.__swiftMlKitInit = true;
-        window.__swiftExtractText = function(sourceLang) {
-            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-                acceptNode: (node) => {
-                    if (!node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-                    const parent = node.parentElement;
-                    if (!parent) return NodeFilter.FILTER_REJECT;
-                    const tag = parent.tagName.toLowerCase();
-                    if (['script', 'style', 'noscript'].includes(tag)) return NodeFilter.FILTER_REJECT;
-                    return NodeFilter.FILTER_ACCEPT;
-                }
-            });
-            const texts = [];
-            const nodes = [];
-            let n;
-            while (n = walker.nextNode()) {
-                texts.push(n.nodeValue.trim());
-                nodes.push(n);
-            }
-            window.__swiftTranslateNodes = (translatedArray) => {
-                nodes.forEach((node, i) => {
-                    if (translatedArray[i]) node.nodeValue = translatedArray[i];
-                });
-            };
-            if (window.SwiftTranslator) {
-                window.SwiftTranslator.requestTranslation(JSON.stringify(texts), sourceLang);
-            }
-        };
-    }
-})();
-"""
+// Page translation script lives in TranslateJs.kt (TRANSLATE_JS).
 
 // Downloads started in this browser (ids of DownloadManager entries).
 private class DownloadStore(context: Context) {
@@ -516,6 +483,8 @@ private fun SwiftBrowserApp() {
     val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val store = remember { BrowserStore(context) }
+    val appSettings = remember { AppSettings(context) }
+    val uiScope = rememberCoroutineScope()
     val blocker = remember { TrackerBlocker(context) }
     val session = remember { loadSession(context) }
     val startTab = session?.let { sess -> sess.tabs.firstOrNull { it.id == sess.activeId } }
@@ -529,7 +498,7 @@ private fun SwiftBrowserApp() {
     var pageTitle by remember { mutableStateOf(startTab?.title ?: "Swift Browser") }
     var pageUrl by remember { mutableStateOf(startTab?.url ?: "swift://home") }
     var blockedCount by remember { mutableIntStateOf(0) }
-    var blockingEnabled by remember { mutableStateOf(true) }
+    var blockingEnabled by remember { mutableStateOf(appSettings.blockTrackers) }
     var privateMode by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
     var showShield by remember { mutableStateOf(false) }
@@ -802,7 +771,7 @@ private fun SwiftBrowserApp() {
         if (!looksLikeDomain) {
             // Search in-page with Brave Search — results render inside the
             // app instead of opening a search-engine homepage.
-            return "https://search.brave.com/search?q=" + Uri.encode(value)
+            return appSettings.searchUrl(value)
         }
 
         return "https://$value"
@@ -1001,8 +970,68 @@ private fun SwiftBrowserApp() {
 
     fun deviceLang(): String = java.util.Locale.getDefault().language
 
-    // Like Brave: after a page loads, offer to translate it if it isn't in your language.
+    fun applyDesktopJs(view: WebView?, tabId: Long) {
+        if (desktopSites[tabId] == true) view?.evaluateJavascript(DESKTOP_JS, null)
+    }
+
+    // Translates the open page on the device (ML Kit): checks the language packs,
+    // downloads what is missing (with clear errors when offline / Wi-Fi only),
+    // then injects the page script that rewrites the text in place.
+    fun translatePageInPlace(knownSource: String? = null) {
+        val wv = activeWebView() ?: return
+        val startTab = activeId
+        val startUrl = pageUrl
+        val offered = knownSource ?: translateOffer?.second.orEmpty()
+        translateOffer = null
+        translateDone = null
+        translateMenu = false
+        translateDismissedUrl = null
+
+        fun startTranslation(rawSource: String) {
+            val src = TranslateEngine.normalize(rawSource)
+            val tgt = appSettings.translateTarget
+            if (src == null) {
+                Toast.makeText(context, "Offline translation doesn't support this page's language", Toast.LENGTH_LONG).show()
+                return
+            }
+            if (src == tgt) {
+                Toast.makeText(context, "This page is already in " + TranslateEngine.displayName(tgt), Toast.LENGTH_SHORT).show()
+                return
+            }
+            uiScope.launch {
+                try {
+                    TranslateEngine.ensureModels(context, src, tgt, appSettings.wifiOnlyModels) {
+                        Toast.makeText(
+                            context,
+                            "Downloading language pack (about " + TranslateEngine.MODEL_MB + " MB)...",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                    if (activeId == startTab && pageUrl == startUrl) {
+                        wv.evaluateJavascript(TRANSLATE_JS + "\nwindow.__swiftTr.start('" + src + "');", null)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Toast.makeText(context, e.message ?: "Translation failed", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+
+        if (offered.isNotEmpty()) {
+            startTranslation(offered)
+        } else {
+            wv.evaluateJavascript(LANG_JS) { raw ->
+                val detected = raw?.trim('"')?.lowercase().orEmpty().let { if (it == "null") "" else it }
+                startTranslation(if (detected.isEmpty()) "en" else detected)
+            }
+        }
+    }
+
+    // Like Brave: after a page loads, offer to translate it if it isn't in your language
+    // (or translate it straight away when the language pack is already downloaded).
     fun offerTranslateIfNeeded(view: WebView?, tabId: Long, url: String) {
+        if (!appSettings.translateOffer && !appSettings.translateAuto) return
         val host = hostOf(url)
         if (host.endsWith("translate.goog") || host.contains("translate.google")) return
         val never = context.getSharedPreferences("swift_translate", Context.MODE_PRIVATE)
@@ -1010,42 +1039,30 @@ private fun SwiftBrowserApp() {
         if (host in never) return
         view?.evaluateJavascript(LANG_JS) { raw ->
             val code = raw?.trim('"')?.lowercase().orEmpty()
-            if (code.isNotEmpty() && code != "null" && code != deviceLang() && tabId == activeId) {
-                translateOffer = tabId to code
+            val src = if (code.isEmpty() || code == "null") null else TranslateEngine.normalize(code)
+            val tgt = appSettings.translateTarget
+            if (src != null && src != tgt && tabId == activeId) {
+                if (appSettings.translateAuto) {
+                    uiScope.launch {
+                        val have = runCatching { TranslateEngine.downloadedLanguages() }.getOrDefault(emptySet())
+                        if (src in have && (tgt == "en" || tgt in have)) {
+                            if (tabId == activeId) translatePageInPlace(src)
+                        } else if (appSettings.translateOffer && tabId == activeId) {
+                            translateOffer = tabId to src
+                        }
+                    }
+                } else if (appSettings.translateOffer) {
+                    translateOffer = tabId to src
+                }
             }
         }
     }
 
-    fun applyDesktopJs(view: WebView?, tabId: Long) {
-        if (desktopSites[tabId] == true) view?.evaluateJavascript(DESKTOP_JS, null)
-    }
-
-    fun translatePageInPlace() {
-        val wv = activeWebView() ?: return
-        val code = translateOffer?.second ?: ""
-        translateOffer = null
-        translateDone = null
-        translateMenu = false
-        translateDismissedUrl = null
-        Toast.makeText(context, "Downloading language pack & Translating...", Toast.LENGTH_SHORT).show()
-        
-        // Inject the script that sends text to ML Kit
-        if (code.isNotEmpty()) {
-            wv.evaluateJavascript("window.__swiftExtractText && window.__swiftExtractText('$code');", null)
-        } else {
-            wv.evaluateJavascript(LANG_JS) { raw ->
-                val detected = raw?.trim('"')?.lowercase().orEmpty().let { if (it == "null") "" else it }
-                val src = if (detected.isEmpty()) "en" else detected
-                wv.evaluateJavascript("window.__swiftExtractText && window.__swiftExtractText('$src');", null)
-            }
-        }
-    }
-
+    // Puts the original text back in the page itself, no reload needed.
     fun undoTranslate() {
         val wv = activeWebView() ?: return
         translateDone = null
-        // Since ML Kit directly edits the DOM, a simple reload restores the original text
-        wv.reload()
+        wv.evaluateJavascript("window.__swiftTr&&window.__swiftTr.restore();", null)
     }
 
     fun refreshNavigation() {
@@ -1081,17 +1098,20 @@ private fun SwiftBrowserApp() {
             )
             CookieManager.getInstance().setAcceptCookie(true)
 
-            // Add the ML Kit Bridge
+            // On-device translation bridge (see WebAppInterface.kt / TranslateJs.kt)
             addJavascriptInterface(WebAppInterface(
                 webView = this,
-                targetLang = deviceLang(),
-                onComplete = { sourceLang ->
-                    if (tabId == activeId) translateDone = activeId to sourceLang
+                getTarget = { appSettings.translateTarget },
+                onFirstApplied = { sourceLang ->
+                    if (tabId == activeId && translateDismissedUrl != pageUrl) translateDone = activeId to sourceLang
                 },
                 onError = { error ->
                     Toast.makeText(ctx, error, Toast.LENGTH_LONG).show()
                 }
             ), "SwiftTranslator")
+
+            // Saved settings: text size, JavaScript, images, Safe Browsing, third-party cookies.
+            appSettings.applyTo(this)
 
             webChromeClient = object : WebChromeClient() {
                 override fun onReceivedTitle(view: WebView?, title: String?) {
@@ -1266,7 +1286,8 @@ private fun SwiftBrowserApp() {
             showShield -> showShield = false
             showTabs -> showTabs = false
             showSuggestions -> showSuggestions = false
-            address == "swift://bookmarks" || address == "swift://history" || address == "swift://downloads" ->
+            address == "swift://bookmarks" || address == "swift://history" || address == "swift://downloads" ||
+                address == "swift://settings" ->
                 address = if (isHome) "" else pageUrl
             canGoBackReal() -> {
                 activeWebView()?.goBack()
@@ -1591,7 +1612,7 @@ private fun SwiftBrowserApp() {
                         val isCurrent = tab.id == activeId
                         val pageVisible = isCurrent && !isHome && !showTabs &&
                             address != "swift://bookmarks" && address != "swift://history" &&
-                            address != "swift://downloads"
+                            address != "swift://downloads" && address != "swift://settings"
                         AndroidView(
                             modifier = Modifier
                                 .fillMaxSize()
@@ -1642,7 +1663,7 @@ private fun SwiftBrowserApp() {
 
                 androidx.compose.animation.AnimatedVisibility(
                     visible = isHome && !showTabs && address != "swift://bookmarks" && address != "swift://history" &&
-                        address != "swift://downloads",
+                        address != "swift://downloads" && address != "swift://settings",
                     enter = fadeIn(tween(180)) + slideInVertically(initialOffsetY = { it / 18 }),
                     exit = fadeOut(tween(120)),
                     modifier = Modifier.fillMaxSize()
@@ -1715,6 +1736,42 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = address == "swift://settings",
+                    enter = fadeIn(tween(150)),
+                    exit = fadeOut(tween(100)),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    SettingsScreen(
+                        settings = appSettings,
+                        blockingEnabled = blockingEnabled,
+                        onBlockingChange = { blockingEnabled = it; appSettings.setBlockTrackers(it) },
+                        privateMode = privateMode,
+                        onPrivateChange = { enable ->
+                            privateMode = enable
+                            if (enable) {
+                                CookieManager.getInstance().removeAllCookies(null)
+                                CookieManager.getInstance().flush()
+                            }
+                        },
+                        onWebSettingsChanged = { webViews.values.forEach { appSettings.applyTo(it) } },
+                        onClearCache = { webViews.values.forEach { it.clearCache(true) } },
+                        // Wire your history store's clear function here to show "Browsing history"
+                        // in the Clear browsing data dialog, e.g. { store.clearHistory() }.
+                        onClearHistory = null,
+                        onOpenPrivacyDashboard = {
+                            address = if (isHome) "" else pageUrl
+                            showShield = true
+                        },
+                        onSetDefaultBrowser = {
+                            runCatching {
+                                context.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+                            }
+                        },
+                        onClose = { address = if (isHome) "" else pageUrl }
+                    )
+                }
+
                 // Brave-style translate card: "Translate page?" first, then "Page translated / Undo".
                 // Goes away by itself, or swipe it up.
                 val banner = translateDone ?: translateOffer
@@ -1729,7 +1786,7 @@ private fun SwiftBrowserApp() {
                 androidx.compose.animation.AnimatedVisibility(
                     visible = banner != null && banner.first == activeId && !showTabs && !showSuggestions &&
                         address != "swift://bookmarks" && address != "swift://history" &&
-                        address != "swift://downloads",
+                        address != "swift://downloads" && address != "swift://settings",
                     enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { -it }),
                     exit = fadeOut(tween(120)) + slideOutVertically(targetOffsetY = { -it }),
                     modifier = Modifier.align(Alignment.TopCenter)
@@ -1906,7 +1963,7 @@ private fun SwiftBrowserApp() {
                         enabled = blockingEnabled,
                         blockedCount = blockedCount,
                         privateMode = privateMode,
-                        onEnabledChange = { blockingEnabled = it },
+                        onEnabledChange = { blockingEnabled = it; appSettings.setBlockTrackers(it) },
                         onPrivateChange = {
                             privateMode = it
                             if (it) {
@@ -2190,7 +2247,13 @@ private fun SwiftBrowserApp() {
                             }
                             MenuDivider()
                         }
-                        MenuRow(Icons.Default.Settings, "Settings") { showMenu = false; showShield = true }
+                        MenuRow(Icons.Default.Settings, "Settings") {
+                            showMenu = false
+                            showTabs = false
+                            showShield = false
+                            address = "swift://settings"
+                            showSuggestions = false
+                        }
                         MenuRow(Icons.Default.Public, "Set as default browser") {
                             showMenu = false
                             runCatching {
