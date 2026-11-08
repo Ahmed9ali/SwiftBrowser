@@ -1,7 +1,6 @@
 package com.swift.browser
 
 import android.annotation.SuppressLint
-import android.app.DownloadManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.content.Intent
@@ -94,6 +93,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.zIndex
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import androidx.compose.animation.core.Animatable
@@ -309,125 +309,16 @@ private const val DESKTOP_JS = """
 
 // Page translation script lives in TranslateJs.kt (TRANSLATE_JS).
 
-// Downloads started in this browser (ids of DownloadManager entries).
-private class DownloadStore(context: Context) {
-    private val prefs = context.getSharedPreferences("swift_downloads", Context.MODE_PRIVATE)
-    fun ids(): List<Long> =
-        (prefs.getString("ids", "") ?: "").split(",").mapNotNull { it.toLongOrNull() }
-    fun add(id: Long) {
-        prefs.edit().putString("ids", (ids() + id).distinct().joinToString(",")).apply()
-    }
-    fun remove(id: Long) {
-        prefs.edit().putString("ids", ids().filter { it != id }.joinToString(",")).apply()
-    }
-}
-
-private data class DlItem(
-    val id: Long, val title: String, val status: Int,
-    val done: Long, val total: Long, val mime: String?,
-    val url: String, val time: Long
-)
-
 private data class PendingDownload(
     val url: String, val userAgent: String?, val disposition: String?,
     val mime: String?, val referer: String?, val filename: String
 )
 
-private fun queryDownloads(context: Context, ids: List<Long>): List<DlItem> {
-    if (ids.isEmpty()) return emptyList()
-    val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-    val out = ArrayList<DlItem>()
-    runCatching {
-        dm.query(DownloadManager.Query().setFilterById(*ids.toLongArray())).use { c ->
-            while (c.moveToNext()) {
-                fun col(n: String) = c.getColumnIndexOrThrow(n)
-                out.add(
-                    DlItem(
-                        c.getLong(col(DownloadManager.COLUMN_ID)),
-                        c.getString(col(DownloadManager.COLUMN_TITLE)) ?: "File",
-                        c.getInt(col(DownloadManager.COLUMN_STATUS)),
-                        c.getLong(col(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)),
-                        c.getLong(col(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)),
-                        c.getString(col(DownloadManager.COLUMN_MEDIA_TYPE)),
-                        c.getString(col(DownloadManager.COLUMN_URI)) ?: "",
-                        c.getLong(col(DownloadManager.COLUMN_LAST_MODIFIED_TIMESTAMP))
-                    )
-                )
-            }
-        }
-    }
-    return out.sortedByDescending { it.id }
-}
-
-// Opens a finished download with the app that handles its type.
-private fun openDownloadedFile(context: Context, item: DlItem) {
-    runCatching {
-        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val uri = dm.getUriForDownloadedFile(item.id) ?: error("missing")
-        context.startActivity(
-            Intent(Intent.ACTION_VIEW)
-                .setDataAndType(uri, item.mime ?: "*/*")
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
-    }.onFailure { Toast.makeText(context, "Can't open this file", Toast.LENGTH_SHORT).show() }
-}
-
-private fun shareDownloadedFile(context: Context, item: DlItem) {
-    runCatching {
-        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val uri = dm.getUriForDownloadedFile(item.id) ?: error("missing")
-        val send = Intent(Intent.ACTION_SEND).apply {
-            type = item.mime ?: "*/*"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        context.startActivity(Intent.createChooser(send, "Share").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-    }.onFailure { Toast.makeText(context, "Can't share this file", Toast.LENGTH_SHORT).show() }
-}
-
-// Only these are opened automatically (never apps or archives).
-private fun canAutoOpen(item: DlItem): Boolean {
-    val m = item.mime ?: ""
-    return m.startsWith("image/") || m.startsWith("video/") || m.startsWith("audio/") ||
-        m.startsWith("text/") || m == "application/pdf" ||
-        m.contains("officedocument") || m == "application/msword"
-}
-
-private fun dlKind(d: DlItem): String {
-    val m = d.mime ?: ""
-    val n = d.title.lowercase()
-    return when {
-        m.startsWith("video/") -> "Videos"
-        m.startsWith("image/") -> "Images"
-        m.startsWith("audio/") -> "Audio"
-        m == "application/pdf" || m.startsWith("text/") || m.contains("officedocument") ||
-            n.endsWith(".doc") || n.endsWith(".docx") || n.endsWith(".xls") || n.endsWith(".xlsx") ||
-            n.endsWith(".ppt") || n.endsWith(".pptx") || n.endsWith(".txt") -> "Documents"
-        else -> "Other"
-    }
-}
-
-private fun dlIcon(d: DlItem): ImageVector {
-    val m = d.mime ?: ""
-    return when {
-        m.startsWith("video/") -> Icons.Default.Movie
-        m.startsWith("image/") -> Icons.Default.Image
-        m.startsWith("audio/") -> Icons.Default.MusicNote
-        m == "application/vnd.android.package-archive" -> Icons.Default.Android
-        dlKind(d) == "Documents" -> Icons.Default.Description
-        else -> Icons.Default.InsertDriveFile
-    }
-}
-
-private fun dayLabel(ts: Long): String {
-    val d = java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.getDefault()).format(java.util.Date(ts))
-    fun key(t: Long) = java.text.SimpleDateFormat("yyyyDDD", java.util.Locale.US).format(java.util.Date(t))
-    val now = System.currentTimeMillis()
-    return when (key(ts)) {
-        key(now) -> "Today - $d"
-        key(now - 86_400_000L) -> "Yesterday - $d"
-        else -> d
-    }
+private fun canAutoOpenMime(m: String?): Boolean {
+    val t = m ?: ""
+    return t.startsWith("image/") || t.startsWith("video/") || t.startsWith("audio/") ||
+        t.startsWith("text/") || t == "application/pdf" ||
+        t.contains("officedocument") || t == "application/msword"
 }
 
 // Per-tab favicons and page thumbnails (shown in tab cards and the group bar).
@@ -448,6 +339,7 @@ private val GroupColors = listOf(
 // Colors the user picked (group key -> palette index); others use a default.
 private val GroupColorStore = mutableStateMapOf<Long, Int>()
 private val GroupInk = Color(0xFF1B1D22)
+private val PrivateColor = Color(0xFF8E5BFF)
 
 // One card in the tab grid: either a single tab or a group of tabs.
 private data class TabEntry(val key: Long, val isGroup: Boolean, val tabs: List<BrowserTab>)
@@ -596,6 +488,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleIntent(intent)
+        // Download progress notifications need this on Android 13+.
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
         window.statusBarColor = android.graphics.Color.rgb(16, 17, 20)
         window.navigationBarColor = android.graphics.Color.rgb(16, 17, 20)
         setContent { SwiftBrowserApp() }
@@ -628,6 +524,8 @@ private fun SwiftBrowserApp() {
     var blockingEnabled by remember { mutableStateOf(appSettings.blockTrackers) }
     var privateMode by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
+    // 0 = tabs, 1 = tab groups, 2 = private tabs (shown only while a private tab exists)
+    var tabSection by remember { mutableIntStateOf(0) }
     var showShield by remember { mutableStateOf(false) }
     var showTabs by remember { mutableStateOf(false) }
     var showSuggestions by remember { mutableStateOf(false) }
@@ -657,7 +555,6 @@ private fun SwiftBrowserApp() {
     var contextMenu by remember { mutableStateOf<ContextTarget?>(null) }
     var pendingLogin by remember { mutableStateOf<PendingLogin?>(null) }
     val passwordStore = remember { PasswordStore(context) }
-    val downloadStore = remember { DownloadStore(context) }
     var settingsEntry by remember { mutableStateOf("main") }
     var downloadNoticeAt by remember { mutableLongStateOf(0L) }
     var downloadNoticeVisible by remember { mutableStateOf(false) }
@@ -676,27 +573,19 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Opens finished downloads by itself when the Download settings ask for it.
+    // Our own download engine: opens finished downloads when the Download settings ask for it.
     DisposableEffect(Unit) {
-        val receiver = object : android.content.BroadcastReceiver() {
-            override fun onReceive(c: Context, i: Intent) {
-                val id = i.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
-                if (id < 0 || id !in downloadStore.ids()) return
-                val item = queryDownloads(c, listOf(id)).firstOrNull() ?: return
-                if (item.status != DownloadManager.STATUS_SUCCESSFUL) return
-                val isPdf = item.mime == "application/pdf"
-                if ((isPdf && appSettings.autoOpenPdf) || (appSettings.autoOpenDownloads && canAutoOpen(item))) {
-                    openDownloadedFile(c, item)
-                }
+        DownloadEngine.init(context)
+        DownloadEngine.onCompleted = { item ->
+            val isPdf = item.mime == "application/pdf"
+            if ((isPdf && appSettings.autoOpenPdf) || (appSettings.autoOpenDownloads && canAutoOpenMime(item.mime))) {
+                DownloadActions.open(context, item)
             }
         }
-        androidx.core.content.ContextCompat.registerReceiver(
-            context, receiver,
-            android.content.IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
-            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
-        )
-        onDispose { runCatching { context.unregisterReceiver(receiver) } }
+        onDispose { DownloadEngine.onCompleted = null }
     }
+    SideEffect { DownloadEngine.notificationsEnabled = appSettings.downloadNotifications }
+
     val recentClosed = remember { mutableStateListOf<Pair<String, String>>() }
     val pendingLoads = remember { HashMap<Long, String>() }
     val webArea = remember { android.graphics.Rect() }
@@ -826,12 +715,13 @@ private fun SwiftBrowserApp() {
     // the app and reopening it brings everything back.
     fun saveSession() {
         try {
+            val saveTabs = tabs.filter { !it.isPrivate } // private tabs are never written to disk
             val o = org.json.JSONObject()
             o.put("active", activeId)
             o.put("next", idCounter.get())
             o.put("gc", groupCounter)
             val arr = org.json.JSONArray()
-            tabs.forEach { t ->
+            saveTabs.forEach { t ->
                 arr.put(org.json.JSONObject().put("id", t.id).put("url", t.url).put("title", t.title))
             }
             o.put("tabs", arr)
@@ -848,8 +738,8 @@ private fun SwiftBrowserApp() {
                 .edit().putString("session", o.toString()).commit()
 
             val dir = context.filesDir
-            val ids = tabs.map { it.id }.toSet()
-            tabs.forEach { t ->
+            val ids = saveTabs.map { it.id }.toSet()
+            saveTabs.forEach { t ->
                 val stateFile = File(dir, "tab_${t.id}.bin")
                 val wv = webViews[t.id]
                 if (wv != null && t.id !in unloaded && t.url.startsWith("http")) {
@@ -989,8 +879,8 @@ private fun SwiftBrowserApp() {
         focusManager.clearFocus()
     }
 
-    fun newTab() {
-        val tab = BrowserTab(idCounter.getAndIncrement())
+    fun newTab(private: Boolean = false) {
+        val tab = BrowserTab(idCounter.getAndIncrement(), isPrivate = private)
         tabs.add(tab)
         activeId = tab.id
         pageUrl = "swift://home"
@@ -1022,7 +912,7 @@ private fun SwiftBrowserApp() {
     }
 
     fun recordClosed(tab: BrowserTab) {
-        if (!tab.url.startsWith("http")) return
+        if (tab.isPrivate || !tab.url.startsWith("http")) return
         recentClosed.removeAll { it.second == tab.url }
         recentClosed.add(0, tab.title to tab.url)
         while (recentClosed.size > 15) recentClosed.removeAt(recentClosed.size - 1)
@@ -1049,9 +939,13 @@ private fun SwiftBrowserApp() {
         val remainingMates = groupMates.filter { it.id != tab.id }
         tabs.removeAll { it.id == tab.id }
         tabGroups.remove(tab.id)
+        // There is always at least one normal tab; private tabs live beside them.
+        if (tabs.none { !it.isPrivate }) tabs.add(0, BrowserTab(idCounter.getAndIncrement()))
         if (activeId == tab.id) {
+            val sameKind = tabs.filter { it.isPrivate == tab.isPrivate }
             val next = remainingMates.getOrNull(matePos) ?: remainingMates.lastOrNull()
-                ?: tabs.getOrNull((index - 1).coerceAtLeast(0)) ?: tabs.first()
+                ?: sameKind.getOrNull((index - 1).coerceAtLeast(0).coerceAtMost(sameKind.size - 1))
+                ?: tabs.lastOrNull { !it.isPrivate } ?: tabs.first()
             selectTab(next)
             // Closing a tab from the overview must not leave the overview.
             if (fromOverview) showTabs = true
@@ -1120,7 +1014,7 @@ private fun SwiftBrowserApp() {
 
     // Group-icon action: collect every loose tab into one group.
     fun groupAllTabs() {
-        val loose = tabs.filter { tabGroups[it.id] == null }
+        val loose = tabs.filter { tabGroups[it.id] == null && !it.isPrivate }
         if (loose.size < 2) {
             Toast.makeText(context, "Nothing to group", Toast.LENGTH_SHORT).show()
             return
@@ -1134,14 +1028,18 @@ private fun SwiftBrowserApp() {
 
     // Delete-all action: closes every tab and lands on a fresh home tab.
     fun closeAllTabs() {
-        tabs.toList().forEach { recordClosed(it) }
-        tabs.clear()
-        tabGroups.clear()
-        val fresh = BrowserTab(idCounter.getAndIncrement())
-        tabs.add(fresh)
-        selectTab(fresh)
+        // Closes the tabs of the section you are looking at (normal or private).
+        val priv = tabSection == 2
+        tabs.filter { it.isPrivate == priv }.forEach { recordClosed(it) }
+        tabs.removeAll { it.isPrivate == priv }
+        if (!priv) {
+            tabGroups.clear()
+            tabs.add(0, BrowserTab(idCounter.getAndIncrement()))
+        }
+        tabSection = 0
+        selectTab(tabs.last { !it.isPrivate })
         showTabs = false
-        Toast.makeText(context, "All tabs closed", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, if (priv) "Private tabs closed" else "All tabs closed", Toast.LENGTH_SHORT).show()
     }
 
     fun deviceLang(): String = java.util.Locale.getDefault().language
@@ -1251,25 +1149,10 @@ private fun SwiftBrowserApp() {
     // Every download (page links, long-press menu) goes through here so the Download
     // settings (ask first, notifications) and the "Downloading file..." card always apply.
     fun enqueueDownload(d: PendingDownload) {
-        runCatching {
-            val ua = d.userAgent ?: android.webkit.WebSettings.getDefaultUserAgent(context)
-            val request = DownloadManager.Request(Uri.parse(d.url))
-                .addRequestHeader("User-Agent", ua)
-                .setTitle(d.filename)
-                .setNotificationVisibility(
-                    if (appSettings.downloadNotifications) DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
-                    else DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_ONLY_COMPLETION
-                )
-                .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, d.filename)
-            if (!d.mime.isNullOrBlank()) request.setMimeType(d.mime)
-            d.referer?.takeIf { it.startsWith("http") }?.let { request.addRequestHeader("Referer", it) }
-            CookieManager.getInstance().getCookie(d.url)?.let { request.addRequestHeader("Cookie", it) }
-            val id = (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-            downloadStore.add(id)
-            downloadNoticeAt = System.currentTimeMillis()
-        }.onFailure {
-            Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
-        }
+        val ua = d.userAgent ?: android.webkit.WebSettings.getDefaultUserAgent(context)
+        val cookie = CookieManager.getInstance().getCookie(d.url)
+        DownloadEngine.enqueue(d.url, d.filename, d.mime, ua, d.referer, cookie)
+        downloadNoticeAt = System.currentTimeMillis()
     }
 
     fun startDownload(url: String, userAgent: String?, disposition: String?, mime: String?, referer: String?) {
@@ -1321,10 +1204,14 @@ private fun SwiftBrowserApp() {
 
             // Saved settings: text size, JavaScript, images, Safe Browsing, third-party cookies.
             appSettings.applyTo(this)
+            if (tabs.firstOrNull { it.id == tabId }?.isPrivate == true) {
+                settings.cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
+                settings.saveFormData = false
+            }
 
             // Password Manager: the page reports sign-in submits (never reads anything back).
             addJavascriptInterface(PasswordBridge(this) { host, user, pass ->
-                if (host.isNotEmpty() && passwordStore.offerToSave && !currentPrivateMode && !passwordStore.isNever(host)) {
+                if (host.isNotEmpty() && passwordStore.offerToSave && !currentPrivateMode && tabs.firstOrNull { it.id == tabId }?.isPrivate != true && !passwordStore.isNever(host)) {
                     val existing = passwordStore.find(host, user)
                     if (existing == null || existing.password != pass) {
                         pendingLogin = PendingLogin(host, user, pass, existing != null)
@@ -1460,7 +1347,7 @@ private fun SwiftBrowserApp() {
                         loadProgress = 100
                         refreshNavigation()
                     }
-                    if (!currentPrivateMode) store.addHistory(title, url)
+                    if (!currentPrivateMode && tabs.firstOrNull { it.id == tabId }?.isPrivate != true) store.addHistory(title, url)
                     Handler(Looper.getMainLooper()).postDelayed({ captureThumb(tabId) }, 700)
                     if (tabId == activeId && url.startsWith("http")) offerTranslateIfNeeded(view, tabId, url)
                     if (url.startsWith("http")) {
@@ -1556,8 +1443,9 @@ private fun SwiftBrowserApp() {
     }
 
     fun openUrlInPrivateTab(u: String) {
-        privateMode = true
-        openUrlInNewTab(u)
+        newTab(private = true)
+        pendingLoads[activeId] = u
+        load(u)
     }
 
     // Downloads a link or image straight from the long-press menu.
@@ -1574,9 +1462,8 @@ private fun SwiftBrowserApp() {
     }
 
     fun startPrivateTab() {
-        privateMode = true
-        newTab()
-        Toast.makeText(context, "Private browsing is on: history isn't saved", Toast.LENGTH_SHORT).show()
+        newTab(private = true)
+        Toast.makeText(context, "Private tab: history isn't saved", Toast.LENGTH_SHORT).show()
     }
 
     fun toggleDesktopSite() {
@@ -1983,14 +1870,12 @@ private fun SwiftBrowserApp() {
                     exit = fadeOut(tween(100)),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    DownloadsPanel(
-                        store = downloadStore,
+                    DownloadsScreen(
                         onClose = { address = if (isHome) "" else pageUrl },
                         onOpenSettings = {
                             settingsEntry = "downloads"
                             address = "swift://settings"
-                        },
-                        onRetry = { u -> startDownload(u, null, null, null, pageUrl) }
+                        }
                     )
                 }
 
@@ -2297,7 +2182,10 @@ private fun SwiftBrowserApp() {
                     modifier = Modifier.fillMaxSize()
                 ) {
                     TabSwitcher(
-                        tabs = tabs.toList(),
+                        tabs = tabs.filter { !it.isPrivate },
+                        privateTabs = tabs.filter { it.isPrivate },
+                        section = tabSection,
+                        onSectionChange = { tabSection = it },
                         activeId = activeId,
                         groups = tabGroups,
                         groupNames = groupNames,
@@ -2319,7 +2207,7 @@ private fun SwiftBrowserApp() {
                         onReorder = { src, tgt, after -> moveEntry(src, tgt, after) },
                         onSelect = { selectTab(it) },
                         onClose = { closeTab(it) },
-                        onNew = { newTab() },
+                        onNew = { newTab(private = tabSection == 2) },
                         onGroup = { source, target -> handleGroupDrop(source, target) },
                         onDropOutside = { handleDropOutside(it) },
                         onGroupAll = { groupAllTabs() },
@@ -2486,7 +2374,7 @@ private fun SwiftBrowserApp() {
                             .align(Alignment.Center)
                             .clip(RoundedCornerShape(22.dp))
                             .background(Color(0xFFE8E8EC))
-                            .clickable { newTab() }
+                            .clickable { newTab(private = tabSection == 2) }
                             .padding(horizontal = 14.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -2544,8 +2432,12 @@ private fun SwiftBrowserApp() {
                 }
 
                 // TABS
-                TabCountButton(tabs.size, showTabs) {
-                    if (!showTabs) captureThumb(activeId)
+                val activeIsPrivate = tabs.firstOrNull { it.id == activeId }?.isPrivate == true
+                TabCountButton(tabs.count { it.isPrivate == activeIsPrivate }, showTabs) {
+                    if (!showTabs) {
+                        captureThumb(activeId)
+                        tabSection = if (activeIsPrivate) 2 else 0
+                    }
                     showTabs = !showTabs
                     showShield = false
                     showSuggestions = false
@@ -2579,7 +2471,8 @@ private fun SwiftBrowserApp() {
                 },
                 onSelect = { showGroupSheet = false; selectTab(it) },
                 onCloseTab = { closeTab(it, false) },
-                onRemoveFromGroup = { handleDropOutside(it.id) }
+                onRemoveFromGroup = { handleDropOutside(it.id) },
+                onReorder = { src, tgt, after -> moveEntry(src, tgt, after) }
             )
         }
         // Tabs overview menu (like Brave): only tab actions.
@@ -3539,6 +3432,9 @@ private fun GroupCard(
 @Composable
 private fun TabSwitcher(
     tabs: List<BrowserTab>,
+    privateTabs: List<BrowserTab>,
+    section: Int,
+    onSectionChange: (Int) -> Unit,
     activeId: Long,
     groups: Map<Long, Long>,
     onSelect: (BrowserTab) -> Unit,
@@ -3578,7 +3474,8 @@ private fun TabSwitcher(
             onEditConsumed()
         }
     }
-    var section by remember { mutableIntStateOf(0) } // 0 = tabs, 1 = groups
+    // Private section disappears with its last private tab.
+    LaunchedEffect(privateTabs.isEmpty(), section) { if (section == 2 && privateTabs.isEmpty()) onSectionChange(0) }
     var dragKey by remember { mutableStateOf<Long?>(null) }
     var dragPos by remember { mutableStateOf(Offset.Zero) }
     var dragDistance by remember { mutableStateOf(0f) }
@@ -3611,7 +3508,8 @@ private fun TabSwitcher(
     val entries = run {
         val list = ArrayList<TabEntry>()
         val seen = mutableSetOf<Long>()
-        tabs.forEach { tab ->
+        if (section == 2) privateTabs.forEach { list.add(TabEntry(it.id, false, listOf(it))) }
+        else tabs.forEach { tab ->
             val gid = groups[tab.id]
             if (gid == null) {
                 list.add(TabEntry(tab.id, false, listOf(tab)))
@@ -3866,7 +3764,7 @@ private fun TabSwitcher(
                     Modifier.width(58.dp).height(40.dp)
                         .clip(RoundedCornerShape(20.dp))
                         .background(if (section == 0) Surface3 else Color.Transparent)
-                        .clickable { section = 0 },
+                        .clickable { onSectionChange(0) },
                     contentAlignment = Alignment.Center
                 ) {
                     Box(
@@ -3880,10 +3778,22 @@ private fun TabSwitcher(
                     Modifier.width(58.dp).height(40.dp)
                         .clip(RoundedCornerShape(20.dp))
                         .background(if (section == 1) Surface3 else Color.Transparent)
-                        .clickable { section = 1 },
+                        .clickable { onSectionChange(1) },
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(Icons.Default.GridView, "Tab groups", tint = TextMain, modifier = Modifier.size(22.dp))
+                }
+                // Appears when the first private tab is opened, like Brave.
+                if (privateTabs.isNotEmpty()) {
+                    Box(
+                        Modifier.width(58.dp).height(40.dp)
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(if (section == 2) PrivateColor.copy(alpha = 0.55f) else Color.Transparent)
+                            .clickable { onSectionChange(2) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Default.VisibilityOff, "Private tabs", tint = TextMain, modifier = Modifier.size(22.dp))
+                    }
                 }
             }
             IconButton(
@@ -3908,7 +3818,7 @@ private fun TabSwitcher(
         ) {
             Icon(Icons.Default.Tab, null, tint = TextMuted, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(9.dp))
-            Text("Search your tabs", color = TextMuted, fontSize = 13.sp)
+            Text(if (section == 2) "Search your Private tabs" else "Search your tabs", color = TextMuted, fontSize = 13.sp)
         }
 
         Box(
@@ -3988,6 +3898,7 @@ private fun TabSwitcher(
                         .pointerInput(entry.key) {
                             detectDragGesturesAfterLongPress(
                                 onDragStart = { offset ->
+                                    if (section == 2) return@detectDragGesturesAfterLongPress
                                     val r = cardBounds[entry.key]
                                     dragKey = entry.key
                                     dragDistance = 0f
@@ -4045,7 +3956,7 @@ private fun TabSwitcher(
                                 tab = activeMember,
                                 isActive = isActiveEntry,
                                 hovered = false,
-                                ringColor = null,
+                                ringColor = if (activeMember.isPrivate) PrivateColor else null,
                                 onSelect = { onSelect(activeMember) },
                                 onClose = { onClose(activeMember) },
                                 onRemoveFromGroup = null,
@@ -4150,7 +4061,8 @@ private fun TabSwitcher(
             onCloseGroup = { openEntry.tabs.toList().forEach { onClose(it) } },
             onSelect = onSelect,
             onCloseTab = onClose,
-            onRemoveFromGroup = { onDropOutside(it.id) }
+            onRemoveFromGroup = { onDropOutside(it.id) },
+            onReorder = onReorder
         )
     }
 
@@ -4158,7 +4070,7 @@ private fun TabSwitcher(
     if (searching) {
         BackHandler { searching = false }
         TabSearchScreen(
-            tabs = tabs,
+            tabs = if (section == 2) privateTabs else tabs,
             groups = groups,
             groupNames = groupNames,
             onBack = { searching = false },
@@ -4197,9 +4109,16 @@ private fun GroupPopupOverlay(
     onCloseGroup: () -> Unit,
     onSelect: (BrowserTab) -> Unit,
     onCloseTab: (BrowserTab) -> Unit,
-    onRemoveFromGroup: (BrowserTab) -> Unit
+    onRemoveFromGroup: (BrowserTab) -> Unit,
+    onReorder: (Long, Long, Boolean) -> Unit = { _, _, _ -> }
 ) {
     var popupMenu by remember { mutableStateOf(false) }
+    // Long-press a tab and drag it onto another one to swap places inside the group.
+    var dragId by remember { mutableStateOf<Long?>(null) }
+    var finger by remember { mutableStateOf(Offset.Zero) }   // finger position in root coordinates
+    var grab by remember { mutableStateOf(Offset.Zero) }     // finger offset inside the held card
+    var lastSwap by remember { mutableLongStateOf(0L) }
+    val popupBounds = remember { mutableStateMapOf<Long, Rect>() }
     Box(
         Modifier.fillMaxSize()
             .background(Color(0xB3000000))
@@ -4273,13 +4192,58 @@ private fun GroupPopupOverlay(
                 }
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(2),
+                    userScrollEnabled = dragId == null,
                     modifier = Modifier.heightIn(max = 520.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                 ) {
                     gridItems(entry.tabs, key = { it.id }) { tab ->
-                        Box(Modifier.fillMaxWidth().height(176.dp)) {
+                        val held = dragId == tab.id
+                        Box(
+                            Modifier.fillMaxWidth().height(176.dp)
+                                .then(if (held) Modifier else Modifier.animateItem())
+                                .onGloballyPositioned { popupBounds[tab.id] = it.boundsInRoot() }
+                                .zIndex(if (held) 1f else 0f)
+                                .graphicsLayer {
+                                    if (held) {
+                                        // Follows the finger from wherever its slot currently is.
+                                        val slot = popupBounds[tab.id]?.topLeft ?: Offset.Zero
+                                        val want = finger - grab
+                                        translationX = want.x - slot.x
+                                        translationY = want.y - slot.y
+                                        scaleX = 1.04f; scaleY = 1.04f
+                                    }
+                                }
+                                .pointerInput(tab.id) {
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = { offset ->
+                                            val r = popupBounds[tab.id] ?: return@detectDragGesturesAfterLongPress
+                                            dragId = tab.id
+                                            grab = offset
+                                            finger = r.topLeft + offset
+                                        },
+                                        onDrag = { change, amount ->
+                                            change.consume()
+                                            finger += amount
+                                            val me = dragId ?: return@detectDragGesturesAfterLongPress
+                                            val now = System.currentTimeMillis()
+                                            if (now - lastSwap < 220) return@detectDragGesturesAfterLongPress
+                                            val target = entry.tabs.firstOrNull { t ->
+                                                t.id != me && popupBounds[t.id]?.contains(finger) == true
+                                            }
+                                            if (target != null) {
+                                                val from = entry.tabs.indexOfFirst { it.id == me }
+                                                val to = entry.tabs.indexOfFirst { it.id == target.id }
+                                                lastSwap = now
+                                                onReorder(me, target.id, to > from)
+                                            }
+                                        },
+                                        onDragEnd = { dragId = null },
+                                        onDragCancel = { dragId = null }
+                                    )
+                                }
+                        ) {
                             SingleTabCard(
                                 tab = tab,
                                 isActive = tab.id == activeId,
@@ -4676,282 +4640,6 @@ private fun TabSearchScreen(
                             )
                         }
                     }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun DownloadsPanel(
-    store: DownloadStore,
-    onClose: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onRetry: (String) -> Unit
-) {
-    val context = LocalContext.current
-    var items by remember { mutableStateOf(emptyList<DlItem>()) }
-    var filter by remember { mutableStateOf("All") }
-    var searching by remember { mutableStateOf(false) }
-    var query by remember { mutableStateOf("") }
-    var eta by remember { mutableStateOf<Map<Long, String>>(emptyMap()) }
-    val samples = remember { HashMap<Long, Triple<Long, Long, Float>>() } // id -> time, bytes, bytes per ms
-    val totalSpace = remember {
-        runCatching { android.os.StatFs(Environment.getExternalStorageDirectory().path).totalBytes }.getOrDefault(0L)
-    }
-
-    LaunchedEffect(Unit) {
-        while (true) {
-            val fresh = withContext(Dispatchers.IO) { queryDownloads(context, store.ids()) }
-            val now = System.currentTimeMillis()
-            val left = HashMap<Long, String>()
-            fresh.forEach { d ->
-                if (d.status == DownloadManager.STATUS_RUNNING && d.total > 0) {
-                    val prev = samples[d.id]
-                    if (prev == null) {
-                        samples[d.id] = Triple(now, d.done, 0f)
-                    } else if (now > prev.first) {
-                        val inst = (d.done - prev.second).toFloat() / (now - prev.first)
-                        val smooth = if (prev.third > 0f) prev.third * 0.6f + inst * 0.4f else inst
-                        samples[d.id] = Triple(now, d.done, smooth)
-                        if (smooth > 0f) {
-                            val secs = ((d.total - d.done) / smooth / 1000f).toLong().coerceAtLeast(1)
-                            left[d.id] = when {
-                                secs < 60 -> "$secs secs left"
-                                secs < 3600 -> "${secs / 60} mins left"
-                                else -> "${secs / 3600} hrs left"
-                            }
-                        }
-                    }
-                }
-            }
-            eta = left
-            items = fresh
-            delay(1000)
-        }
-    }
-
-    fun remove(item: DlItem) {
-        runCatching { (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).remove(item.id) }
-        store.remove(item.id)
-        items = items.filter { it.id != item.id }
-    }
-
-    val shown = items.filter {
-        (filter == "All" || dlKind(it) == filter) && (query.isBlank() || it.title.contains(query, true))
-    }
-    val active = shown.filter {
-        it.status != DownloadManager.STATUS_SUCCESSFUL && it.status != DownloadManager.STATUS_FAILED
-    }
-    val finished = shown.filter {
-        it.status == DownloadManager.STATUS_SUCCESSFUL || it.status == DownloadManager.STATUS_FAILED
-    }.sortedByDescending { it.time }
-    val byDay = LinkedHashMap<String, MutableList<DlItem>>()
-    finished.forEach { byDay.getOrPut(dayLabel(it.time)) { mutableListOf() }.add(it) }
-    val used = items.filter { it.status == DownloadManager.STATUS_SUCCESSFUL }.sumOf { maxOf(it.total, it.done) }
-    val fmt = { n: Long -> android.text.format.Formatter.formatFileSize(context, n) }
-
-    Column(Modifier.fillMaxSize().background(Bg)) {
-        Row(
-            Modifier.fillMaxWidth().padding(start = 17.dp, end = 6.dp, top = 10.dp, bottom = 2.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            if (searching) {
-                val focus = remember { androidx.compose.ui.focus.FocusRequester() }
-                LaunchedEffect(Unit) { focus.requestFocus() }
-                Box(Modifier.weight(1f).padding(end = 8.dp)) {
-                    if (query.isEmpty()) Text("Search downloads", color = TextMuted, fontSize = 18.sp)
-                    BasicTextField(
-                        value = query,
-                        onValueChange = { query = it },
-                        singleLine = true,
-                        textStyle = androidx.compose.ui.text.TextStyle(color = TextMain, fontSize = 18.sp),
-                        cursorBrush = androidx.compose.ui.graphics.SolidColor(Accent),
-                        modifier = Modifier.fillMaxWidth().focusRequester(focus)
-                    )
-                }
-            } else {
-                Text(
-                    "Downloads", color = TextMain, fontSize = 28.sp,
-                    fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f)
-                )
-            }
-            IconButton(onClick = onOpenSettings) { Icon(Icons.Default.Settings, "Download settings", tint = TextMain) }
-            IconButton(onClick = { searching = !searching; if (!searching) query = "" }) {
-                Icon(if (searching) Icons.Default.Close else Icons.Default.Search, "Search downloads", tint = TextMain)
-            }
-            IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Close", tint = TextMain) }
-        }
-        Text(
-            "Using ${fmt(used)}" + (if (totalSpace > 0) " of ${fmt(totalSpace)}" else ""),
-            color = TextMuted, fontSize = 15.sp,
-            modifier = Modifier.padding(horizontal = 17.dp, vertical = 10.dp)
-        )
-        HorizontalDivider(color = Surface3)
-
-        Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-                .padding(horizontal = 17.dp, vertical = 14.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            listOf(
-                "All" to null, "Videos" to Icons.Default.Movie, "Images" to Icons.Default.Image,
-                "Audio" to Icons.Default.MusicNote, "Documents" to Icons.Default.Description,
-                "Other" to Icons.Default.InsertDriveFile
-            ).forEach { (name, icon) ->
-                val on = filter == name
-                val shape = RoundedCornerShape(10.dp)
-                Row(
-                    Modifier.clip(shape)
-                        .border(1.dp, if (on) Color.Transparent else Surface3, shape)
-                        .background(if (on) Color(0xFF343A6B) else Color.Transparent)
-                        .clickable { filter = name }
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (on) {
-                        Icon(Icons.Default.Check, null, tint = TextMain, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                    } else if (icon != null) {
-                        Icon(icon, null, tint = TextMain, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                    }
-                    Text(name, color = TextMain, fontSize = 15.sp)
-                }
-            }
-        }
-
-        if (shown.isEmpty()) {
-            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text("No downloads yet", color = TextMuted, fontSize = 14.sp)
-            }
-        } else {
-            LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(bottom = 24.dp)) {
-                if (active.isNotEmpty()) {
-                    item(key = "h-now") { DownloadSectionTitle("Just now") }
-                    items(active, key = { it.id }) { d ->
-                        DownloadRow(
-                            item = d, eta = eta[d.id],
-                            onOpen = {}, onCancel = { remove(d) }, onShare = {},
-                            onCopyLink = {}, onDelete = { remove(d) }, onRetry = {}
-                        )
-                    }
-                }
-                byDay.forEach { (label, list) ->
-                    item(key = "h-$label") { DownloadSectionTitle(label) }
-                    items(list, key = { it.id }) { d ->
-                        DownloadRow(
-                            item = d, eta = null,
-                            onOpen = { openDownloadedFile(context, d) },
-                            onCancel = {},
-                            onShare = { shareDownloadedFile(context, d) },
-                            onCopyLink = {
-                                context.getSystemService(android.content.ClipboardManager::class.java)
-                                    .setPrimaryClip(android.content.ClipData.newPlainText("Link", d.url))
-                                Toast.makeText(context, "Link copied", Toast.LENGTH_SHORT).show()
-                            },
-                            onDelete = { remove(d) },
-                            onRetry = { remove(d); onRetry(d.url) }
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun DownloadSectionTitle(text: String) {
-    Text(
-        text, color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Medium,
-        modifier = Modifier.padding(start = 17.dp, end = 17.dp, top = 20.dp, bottom = 6.dp)
-    )
-}
-
-@Composable
-private fun DownloadRow(
-    item: DlItem,
-    eta: String?,
-    onOpen: () -> Unit,
-    onCancel: () -> Unit,
-    onShare: () -> Unit,
-    onCopyLink: () -> Unit,
-    onDelete: () -> Unit,
-    onRetry: () -> Unit
-) {
-    val context = LocalContext.current
-    val done = item.status == DownloadManager.STATUS_SUCCESSFUL
-    val failed = item.status == DownloadManager.STATUS_FAILED
-    val frac = if (item.total > 0) (item.done.toFloat() / item.total).coerceIn(0f, 1f) else 0f
-    val fmt = { n: Long -> android.text.format.Formatter.formatFileSize(context, n) }
-    val host = runCatching { Uri.parse(item.url).host }.getOrNull().orEmpty().removePrefix("www.")
-    var menu by remember { mutableStateOf(false) }
-
-    val subtitle = when {
-        done -> fmt(maxOf(item.total, item.done)) + (if (host.isNotEmpty()) " \u2022 $host" else "")
-        failed -> "Failed" + (if (host.isNotEmpty()) " \u2022 $host" else "")
-        item.status == DownloadManager.STATUS_PAUSED -> "Paused \u2022 ${fmt(item.done)}"
-        item.status == DownloadManager.STATUS_PENDING -> "Waiting\u2026"
-        item.total > 0 -> "${fmt(item.done)}/${fmt(item.total)}" + (if (eta != null) " \u2022 $eta" else "")
-        else -> fmt(item.done)
-    }
-
-    Row(
-        Modifier.fillMaxWidth().clickable(enabled = done) { onOpen() }
-            .padding(horizontal = 17.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(Modifier.size(52.dp), contentAlignment = Alignment.Center) {
-            if (!done && !failed) {
-                if (item.total > 0) {
-                    CircularProgressIndicator(
-                        progress = { frac }, modifier = Modifier.fillMaxSize(),
-                        color = Color(0xFFB9C3FF), trackColor = Surface3, strokeWidth = 3.dp
-                    )
-                } else {
-                    CircularProgressIndicator(
-                        modifier = Modifier.fillMaxSize(), color = Color(0xFFB9C3FF), strokeWidth = 3.dp
-                    )
-                }
-                Icon(Icons.Default.Download, null, tint = TextMain, modifier = Modifier.size(22.dp))
-            } else {
-                Box(
-                    Modifier.fillMaxSize().clip(CircleShape).background(Color(0xFF1B1D21)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        if (failed) Icons.Default.ErrorOutline else dlIcon(item), null,
-                        tint = if (failed) Color(0xFFE5484D) else TextMain
-                    )
-                }
-            }
-        }
-        Spacer(Modifier.width(16.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                item.title, color = TextMain, fontSize = 17.sp, maxLines = 1,
-                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-            )
-            Text(
-                subtitle, color = TextMuted, fontSize = 14.sp, maxLines = 1,
-                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-            )
-        }
-        if (!done && !failed) {
-            IconButton(onClick = onCancel) { Icon(Icons.Default.Close, "Cancel download", tint = TextMain) }
-        } else {
-            Box {
-                IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "More", tint = TextMain) }
-                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    if (done) {
-                        BrowserMenuItem("Open", Icons.Default.OpenInNew) { menu = false; onOpen() }
-                        BrowserMenuItem("Share", Icons.Default.Share) { menu = false; onShare() }
-                    }
-                    if (failed) BrowserMenuItem("Retry", Icons.Default.Refresh) { menu = false; onRetry() }
-                    if (item.url.startsWith("http")) {
-                        BrowserMenuItem("Copy link", Icons.Default.ContentCopy) { menu = false; onCopyLink() }
-                    }
-                    BrowserMenuItem("Delete", Icons.Default.Delete) { menu = false; onDelete() }
                 }
             }
         }

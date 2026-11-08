@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <cache-path name="shared" path="shared/" />
+    <!-- KEEP the entries you already had (cache-path etc. for Copy/Share image) and add these: -->
+    <external-files-path name="downloads" path="Download/" />
+    <external-files-path name="dl_parts" path="dl_parts/" />
 </paths>
