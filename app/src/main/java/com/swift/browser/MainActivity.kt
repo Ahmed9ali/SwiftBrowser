@@ -324,7 +324,13 @@ private class DownloadStore(context: Context) {
 
 private data class DlItem(
     val id: Long, val title: String, val status: Int,
-    val done: Long, val total: Long, val mime: String?
+    val done: Long, val total: Long, val mime: String?,
+    val url: String, val time: Long
+)
+
+private data class PendingDownload(
+    val url: String, val userAgent: String?, val disposition: String?,
+    val mime: String?, val referer: String?, val filename: String
 )
 
 private fun queryDownloads(context: Context, ids: List<Long>): List<DlItem> {
@@ -342,13 +348,86 @@ private fun queryDownloads(context: Context, ids: List<Long>): List<DlItem> {
                         c.getInt(col(DownloadManager.COLUMN_STATUS)),
                         c.getLong(col(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)),
                         c.getLong(col(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)),
-                        c.getString(col(DownloadManager.COLUMN_MEDIA_TYPE))
+                        c.getString(col(DownloadManager.COLUMN_MEDIA_TYPE)),
+                        c.getString(col(DownloadManager.COLUMN_URI)) ?: "",
+                        c.getLong(col(DownloadManager.COLUMN_LAST_MODIFIED_TIMESTAMP))
                     )
                 )
             }
         }
     }
     return out.sortedByDescending { it.id }
+}
+
+// Opens a finished download with the app that handles its type.
+private fun openDownloadedFile(context: Context, item: DlItem) {
+    runCatching {
+        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val uri = dm.getUriForDownloadedFile(item.id) ?: error("missing")
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW)
+                .setDataAndType(uri, item.mime ?: "*/*")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }.onFailure { Toast.makeText(context, "Can't open this file", Toast.LENGTH_SHORT).show() }
+}
+
+private fun shareDownloadedFile(context: Context, item: DlItem) {
+    runCatching {
+        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val uri = dm.getUriForDownloadedFile(item.id) ?: error("missing")
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = item.mime ?: "*/*"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(send, "Share").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }.onFailure { Toast.makeText(context, "Can't share this file", Toast.LENGTH_SHORT).show() }
+}
+
+// Only these are opened automatically (never apps or archives).
+private fun canAutoOpen(item: DlItem): Boolean {
+    val m = item.mime ?: ""
+    return m.startsWith("image/") || m.startsWith("video/") || m.startsWith("audio/") ||
+        m.startsWith("text/") || m == "application/pdf" ||
+        m.contains("officedocument") || m == "application/msword"
+}
+
+private fun dlKind(d: DlItem): String {
+    val m = d.mime ?: ""
+    val n = d.title.lowercase()
+    return when {
+        m.startsWith("video/") -> "Videos"
+        m.startsWith("image/") -> "Images"
+        m.startsWith("audio/") -> "Audio"
+        m == "application/pdf" || m.startsWith("text/") || m.contains("officedocument") ||
+            n.endsWith(".doc") || n.endsWith(".docx") || n.endsWith(".xls") || n.endsWith(".xlsx") ||
+            n.endsWith(".ppt") || n.endsWith(".pptx") || n.endsWith(".txt") -> "Documents"
+        else -> "Other"
+    }
+}
+
+private fun dlIcon(d: DlItem): ImageVector {
+    val m = d.mime ?: ""
+    return when {
+        m.startsWith("video/") -> Icons.Default.Movie
+        m.startsWith("image/") -> Icons.Default.Image
+        m.startsWith("audio/") -> Icons.Default.MusicNote
+        m == "application/vnd.android.package-archive" -> Icons.Default.Android
+        dlKind(d) == "Documents" -> Icons.Default.Description
+        else -> Icons.Default.InsertDriveFile
+    }
+}
+
+private fun dayLabel(ts: Long): String {
+    val d = java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.getDefault()).format(java.util.Date(ts))
+    fun key(t: Long) = java.text.SimpleDateFormat("yyyyDDD", java.util.Locale.US).format(java.util.Date(t))
+    val now = System.currentTimeMillis()
+    return when (key(ts)) {
+        key(now) -> "Today - $d"
+        key(now - 86_400_000L) -> "Yesterday - $d"
+        else -> d
+    }
 }
 
 // Per-tab favicons and page thumbnails (shown in tab cards and the group bar).
@@ -579,6 +658,45 @@ private fun SwiftBrowserApp() {
     var pendingLogin by remember { mutableStateOf<PendingLogin?>(null) }
     val passwordStore = remember { PasswordStore(context) }
     val downloadStore = remember { DownloadStore(context) }
+    var settingsEntry by remember { mutableStateOf("main") }
+    var downloadNoticeAt by remember { mutableLongStateOf(0L) }
+    var downloadNoticeVisible by remember { mutableStateOf(false) }
+    var pendingDownload by remember { mutableStateOf<PendingDownload?>(null) }
+    var selecting by remember { mutableStateOf(false) }
+    val selectedTabs = remember { mutableStateListOf<Long>() }
+    var showClearData by remember { mutableStateOf(false) }
+    var webSuggestions by remember { mutableStateOf<List<String>>(emptyList()) }
+
+    // "Show the download card for a few seconds" (like Brave's Downloading file... card).
+    LaunchedEffect(downloadNoticeAt) {
+        if (downloadNoticeAt != 0L) {
+            downloadNoticeVisible = true
+            delay(4500)
+            downloadNoticeVisible = false
+        }
+    }
+
+    // Opens finished downloads by itself when the Download settings ask for it.
+    DisposableEffect(Unit) {
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                val id = i.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+                if (id < 0 || id !in downloadStore.ids()) return
+                val item = queryDownloads(c, listOf(id)).firstOrNull() ?: return
+                if (item.status != DownloadManager.STATUS_SUCCESSFUL) return
+                val isPdf = item.mime == "application/pdf"
+                if ((isPdf && appSettings.autoOpenPdf) || (appSettings.autoOpenDownloads && canAutoOpen(item))) {
+                    openDownloadedFile(c, item)
+                }
+            }
+        }
+        androidx.core.content.ContextCompat.registerReceiver(
+            context, receiver,
+            android.content.IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        onDispose { runCatching { context.unregisterReceiver(receiver) } }
+    }
     val recentClosed = remember { mutableStateListOf<Pair<String, String>>() }
     val pendingLoads = remember { HashMap<Long, String>() }
     val webArea = remember { android.graphics.Rect() }
@@ -923,10 +1041,17 @@ private fun SwiftBrowserApp() {
             return
         }
         val index = tabs.indexOfFirst { it.id == tab.id }
+        // Closing a tab inside a group goes to the neighbouring tab of the same group;
+        // only when the group is empty does it go to the previous tab or group.
+        val closedGroup = tabGroups[tab.id]
+        val groupMates = if (closedGroup != null) tabs.filter { tabGroups[it.id] == closedGroup } else emptyList()
+        val matePos = groupMates.indexOfFirst { it.id == tab.id }
+        val remainingMates = groupMates.filter { it.id != tab.id }
         tabs.removeAll { it.id == tab.id }
         tabGroups.remove(tab.id)
         if (activeId == tab.id) {
-            val next = tabs.getOrNull((index - 1).coerceAtLeast(0)) ?: tabs.first()
+            val next = remainingMates.getOrNull(matePos) ?: remainingMates.lastOrNull()
+                ?: tabs.getOrNull((index - 1).coerceAtLeast(0)) ?: tabs.first()
             selectTab(next)
             // Closing a tab from the overview must not leave the overview.
             if (fromOverview) showTabs = true
@@ -1123,6 +1248,39 @@ private fun SwiftBrowserApp() {
 
     // Builds the WebView for one tab. Callbacks only touch the shared UI state
     // when this tab is the active one; otherwise they update just this tab.
+    // Every download (page links, long-press menu) goes through here so the Download
+    // settings (ask first, notifications) and the "Downloading file..." card always apply.
+    fun enqueueDownload(d: PendingDownload) {
+        runCatching {
+            val ua = d.userAgent ?: android.webkit.WebSettings.getDefaultUserAgent(context)
+            val request = DownloadManager.Request(Uri.parse(d.url))
+                .addRequestHeader("User-Agent", ua)
+                .setTitle(d.filename)
+                .setNotificationVisibility(
+                    if (appSettings.downloadNotifications) DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+                    else DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_ONLY_COMPLETION
+                )
+                .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, d.filename)
+            if (!d.mime.isNullOrBlank()) request.setMimeType(d.mime)
+            d.referer?.takeIf { it.startsWith("http") }?.let { request.addRequestHeader("Referer", it) }
+            CookieManager.getInstance().getCookie(d.url)?.let { request.addRequestHeader("Cookie", it) }
+            val id = (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+            downloadStore.add(id)
+            downloadNoticeAt = System.currentTimeMillis()
+        }.onFailure {
+            Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun startDownload(url: String, userAgent: String?, disposition: String?, mime: String?, referer: String?) {
+        if (!url.startsWith("http")) {
+            Toast.makeText(context, "This link can't be downloaded", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val d = PendingDownload(url, userAgent, disposition, mime, referer, URLUtil.guessFileName(url, disposition, mime))
+        if (appSettings.askBeforeDownload) pendingDownload = d else enqueueDownload(d)
+    }
+
     fun createWebView(ctx: Context, tabId: Long): WebView {
         return WebView(ctx).apply {
             // Dark background so a not-yet-painted page never flashes white.
@@ -1321,20 +1479,7 @@ private fun SwiftBrowserApp() {
             }
 
             setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, _ ->
-                runCatching {
-                    val filename = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
-                    val request = DownloadManager.Request(Uri.parse(downloadUrl))
-                        .setMimeType(mimeType)
-                        .addRequestHeader("User-Agent", userAgent)
-                        .setTitle(filename)
-                        .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                        .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
-                    val dlId = (ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-                    downloadStore.add(dlId)
-                    Toast.makeText(ctx, "Download started \u2014 see Menu > Downloads", Toast.LENGTH_SHORT).show()
-                }.onFailure {
-                    Toast.makeText(ctx, "Download failed", Toast.LENGTH_SHORT).show()
-                }
+                startDownload(downloadUrl, userAgent, contentDisposition, mimeType, this.url)
             }
 
             webViews[tabId] = this
@@ -1415,28 +1560,9 @@ private fun SwiftBrowserApp() {
         openUrlInNewTab(u)
     }
 
-    // Downloads a link or image straight from the menu.
+    // Downloads a link or image straight from the long-press menu.
     fun downloadFromUrl(u: String) {
-        if (!u.startsWith("http")) {
-            Toast.makeText(context, "This link can't be downloaded", Toast.LENGTH_SHORT).show()
-            return
-        }
-        runCatching {
-            val ua = activeWebView()?.settings?.userAgentString ?: android.webkit.WebSettings.getDefaultUserAgent(context)
-            val filename = URLUtil.guessFileName(u, null, null)
-            val request = DownloadManager.Request(Uri.parse(u))
-                .addRequestHeader("User-Agent", ua)
-                .addRequestHeader("Referer", pageUrl)
-                .setTitle(filename)
-                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
-            CookieManager.getInstance().getCookie(u)?.let { request.addRequestHeader("Cookie", it) }
-            val id = (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-            downloadStore.add(id)
-            Toast.makeText(context, "Download started \u2014 see Menu > Downloads", Toast.LENGTH_SHORT).show()
-        }.onFailure {
-            Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
-        }
+        startDownload(u, null, null, null, pageUrl)
     }
 
     LaunchedEffect(MainActivity.pendingUrl) {
@@ -1567,7 +1693,7 @@ private fun SwiftBrowserApp() {
             // Browser top bar: just the address pill, app logo inside it
             // (like Brave's lion inside its omnibox).
             // Hidden in the tab overview — Brave has no address bar there.
-            if (!showTabs && address != "swift://settings") {
+            if (!showTabs && address != "swift://settings" && address != "swift://downloads") {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1689,7 +1815,7 @@ private fun SwiftBrowserApp() {
 
             // Small protection strip opens the detailed shield dashboard.
             // Hidden in the tabs overview, like Brave.
-            if (!showTabs && address != "swift://settings") {
+            if (!showTabs && address != "swift://settings" && address != "swift://downloads") {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 1.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1859,7 +1985,12 @@ private fun SwiftBrowserApp() {
                 ) {
                     DownloadsPanel(
                         store = downloadStore,
-                        onClose = { address = if (isHome) "" else pageUrl }
+                        onClose = { address = if (isHome) "" else pageUrl },
+                        onOpenSettings = {
+                            settingsEntry = "downloads"
+                            address = "swift://settings"
+                        },
+                        onRetry = { u -> startDownload(u, null, null, null, pageUrl) }
                     )
                 }
 
@@ -1891,7 +2022,8 @@ private fun SwiftBrowserApp() {
                             address = if (isHome) "" else pageUrl
                             showShield = true
                         },
-                        onOpenDownloads = { address = "swift://downloads" },
+                        startPage = settingsEntry,
+                        onExitStart = { address = "swift://downloads" },
                         onSetDefaultBrowser = {
                             runCatching {
                                 context.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
@@ -1940,6 +2072,59 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
+                pendingDownload?.let { d ->
+                    AlertDialog(
+                        onDismissRequest = { pendingDownload = null },
+                        containerColor = Surface,
+                        title = { Text("Download file?", color = TextMain) },
+                        text = {
+                            Column {
+                                Text(d.filename, color = TextMain, fontSize = 15.sp)
+                                Text(
+                                    runCatching { Uri.parse(d.url).host }.getOrNull().orEmpty().removePrefix("www."),
+                                    color = TextMuted, fontSize = 13.sp
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(onClick = { pendingDownload = null; enqueueDownload(d) }) { Text("Download", color = Accent) }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { pendingDownload = null }) { Text("Cancel", color = TextMain) }
+                        }
+                    )
+                }
+
+                // "Downloading file..." card under the address bar, like Brave.
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = downloadNoticeVisible && !showTabs &&
+                        address != "swift://downloads" && address != "swift://settings",
+                    enter = fadeIn(tween(120)) + slideInVertically(initialOffsetY = { -it }),
+                    exit = fadeOut(tween(120)) + slideOutVertically(targetOffsetY = { -it }),
+                    modifier = Modifier.align(Alignment.TopCenter)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
+                            .clip(RoundedCornerShape(18.dp)).background(Surface)
+                            .padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Download, null, tint = TextMuted, modifier = Modifier.size(26.dp))
+                        Spacer(Modifier.width(14.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Downloading file\u2026", color = TextMain, fontSize = 17.sp)
+                            Text(
+                                if (appSettings.downloadNotifications) "See notification for download status"
+                                else "See Downloads for download status",
+                                color = TextMuted, fontSize = 13.sp
+                            )
+                        }
+                        TextButton(onClick = { downloadNoticeVisible = false; address = "swift://downloads" }) {
+                            Text("Details", color = Color(0xFFA9B4FF), fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                        }
+                    }
+                }
+
                 // Brave-style translate card: "Translate page?" first, then "Page translated / Undo".
                 // Goes away by itself, or swipe it up.
                 val banner = translateDone ?: translateOffer
@@ -1967,7 +2152,7 @@ private fun SwiftBrowserApp() {
                     val code = banner?.second ?: ""
                     val fromName = java.util.Locale(code).getDisplayLanguage()
                     val from = fromName.ifBlank { "Detected language" }
-                    val to = java.util.Locale(deviceLang()).getDisplayLanguage()
+                    val to = TranslateEngine.displayName(appSettings.translateTarget)
                     // The swipe offset is a plain state, so the card follows the finger exactly
                     // (no coroutine per drag step). Letting go animates it back or off the top.
                     var swipeY by remember(banner) { mutableFloatStateOf(0f) }
@@ -2058,34 +2243,49 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
+                // Web suggestions for what you type (from the engine chosen in Settings).
+                LaunchedEffect(address, showSuggestions) {
+                    webSuggestions = emptyList()
+                    val q = address.trim()
+                    if (showSuggestions && q.isNotEmpty() && !q.startsWith("http") && !q.startsWith("swift://")) {
+                        delay(180)
+                        webSuggestions = withContext(Dispatchers.IO) { fetchSuggestions(q, appSettings.searchEngine) }
+                    }
+                }
+
                 androidx.compose.animation.AnimatedVisibility(
                     visible = showSuggestions && address.isNotBlank() && !showTabs,
                     enter = fadeIn(tween(100)),
                     exit = fadeOut(tween(80)),
                     modifier = Modifier.align(Alignment.TopCenter)
                 ) {
-                    val suggestions = (bookmarksNow() + store.history())
+                    val term = address.trim()
+                    val localHits = (bookmarksNow() + store.history())
                         .distinctBy { it.second }
-                        .filter { it.first.contains(address, true) || it.second.contains(address, true) }
-                        .take(5)
-                    if (suggestions.isNotEmpty()) {
-                        Column(
-                            Modifier.fillMaxWidth().padding(horizontal = 12.dp)
-                                .clip(RoundedCornerShape(16.dp)).background(Surface).padding(8.dp)
-                        ) {
-                            suggestions.forEach { (title, url) ->
-                                Row(
-                                    Modifier.fillMaxWidth().clickable { load(url) }.padding(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Default.History, null, tint = TextMuted, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(10.dp))
-                                    Column {
-                                        Text(title.ifBlank { url }, color = TextMain, fontSize = 13.sp, maxLines = 1)
-                                        Text(url, color = TextMuted, fontSize = 10.sp, maxLines = 1)
-                                    }
-                                }
-                            }
+                        .filter { it.first.contains(term, true) || it.second.contains(term, true) }
+                        .take(3)
+                    val looksLikeUrl = !term.contains(' ') &&
+                        (term.contains('.') || term.startsWith("localhost") || term.startsWith("http"))
+                    Column(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
+                            .clip(RoundedCornerShape(18.dp)).background(Surface).padding(vertical = 6.dp)
+                    ) {
+                        SuggestionRow(
+                            icon = if (looksLikeUrl) Icons.Default.Public else Icons.Default.Search,
+                            title = androidx.compose.ui.text.AnnotatedString(term)
+                        ) { load(term) }
+                        webSuggestions.forEach { sug ->
+                            SuggestionRow(
+                                icon = Icons.Default.Search,
+                                title = suggestionText(sug, term)
+                            ) { load(appSettings.searchUrl(sug)) }
+                        }
+                        localHits.forEach { (title, url) ->
+                            SuggestionRow(
+                                icon = Icons.Default.History,
+                                title = androidx.compose.ui.text.AnnotatedString(title.ifBlank { url }),
+                                subtitle = url
+                            ) { load(url) }
                         }
                     }
                 }
@@ -2123,8 +2323,51 @@ private fun SwiftBrowserApp() {
                         onGroup = { source, target -> handleGroupDrop(source, target) },
                         onDropOutside = { handleDropOutside(it) },
                         onGroupAll = { groupAllTabs() },
-                        onCloseAll = { confirmCloseAll = true }
+                        onCloseAll = { confirmCloseAll = true },
+                        selecting = selecting,
+                        selectedIds = selectedTabs,
+                        onToggleSelect = { ids ->
+                            if (ids.all { it in selectedTabs }) selectedTabs.removeAll(ids)
+                            else ids.forEach { if (it !in selectedTabs) selectedTabs.add(it) }
+                        }
                     )
+                }
+
+                if (showTabs && selecting) {
+                    BackHandler { selecting = false; selectedTabs.clear() }
+                    Row(
+                        Modifier.align(Alignment.TopCenter).fillMaxWidth().height(72.dp)
+                            .background(Bg).padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = { selecting = false; selectedTabs.clear() }) {
+                            Icon(Icons.Default.Close, "Cancel", tint = TextMain)
+                        }
+                        Text(
+                            if (selectedTabs.isEmpty()) "Select tabs" else "${selectedTabs.size} selected",
+                            color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Medium,
+                            modifier = Modifier.weight(1f).padding(start = 8.dp)
+                        )
+                        TextButton(
+                            enabled = selectedTabs.size >= 2,
+                            onClick = {
+                                val gid = groupCounter++
+                                selectedTabs.forEach { tabGroups[it] = gid }
+                                groupUpdated[gid] = System.currentTimeMillis()
+                                pendingEditGroup = gid
+                                selecting = false
+                                selectedTabs.clear()
+                            }
+                        ) { Text("Group", color = if (selectedTabs.size >= 2) Accent else TextMuted, fontWeight = FontWeight.Bold) }
+                        TextButton(
+                            enabled = selectedTabs.isNotEmpty(),
+                            onClick = {
+                                selectedTabs.toList().forEach { id -> tabs.firstOrNull { it.id == id }?.let { closeTab(it) } }
+                                selecting = false
+                                selectedTabs.clear()
+                            }
+                        ) { Text("Close", color = if (selectedTabs.isNotEmpty()) Accent else TextMuted, fontWeight = FontWeight.Bold) }
+                    }
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
@@ -2228,8 +2471,8 @@ private fun SwiftBrowserApp() {
 
             // Bottom bar — Brave-style. In the tab overview it becomes the
             // overview bar: "+" centered, settings at the right.
-            if (address == "swift://settings") {
-                // Settings is a full screen page: no toolbar, like Brave.
+            if (address == "swift://settings" || address == "swift://downloads") {
+                // Settings and Downloads are full screen pages: no toolbar, like Brave.
             } else if (showTabs) {
                 Box(
                     Modifier
@@ -2339,7 +2582,72 @@ private fun SwiftBrowserApp() {
                 onRemoveFromGroup = { handleDropOutside(it.id) }
             )
         }
-        if (showMenu) {
+        // Tabs overview menu (like Brave): only tab actions.
+        if (showMenu && showTabs) {
+            BoxWithConstraints(
+                Modifier.fillMaxSize()
+                    .background(Color(0x66000000))
+                    .pointerInput(Unit) { detectTapGestures(onTap = { showMenu = false }) }
+            ) {
+                Column(
+                    Modifier
+                        .align(Alignment.BottomEnd)
+                        .navigationBarsPadding()
+                        .padding(end = 10.dp, bottom = 12.dp)
+                        .widthIn(max = 340.dp)
+                        .fillMaxWidth(0.9f)
+                        .clip(RoundedCornerShape(26.dp))
+                        .background(Color(0xFF2F3137))
+                        .pointerInput(Unit) { detectTapGestures(onTap = {}) }
+                        .padding(vertical = 8.dp)
+                ) {
+                    MenuRow(Icons.Default.Add, "New tab") { showMenu = false; newTab() }
+                    MenuRow(Icons.Default.VisibilityOff, "New Private tab") { showMenu = false; startPrivateTab() }
+                    MenuRow(Icons.Default.GridView, "New tab group") {
+                        showMenu = false
+                        val gid = groupCounter++
+                        val id = idCounter.get()
+                        newTab()
+                        tabGroups[id] = gid
+                        groupUpdated[gid] = System.currentTimeMillis()
+                        pendingEditGroup = gid
+                        showTabs = true
+                    }
+                    MenuRow(Icons.Default.Close, "Close all tabs") { showMenu = false; confirmCloseAll = true }
+                    MenuRow(Icons.Default.CheckCircle, "Select tabs") {
+                        showMenu = false
+                        selectedTabs.clear()
+                        selecting = true
+                    }
+                    MenuRow(Icons.Default.DeleteSweep, "Delete browsing data") { showMenu = false; showClearData = true }
+                    MenuRow(Icons.Default.Settings, "Settings") {
+                        showMenu = false
+                        showTabs = false
+                        showShield = false
+                        settingsEntry = "main"
+                        address = "swift://settings"
+                        showSuggestions = false
+                    }
+                }
+            }
+        }
+        if (showClearData) {
+            ClearDataDialog(
+                hasHistory = false,
+                onDismiss = { showClearData = false },
+                onConfirm = { cookies, cache, _ ->
+                    if (cookies) {
+                        CookieManager.getInstance().removeAllCookies(null)
+                        CookieManager.getInstance().flush()
+                        android.webkit.WebStorage.getInstance().deleteAllData()
+                    }
+                    if (cache) webViews.values.forEach { it.clearCache(true) }
+                    Toast.makeText(context, "Browsing data cleared", Toast.LENGTH_SHORT).show()
+                    showClearData = false
+                }
+            )
+        }
+        if (showMenu && !showTabs) {
             val onPage = !showTabs && !isHome && pageUrl.startsWith("http")
             BoxWithConstraints(
                 Modifier.fillMaxSize()
@@ -2427,6 +2735,7 @@ private fun SwiftBrowserApp() {
                             showMenu = false
                             showTabs = false
                             showShield = false
+                            settingsEntry = "main"
                             address = "swift://settings"
                             showSuggestions = false
                         }
@@ -3248,7 +3557,10 @@ private fun TabSwitcher(
     editGroupRequest: Long?,
     onEditConsumed: () -> Unit,
     onSearchWeb: (String) -> Unit,
-    onReorder: (Long, Long, Boolean) -> Unit
+    onReorder: (Long, Long, Boolean) -> Unit,
+    selecting: Boolean = false,
+    selectedIds: List<Long> = emptyList(),
+    onToggleSelect: (List<Long>) -> Unit = {}
 ) {
     var query by remember { mutableStateOf("") }
     var openGroupKey by remember { mutableStateOf(openGroupRequest) }
@@ -3587,7 +3899,6 @@ private fun TabSwitcher(
             Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 17.dp)
-                .padding(bottom = 12.dp)
                 .height(46.dp)
                 .clip(RoundedCornerShape(24.dp))
                 .background(Surface2)
@@ -3601,7 +3912,9 @@ private fun TabSwitcher(
         }
 
         Box(
+            // Clipped to the list, so a dragged tab slides UNDER the search bar, not over it.
             Modifier.weight(1f).fillMaxWidth()
+                .clip(androidx.compose.ui.graphics.RectangleShape)
                 .onGloballyPositioned {
                     gridTopLeft = it.positionInRoot()
                     gridHeight = it.size.height
@@ -3641,7 +3954,7 @@ private fun TabSwitcher(
                 modifier = Modifier.fillMaxSize().padding(horizontal = 17.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = PaddingValues(bottom = 12.dp)
+                contentPadding = PaddingValues(top = 12.dp, bottom = 12.dp)
             ) {
                 gridItems(filtered, key = { it.key }) { entry ->
                     val activeMember = entry.tabs.firstOrNull { it.id == activeId } ?: entry.tabs.first()
@@ -3738,6 +4051,22 @@ private fun TabSwitcher(
                                 onRemoveFromGroup = null,
                                 modifier = dragModifier
                             )
+                        }
+                        if (selecting) {
+                            val ids = entry.tabs.map { it.id }
+                            val on = ids.all { it in selectedIds }
+                            Box(
+                                Modifier.matchParentSize()
+                                    .clip(RoundedCornerShape(24.dp))
+                                    .background(if (on) Accent.copy(alpha = 0.22f) else Color(0x22000000))
+                                    .clickable { onToggleSelect(ids) }
+                            ) {
+                                Icon(
+                                    if (on) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked, null,
+                                    tint = if (on) Accent else TextMain.copy(alpha = 0.85f),
+                                    modifier = Modifier.align(Alignment.TopEnd).padding(10.dp).size(28.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -4144,18 +4473,65 @@ private fun suggestionText(s: String, term: String): androidx.compose.ui.text.An
     }
 
 // Search-engine suggestions for the typed text (best effort; empty on any failure).
-private fun fetchSuggestions(q: String): List<String> = runCatching {
-    val url = java.net.URL("https://search.brave.com/api/suggest?q=" + Uri.encode(q) + "&rich=false")
-    val conn = url.openConnection() as java.net.HttpURLConnection
-    conn.connectTimeout = 3000
-    conn.readTimeout = 3000
-    conn.setRequestProperty("Accept", "application/json")
-    val body = conn.inputStream.bufferedReader().use { it.readText() }
-    val list = org.json.JSONArray(body).optJSONArray(1) ?: return@runCatching emptyList<String>()
-    (0 until list.length()).map { list.optString(it) }
-        .filter { it.isNotBlank() && !it.equals(q, ignoreCase = true) }
-        .take(5)
-}.getOrDefault(emptyList())
+private fun fetchSuggestions(q: String, engine: String = "brave"): List<String> {
+    val enc = Uri.encode(q)
+    val primary = when (engine) {
+        "google" -> "https://suggestqueries.google.com/complete/search?client=firefox&q=$enc"
+        "ddg" -> "https://duckduckgo.com/ac/?type=list&q=$enc"
+        "bing" -> "https://api.bing.com/osjson.aspx?query=$enc"
+        else -> "https://search.brave.com/api/suggest?q=$enc&rich=false"
+    }
+    // The chosen engine first; the others only if it returns nothing.
+    val urls = listOf(
+        primary,
+        "https://duckduckgo.com/ac/?type=list&q=$enc",
+        "https://suggestqueries.google.com/complete/search?client=firefox&q=$enc"
+    ).distinct()
+    for (u in urls) {
+        val r = runCatching {
+            val conn = java.net.URL(u).openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 3000
+            conn.readTimeout = 3000
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36")
+            conn.setRequestProperty("Accept", "application/json")
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val list = org.json.JSONArray(body).optJSONArray(1) ?: return@runCatching emptyList<String>()
+            (0 until list.length()).map { list.optString(it) }
+                .filter { it.isNotBlank() && !it.equals(q, ignoreCase = true) }
+                .take(6)
+        }.getOrDefault(emptyList())
+        if (r.isNotEmpty()) return r
+    }
+    return emptyList()
+}
+
+@Composable
+private fun SuggestionRow(
+    icon: ImageVector,
+    title: androidx.compose.ui.text.AnnotatedString,
+    subtitle: String? = null,
+    onClick: () -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = TextMuted, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                title, color = TextMain, fontSize = 15.sp, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+            )
+            if (subtitle != null) {
+                Text(
+                    subtitle, color = TextMuted, fontSize = 11.sp, maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
 
 @Composable
 private fun SearchResultRow(
@@ -4307,84 +4683,275 @@ private fun TabSearchScreen(
 }
 
 @Composable
-private fun DownloadsPanel(store: DownloadStore, onClose: () -> Unit) {
+private fun DownloadsPanel(
+    store: DownloadStore,
+    onClose: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onRetry: (String) -> Unit
+) {
     val context = LocalContext.current
     var items by remember { mutableStateOf(emptyList<DlItem>()) }
+    var filter by remember { mutableStateOf("All") }
+    var searching by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+    var eta by remember { mutableStateOf<Map<Long, String>>(emptyMap()) }
+    val samples = remember { HashMap<Long, Triple<Long, Long, Float>>() } // id -> time, bytes, bytes per ms
+    val totalSpace = remember {
+        runCatching { android.os.StatFs(Environment.getExternalStorageDirectory().path).totalBytes }.getOrDefault(0L)
+    }
+
     LaunchedEffect(Unit) {
         while (true) {
-            items = withContext(Dispatchers.IO) { queryDownloads(context, store.ids()) }
+            val fresh = withContext(Dispatchers.IO) { queryDownloads(context, store.ids()) }
+            val now = System.currentTimeMillis()
+            val left = HashMap<Long, String>()
+            fresh.forEach { d ->
+                if (d.status == DownloadManager.STATUS_RUNNING && d.total > 0) {
+                    val prev = samples[d.id]
+                    if (prev == null) {
+                        samples[d.id] = Triple(now, d.done, 0f)
+                    } else if (now > prev.first) {
+                        val inst = (d.done - prev.second).toFloat() / (now - prev.first)
+                        val smooth = if (prev.third > 0f) prev.third * 0.6f + inst * 0.4f else inst
+                        samples[d.id] = Triple(now, d.done, smooth)
+                        if (smooth > 0f) {
+                            val secs = ((d.total - d.done) / smooth / 1000f).toLong().coerceAtLeast(1)
+                            left[d.id] = when {
+                                secs < 60 -> "$secs secs left"
+                                secs < 3600 -> "${secs / 60} mins left"
+                                else -> "${secs / 3600} hrs left"
+                            }
+                        }
+                    }
+                }
+            }
+            eta = left
+            items = fresh
             delay(1000)
         }
     }
-    fun open(item: DlItem) {
-        runCatching {
-            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-            val uri = dm.getUriForDownloadedFile(item.id) ?: error("missing")
-            context.startActivity(
-                Intent(Intent.ACTION_VIEW)
-                    .setDataAndType(uri, item.mime ?: "*/*")
-                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-        }.onFailure { Toast.makeText(context, "Can't open this file", Toast.LENGTH_SHORT).show() }
+
+    fun remove(item: DlItem) {
+        runCatching { (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).remove(item.id) }
+        store.remove(item.id)
+        items = items.filter { it.id != item.id }
     }
-    Column(Modifier.fillMaxSize().background(Bg).padding(17.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Downloads", color = TextMain, fontSize = 23.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-            IconButton(onClick = {
-                runCatching { context.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
-            }) { Icon(Icons.Default.FolderOpen, "Open in Files", tint = TextMuted) }
+
+    val shown = items.filter {
+        (filter == "All" || dlKind(it) == filter) && (query.isBlank() || it.title.contains(query, true))
+    }
+    val active = shown.filter {
+        it.status != DownloadManager.STATUS_SUCCESSFUL && it.status != DownloadManager.STATUS_FAILED
+    }
+    val finished = shown.filter {
+        it.status == DownloadManager.STATUS_SUCCESSFUL || it.status == DownloadManager.STATUS_FAILED
+    }.sortedByDescending { it.time }
+    val byDay = LinkedHashMap<String, MutableList<DlItem>>()
+    finished.forEach { byDay.getOrPut(dayLabel(it.time)) { mutableListOf() }.add(it) }
+    val used = items.filter { it.status == DownloadManager.STATUS_SUCCESSFUL }.sumOf { maxOf(it.total, it.done) }
+    val fmt = { n: Long -> android.text.format.Formatter.formatFileSize(context, n) }
+
+    Column(Modifier.fillMaxSize().background(Bg)) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 17.dp, end = 6.dp, top = 10.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (searching) {
+                val focus = remember { androidx.compose.ui.focus.FocusRequester() }
+                LaunchedEffect(Unit) { focus.requestFocus() }
+                Box(Modifier.weight(1f).padding(end = 8.dp)) {
+                    if (query.isEmpty()) Text("Search downloads", color = TextMuted, fontSize = 18.sp)
+                    BasicTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(color = TextMain, fontSize = 18.sp),
+                        cursorBrush = androidx.compose.ui.graphics.SolidColor(Accent),
+                        modifier = Modifier.fillMaxWidth().focusRequester(focus)
+                    )
+                }
+            } else {
+                Text(
+                    "Downloads", color = TextMain, fontSize = 28.sp,
+                    fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f)
+                )
+            }
+            IconButton(onClick = onOpenSettings) { Icon(Icons.Default.Settings, "Download settings", tint = TextMain) }
+            IconButton(onClick = { searching = !searching; if (!searching) query = "" }) {
+                Icon(if (searching) Icons.Default.Close else Icons.Default.Search, "Search downloads", tint = TextMain)
+            }
             IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Close", tint = TextMain) }
         }
-        if (items.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No downloads yet", color = TextMuted, fontSize = 13.sp)
+        Text(
+            "Using ${fmt(used)}" + (if (totalSpace > 0) " of ${fmt(totalSpace)}" else ""),
+            color = TextMuted, fontSize = 15.sp,
+            modifier = Modifier.padding(horizontal = 17.dp, vertical = 10.dp)
+        )
+        HorizontalDivider(color = Surface3)
+
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                .padding(horizontal = 17.dp, vertical = 14.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            listOf(
+                "All" to null, "Videos" to Icons.Default.Movie, "Images" to Icons.Default.Image,
+                "Audio" to Icons.Default.MusicNote, "Documents" to Icons.Default.Description,
+                "Other" to Icons.Default.InsertDriveFile
+            ).forEach { (name, icon) ->
+                val on = filter == name
+                val shape = RoundedCornerShape(10.dp)
+                Row(
+                    Modifier.clip(shape)
+                        .border(1.dp, if (on) Color.Transparent else Surface3, shape)
+                        .background(if (on) Color(0xFF343A6B) else Color.Transparent)
+                        .clickable { filter = name }
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (on) {
+                        Icon(Icons.Default.Check, null, tint = TextMain, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                    } else if (icon != null) {
+                        Icon(icon, null, tint = TextMain, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(name, color = TextMain, fontSize = 15.sp)
+                }
+            }
+        }
+
+        if (shown.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("No downloads yet", color = TextMuted, fontSize = 14.sp)
             }
         } else {
-            LazyColumn {
-                items(items, key = { it.id }) { item ->
-                    val done = item.status == DownloadManager.STATUS_SUCCESSFUL
-                    val failed = item.status == DownloadManager.STATUS_FAILED
-                    val frac = if (item.total > 0) (item.done.toFloat() / item.total).coerceIn(0f, 1f) else 0f
-                    val size = android.text.format.Formatter.formatShortFileSize(
-                        context, if (done) item.total.coerceAtLeast(item.done) else item.done
-                    )
-                    Row(
-                        Modifier.fillMaxWidth().clickable(enabled = done) { open(item) }.padding(vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            if (failed) Icons.Default.ErrorOutline else Icons.Default.Download, null,
-                            tint = if (failed) Color(0xFFE5484D) else Accent
+            LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(bottom = 24.dp)) {
+                if (active.isNotEmpty()) {
+                    item(key = "h-now") { DownloadSectionTitle("Just now") }
+                    items(active, key = { it.id }) { d ->
+                        DownloadRow(
+                            item = d, eta = eta[d.id],
+                            onOpen = {}, onCancel = { remove(d) }, onShare = {},
+                            onCopyLink = {}, onDelete = { remove(d) }, onRetry = {}
                         )
-                        Spacer(Modifier.width(12.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(item.title, color = TextMain, fontSize = 13.sp, maxLines = 2)
-                            Text(
-                                when {
-                                    done -> size
-                                    failed -> "Download failed"
-                                    item.status == DownloadManager.STATUS_PAUSED -> "Paused \u00b7 $size"
-                                    item.status == DownloadManager.STATUS_PENDING -> "Waiting\u2026"
-                                    else -> (if (item.total > 0) "${(frac * 100).toInt()}% \u00b7 " else "") + size
-                                },
-                                color = TextMuted, fontSize = 11.sp
-                            )
-                            if (!done && !failed) {
-                                Spacer(Modifier.height(6.dp))
-                                Box(Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp)).background(Surface3)) {
-                                    Box(Modifier.fillMaxWidth(frac).fillMaxHeight().background(Accent))
-                                }
-                            }
-                        }
-                        IconButton(onClick = {
-                            runCatching {
-                                (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).remove(item.id)
-                            }
-                            store.remove(item.id)
-                            items = items.filter { it.id != item.id }
-                        }) { Icon(Icons.Default.Delete, "Delete", tint = TextMuted) }
                     }
-                    HorizontalDivider(color = Surface3.copy(alpha = .45f))
+                }
+                byDay.forEach { (label, list) ->
+                    item(key = "h-$label") { DownloadSectionTitle(label) }
+                    items(list, key = { it.id }) { d ->
+                        DownloadRow(
+                            item = d, eta = null,
+                            onOpen = { openDownloadedFile(context, d) },
+                            onCancel = {},
+                            onShare = { shareDownloadedFile(context, d) },
+                            onCopyLink = {
+                                context.getSystemService(android.content.ClipboardManager::class.java)
+                                    .setPrimaryClip(android.content.ClipData.newPlainText("Link", d.url))
+                                Toast.makeText(context, "Link copied", Toast.LENGTH_SHORT).show()
+                            },
+                            onDelete = { remove(d) },
+                            onRetry = { remove(d); onRetry(d.url) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DownloadSectionTitle(text: String) {
+    Text(
+        text, color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Medium,
+        modifier = Modifier.padding(start = 17.dp, end = 17.dp, top = 20.dp, bottom = 6.dp)
+    )
+}
+
+@Composable
+private fun DownloadRow(
+    item: DlItem,
+    eta: String?,
+    onOpen: () -> Unit,
+    onCancel: () -> Unit,
+    onShare: () -> Unit,
+    onCopyLink: () -> Unit,
+    onDelete: () -> Unit,
+    onRetry: () -> Unit
+) {
+    val context = LocalContext.current
+    val done = item.status == DownloadManager.STATUS_SUCCESSFUL
+    val failed = item.status == DownloadManager.STATUS_FAILED
+    val frac = if (item.total > 0) (item.done.toFloat() / item.total).coerceIn(0f, 1f) else 0f
+    val fmt = { n: Long -> android.text.format.Formatter.formatFileSize(context, n) }
+    val host = runCatching { Uri.parse(item.url).host }.getOrNull().orEmpty().removePrefix("www.")
+    var menu by remember { mutableStateOf(false) }
+
+    val subtitle = when {
+        done -> fmt(maxOf(item.total, item.done)) + (if (host.isNotEmpty()) " \u2022 $host" else "")
+        failed -> "Failed" + (if (host.isNotEmpty()) " \u2022 $host" else "")
+        item.status == DownloadManager.STATUS_PAUSED -> "Paused \u2022 ${fmt(item.done)}"
+        item.status == DownloadManager.STATUS_PENDING -> "Waiting\u2026"
+        item.total > 0 -> "${fmt(item.done)}/${fmt(item.total)}" + (if (eta != null) " \u2022 $eta" else "")
+        else -> fmt(item.done)
+    }
+
+    Row(
+        Modifier.fillMaxWidth().clickable(enabled = done) { onOpen() }
+            .padding(horizontal = 17.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(52.dp), contentAlignment = Alignment.Center) {
+            if (!done && !failed) {
+                if (item.total > 0) {
+                    CircularProgressIndicator(
+                        progress = { frac }, modifier = Modifier.fillMaxSize(),
+                        color = Color(0xFFB9C3FF), trackColor = Surface3, strokeWidth = 3.dp
+                    )
+                } else {
+                    CircularProgressIndicator(
+                        modifier = Modifier.fillMaxSize(), color = Color(0xFFB9C3FF), strokeWidth = 3.dp
+                    )
+                }
+                Icon(Icons.Default.Download, null, tint = TextMain, modifier = Modifier.size(22.dp))
+            } else {
+                Box(
+                    Modifier.fillMaxSize().clip(CircleShape).background(Color(0xFF1B1D21)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        if (failed) Icons.Default.ErrorOutline else dlIcon(item), null,
+                        tint = if (failed) Color(0xFFE5484D) else TextMain
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.width(16.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                item.title, color = TextMain, fontSize = 17.sp, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+            )
+            Text(
+                subtitle, color = TextMuted, fontSize = 14.sp, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+            )
+        }
+        if (!done && !failed) {
+            IconButton(onClick = onCancel) { Icon(Icons.Default.Close, "Cancel download", tint = TextMain) }
+        } else {
+            Box {
+                IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "More", tint = TextMain) }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    if (done) {
+                        BrowserMenuItem("Open", Icons.Default.OpenInNew) { menu = false; onOpen() }
+                        BrowserMenuItem("Share", Icons.Default.Share) { menu = false; onShare() }
+                    }
+                    if (failed) BrowserMenuItem("Retry", Icons.Default.Refresh) { menu = false; onRetry() }
+                    if (item.url.startsWith("http")) {
+                        BrowserMenuItem("Copy link", Icons.Default.ContentCopy) { menu = false; onCopyLink() }
+                    }
+                    BrowserMenuItem("Delete", Icons.Default.Delete) { menu = false; onDelete() }
                 }
             }
         }

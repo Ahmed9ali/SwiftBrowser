@@ -102,6 +102,14 @@ class AppSettings(context: Context) {
         private set
     var wifiOnlyModels by mutableStateOf(sp.getBoolean("tWifi", false))
         private set
+    var askBeforeDownload by mutableStateOf(sp.getBoolean("dlAsk", false))
+        private set
+    var autoOpenPdf by mutableStateOf(sp.getBoolean("dlPdf", false))
+        private set
+    var autoOpenDownloads by mutableStateOf(sp.getBoolean("dlOpen", true))
+        private set
+    var downloadNotifications by mutableStateOf(sp.getBoolean("dlNotify", true))
+        private set
     var translateTarget by mutableStateOf(
         sp.getString("tTarget", null) ?: (TranslateEngine.normalize(Locale.getDefault().language) ?: "en")
     )
@@ -118,6 +126,10 @@ class AppSettings(context: Context) {
     fun putTranslateOffer(v: Boolean) { translateOffer = v; sp.edit().putBoolean("tOffer", v).apply() }
     fun putTranslateAuto(v: Boolean) { translateAuto = v; sp.edit().putBoolean("tAuto", v).apply() }
     fun putWifiOnlyModels(v: Boolean) { wifiOnlyModels = v; sp.edit().putBoolean("tWifi", v).apply() }
+    fun putAskBeforeDownload(v: Boolean) { askBeforeDownload = v; sp.edit().putBoolean("dlAsk", v).apply() }
+    fun putAutoOpenPdf(v: Boolean) { autoOpenPdf = v; sp.edit().putBoolean("dlPdf", v).apply() }
+    fun putAutoOpenDownloads(v: Boolean) { autoOpenDownloads = v; sp.edit().putBoolean("dlOpen", v).apply() }
+    fun putDownloadNotifications(v: Boolean) { downloadNotifications = v; sp.edit().putBoolean("dlNotify", v).apply() }
     fun putTranslateTarget(v: String) { translateTarget = v; sp.edit().putString("tTarget", v).apply() }
 
     /** Search address for the chosen engine. */
@@ -171,7 +183,7 @@ private fun settingIndex(): List<SettingHit> = listOf(
     SettingHit("Never translate these sites", "Languages", "never translate sites", "never", Icons.Default.Block),
     SettingHit("Password Manager", "Passwords and autofill", "password manager saved logins save passwords", "passwords", Icons.Default.Key),
     SettingHit("Autofill services", "Passwords and autofill", "autofill service bitwarden google", "action:autofill", Icons.Default.Key),
-    SettingHit("Downloads", "Browser", "downloads files", "action:downloads", Icons.Default.Download),
+    SettingHit("Download settings", "Browser", "downloads files location notifications pdf open ask", "downloads", Icons.Default.Download),
     SettingHit("Set as default browser", "Browser", "default browser links", "action:default", Icons.Default.Public)
 )
 
@@ -190,25 +202,32 @@ fun SettingsScreen(
     onClearCache: () -> Unit,
     onClearHistory: (() -> Unit)?,
     onOpenPrivacyDashboard: () -> Unit,
-    onOpenDownloads: () -> Unit,
+    startPage: String = "main",
+    onExitStart: () -> Unit = {},
     onSetDefaultBrowser: () -> Unit,
     onOpenAutofillSettings: () -> Unit,
     onClose: () -> Unit
 ) {
     val context = LocalContext.current
-    var page by remember { mutableStateOf("main") }
+    var page by remember(startPage) { mutableStateOf(startPage) }
     var dialog by remember { mutableStateOf<String?>(null) }
     var query by remember { mutableStateOf("") }
 
-    val back = { page = if (page == "never") "languages" else "main" }
-    BackHandler(enabled = page != "main") { back() }
+    // Back: sub-page -> its parent; the page the screen was opened on (e.g. Download
+    // settings opened from the Downloads page) -> out of Settings to where it came from.
+    fun goBack() {
+        if (page == "never") page = "languages"
+        else if (page == startPage && startPage != "main") onExitStart()
+        else page = "main"
+    }
+    val back: () -> Unit = { goBack() }
+    BackHandler(enabled = page != "main") { goBack() }
     BackHandler(enabled = page == "main" && query.isNotEmpty()) { query = "" }
 
     fun go(target: String) {
         when {
             target.startsWith("dialog:") -> dialog = target.removePrefix("dialog:")
             target == "action:autofill" -> onOpenAutofillSettings()
-            target == "action:downloads" -> onOpenDownloads()
             target == "action:default" -> onSetDefaultBrowser()
             else -> { page = target; query = "" }
         }
@@ -216,6 +235,7 @@ fun SettingsScreen(
 
     Box(Modifier.fillMaxSize().background(SBg)) {
         when (page) {
+            "downloads" -> DownloadSettingsPage(settings, back)
             "privacy" -> PrivacyPage(
                 settings, blockingEnabled, onBlockingChange, privateMode, onPrivateChange,
                 onWebSettingsChanged, onOpenPrivacyDashboard, { dialog = "clear" }, back
@@ -370,7 +390,7 @@ private fun MainPage(
 
                 SectionLabel("Browser")
                 CardGroup {
-                    item { SRow(Icons.Default.Download, "Downloads", null, onClick = { onGo("action:downloads") }) { Chevron() } }
+                    item { SRow(Icons.Default.Download, "Downloads", null, onClick = { onGo("downloads") }) { Chevron() } }
                     item { SRow(Icons.Default.Public, "Set as default browser", null, onClick = { onGo("action:default") }) { Chevron() } }
                     item { AboutRow() }
                 }
@@ -1082,7 +1102,7 @@ private fun ChoiceDialog(
 }
 
 @Composable
-private fun ClearDataDialog(
+fun ClearDataDialog(
     hasHistory: Boolean,
     onDismiss: () -> Unit,
     onConfirm: (cookies: Boolean, cache: Boolean, history: Boolean) -> Unit
@@ -1123,5 +1143,58 @@ private fun CheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Uni
         )
         Spacer(Modifier.width(6.dp))
         Text(label, color = SText, fontSize = 15.sp)
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Download settings (opened from Settings > Downloads or the Downloads page)
+// ---------------------------------------------------------------------
+@Composable
+private fun DownloadSettingsPage(settings: AppSettings, onBack: () -> Unit) {
+    val location = remember {
+        runCatching {
+            android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS).absolutePath
+        }.getOrDefault("Downloads")
+    }
+    PageScaffold("Downloads", onBack) {
+        CardGroup {
+            item { PlainRow("Download location", "Downloads  $location") {} }
+            item {
+                PlainRow("Ask before downloading", if (settings.askBeforeDownload) "On" else "Off") {
+                    SSwitch(settings.askBeforeDownload) { settings.putAskBeforeDownload(it) }
+                }
+            }
+            item {
+                PlainRow("Automatically open PDFs", if (settings.autoOpenPdf) "On" else "Off") {
+                    SSwitch(settings.autoOpenPdf) { settings.putAutoOpenPdf(it) }
+                }
+            }
+            item {
+                PlainRow("Automatically open when possible", if (settings.autoOpenDownloads) "On" else "Off") {
+                    SSwitch(settings.autoOpenDownloads) { settings.putAutoOpenDownloads(it) }
+                }
+            }
+            item {
+                PlainRow("Show download progress notifications", if (settings.downloadNotifications) "On" else "Off") {
+                    SSwitch(settings.downloadNotifications) { settings.putDownloadNotifications(it) }
+                }
+            }
+        }
+    }
+}
+
+/** A settings row without an icon (title, small value under it, control on the right). */
+@Composable
+private fun PlainRow(title: String, subtitle: String?, trailing: @Composable () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 72.dp).padding(horizontal = 18.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = SText, fontSize = 17.sp)
+            if (subtitle != null) Text(subtitle, color = SMuted, fontSize = 14.sp)
+        }
+        Spacer(Modifier.width(8.dp))
+        trailing()
     }
 }
