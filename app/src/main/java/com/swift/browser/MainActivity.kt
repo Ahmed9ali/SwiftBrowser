@@ -494,7 +494,14 @@ class MainActivity : ComponentActivity() {
         ) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
         window.statusBarColor = android.graphics.Color.rgb(16, 17, 20)
         window.navigationBarColor = android.graphics.Color.rgb(16, 17, 20)
-        setContent { SwiftBrowserApp() }
+        setContent {
+            // Slightly smaller text overall, closer to Brave's proportions.
+            val d = androidx.compose.ui.platform.LocalDensity.current
+            androidx.compose.runtime.CompositionLocalProvider(
+                androidx.compose.ui.platform.LocalDensity provides
+                    androidx.compose.ui.unit.Density(d.density, d.fontScale * 0.92f)
+            ) { SwiftBrowserApp() }
+        }
     }
 }
 
@@ -865,6 +872,9 @@ private fun SwiftBrowserApp() {
         }
 
         val url = normalize(value)
+        if (url == appSettings.searchUrl(value) && tabs.firstOrNull { it.id == activeId }?.isPrivate != true) {
+            store.addQuery(value) // typed searches feed the suggestions
+        }
         pageUrl = url
         address = url
         blockedCount = 0
@@ -1577,7 +1587,17 @@ private fun SwiftBrowserApp() {
         colorScheme = darkColorScheme(
             primary = Accent, background = Bg, surface = Surface,
             onBackground = TextMain, onSurface = TextMain
-        )
+        ),
+        typography = MaterialTheme.typography.run {
+            val f = androidx.compose.ui.text.font.FontFamily.SansSerif
+            copy(
+                bodyLarge = bodyLarge.copy(fontFamily = f, fontWeight = FontWeight.Normal),
+                bodyMedium = bodyMedium.copy(fontFamily = f, fontWeight = FontWeight.Normal),
+                bodySmall = bodySmall.copy(fontFamily = f, fontWeight = FontWeight.Normal),
+                labelLarge = labelLarge.copy(fontFamily = f, fontWeight = FontWeight.Medium),
+                titleMedium = titleMedium.copy(fontFamily = f, fontWeight = FontWeight.Medium)
+            )
+        }
     ) {
         Box(Modifier.fillMaxSize()) {
         Column(
@@ -1607,7 +1627,7 @@ private fun SwiftBrowserApp() {
                             .background(Brush.linearGradient(listOf(Accent, Color(0xFFE94D25)))),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("S", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Black)
+                        Text("S", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium)
                     }
                     Spacer(Modifier.width(9.dp))
                     BasicTextField(
@@ -1733,7 +1753,7 @@ private fun SwiftBrowserApp() {
                         color = TextMuted, fontSize = 11.sp
                     )
                     Spacer(Modifier.weight(1f))
-                    Text("SHIELDS", color = Accent, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    Text("SHIELDS", color = Accent, fontSize = 9.sp, fontWeight = FontWeight.Medium)
                     Icon(Icons.Default.ChevronRight, null, tint = TextMuted, modifier = Modifier.size(15.dp))
                 }
             }
@@ -2132,7 +2152,7 @@ private fun SwiftBrowserApp() {
                         TextButton(onClick = { if (bannerDone) undoTranslate() else translatePageInPlace() }) {
                             Text(
                                 if (bannerDone) "Undo" else "Translate",
-                                color = Accent, fontWeight = FontWeight.Bold
+                                color = Accent, fontWeight = FontWeight.Medium
                             )
                         }
                     }
@@ -2140,11 +2160,12 @@ private fun SwiftBrowserApp() {
 
                 // Web suggestions for what you type (from the engine chosen in Settings).
                 LaunchedEffect(address, showSuggestions) {
-                    webSuggestions = emptyList()
                     val q = address.trim()
                     if (showSuggestions && q.isNotEmpty() && !q.startsWith("http") && !q.startsWith("swift://")) {
-                        delay(180)
+                        delay(120) // keep the old list on screen while the next one loads (no flicker)
                         webSuggestions = withContext(Dispatchers.IO) { fetchSuggestions(q, appSettings.searchEngine) }
+                    } else {
+                        webSuggestions = emptyList()
                     }
                 }
 
@@ -2155,12 +2176,39 @@ private fun SwiftBrowserApp() {
                     modifier = Modifier.align(Alignment.TopCenter)
                 ) {
                     val term = address.trim()
-                    val localHits = (bookmarksNow() + store.history())
-                        .distinctBy { it.second }
-                        .filter { it.first.contains(term, true) || it.second.contains(term, true) }
-                        .take(3)
                     val looksLikeUrl = !term.contains(' ') &&
                         (term.contains('.') || term.startsWith("localhost") || term.startsWith("http"))
+                    val isPrivateNow = tabs.firstOrNull { it.id == activeId }?.isPrivate == true
+
+                    // Sites you've been to / bookmarked: best matches first, at most 4.
+                    val siteHits = remember(term, showSuggestions) {
+                        val bm = bookmarksNow().map { Triple(it.first, it.second, true) }
+                        val hist = store.history().map { Triple(it.first, it.second, false) }
+                        (bm + hist).distinctBy { it.second }
+                            .mapNotNull { h ->
+                                val host = hostOf(h.second).removePrefix("www.")
+                                val score = when {
+                                    host.startsWith(term, true) -> 0
+                                    h.first.startsWith(term, true) -> 1
+                                    host.contains(term, true) -> 2
+                                    h.first.contains(term, true) -> 3
+                                    h.second.contains(term, true) -> 4
+                                    else -> return@mapNotNull null
+                                }
+                                score to h
+                            }
+                            .sortedBy { it.first }.map { it.second }.take(4)
+                    }
+                    // Searches you typed before that match (not in private tabs).
+                    val pastQueries = remember(term, showSuggestions) {
+                        if (isPrivateNow) emptyList()
+                        else store.queries().filter { it.startsWith(term, true) && !it.equals(term, true) }.take(2)
+                    }
+                    // 3-4 keyword suggestions: your past searches first, then the engine's.
+                    val keywordRows = (pastQueries.map { it to true } +
+                        webSuggestions.filter { w -> pastQueries.none { it.equals(w, true) } }.map { it to false })
+                        .take(4)
+
                     Column(
                         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
                             .clip(RoundedCornerShape(18.dp)).background(Surface).padding(vertical = 6.dp)
@@ -2169,17 +2217,23 @@ private fun SwiftBrowserApp() {
                             icon = if (looksLikeUrl) Icons.Default.Public else Icons.Default.Search,
                             title = androidx.compose.ui.text.AnnotatedString(term)
                         ) { load(term) }
-                        webSuggestions.forEach { sug ->
+                        keywordRows.forEach { (sug, past) ->
                             SuggestionRow(
-                                icon = Icons.Default.Search,
+                                icon = if (past) Icons.Default.History else Icons.Default.Search,
                                 title = suggestionText(sug, term)
-                            ) { load(appSettings.searchUrl(sug)) }
+                            ) {
+                                if (!isPrivateNow) store.addQuery(sug)
+                                load(appSettings.searchUrl(sug))
+                            }
                         }
-                        localHits.forEach { (title, url) ->
+                        if (siteHits.isNotEmpty()) {
+                            HorizontalDivider(color = Surface3.copy(alpha = .6f), modifier = Modifier.padding(vertical = 4.dp))
+                        }
+                        siteHits.forEach { (title, url, isBookmark) ->
                             SuggestionRow(
-                                icon = Icons.Default.History,
+                                icon = if (isBookmark) Icons.Default.Star else Icons.Default.Language,
                                 title = androidx.compose.ui.text.AnnotatedString(title.ifBlank { url }),
-                                subtitle = url
+                                subtitle = prettyAddress(url)
                             ) { load(url) }
                         }
                     }
@@ -2256,7 +2310,7 @@ private fun SwiftBrowserApp() {
                                 selecting = false
                                 selectedTabs.clear()
                             }
-                        ) { Text("Group", color = if (selectedTabs.size >= 2) Accent else TextMuted, fontWeight = FontWeight.Bold) }
+                        ) { Text("Group", color = if (selectedTabs.size >= 2) Accent else TextMuted, fontWeight = FontWeight.Medium) }
                         TextButton(
                             enabled = selectedTabs.isNotEmpty(),
                             onClick = {
@@ -2264,7 +2318,7 @@ private fun SwiftBrowserApp() {
                                 selecting = false
                                 selectedTabs.clear()
                             }
-                        ) { Text("Close", color = if (selectedTabs.isNotEmpty()) Accent else TextMuted, fontWeight = FontWeight.Bold) }
+                        ) { Text("Close", color = if (selectedTabs.isNotEmpty()) Accent else TextMuted, fontWeight = FontWeight.Medium) }
                     }
                 }
 
@@ -2826,7 +2880,7 @@ private fun GlassCard(modifier: Modifier = Modifier, content: @Composable Column
 private fun HomeSectionLabel(text: String) {
     Text(
         text,
-        color = TextMuted, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp,
+        color = TextMuted, fontSize = 11.sp, fontWeight = FontWeight.Medium, letterSpacing = 1.5.sp,
         modifier = Modifier.padding(start = 6.dp, bottom = 8.dp)
     )
 }
@@ -2834,7 +2888,7 @@ private fun HomeSectionLabel(text: String) {
 @Composable
 private fun HomeStat(value: String, label: String, modifier: Modifier = Modifier) {
     Column(modifier) {
-        Text(value, color = Accent, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        Text(value, color = Accent, fontSize = 22.sp, fontWeight = FontWeight.Medium)
         Text(label, color = TextMuted, fontSize = 10.sp, lineHeight = 13.sp)
     }
 }
@@ -2911,12 +2965,12 @@ private fun HomeScreen(
                     Text(
                         greeting,
                         color = Accent, fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold, letterSpacing = 2.sp
+                        fontWeight = FontWeight.Medium, letterSpacing = 2.sp
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
                         "Browse freely.",
-                        color = TextMain, fontSize = 34.sp, fontWeight = FontWeight.Bold
+                        color = TextMain, fontSize = 29.sp, fontWeight = FontWeight.Medium
                     )
                     Text(
                         "A faster, quieter web starts here.",
@@ -2971,7 +3025,7 @@ private fun HomeScreen(
                                 ) {
                                     Text(
                                         label.first().toString(),
-                                        color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold
+                                        color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Medium
                                     )
                                 }
                                 Spacer(Modifier.height(6.dp))
@@ -3228,7 +3282,7 @@ private fun ShieldDashboard(
             }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text("Privacy dashboard", color = TextMain, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Text("Privacy dashboard", color = TextMain, fontSize = 19.sp, fontWeight = FontWeight.Medium)
                 Text("Protection for this browsing session", color = TextMuted, fontSize = 11.sp)
             }
             IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Close", tint = TextMuted) }
@@ -3271,8 +3325,8 @@ private fun ShieldDashboard(
 @Composable
 private fun ShieldStat(label: String, value: String, modifier: Modifier = Modifier) {
     Column(modifier.clip(RoundedCornerShape(13.dp)).background(Surface2).padding(11.dp)) {
-        Text(value, color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Text(label, color = TextMuted, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+        Text(value, color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Medium)
+        Text(label, color = TextMuted, fontSize = 8.sp, fontWeight = FontWeight.Medium)
     }
 }
 
@@ -3323,7 +3377,7 @@ private fun SingleTabCard(
             Text(
                 label,
                 color = TextMain, fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold, maxLines = 1,
+                fontWeight = FontWeight.Medium, maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
@@ -3377,7 +3431,7 @@ private fun GroupCard(
             Text(
                 name,
                 color = TextMain, fontSize = 17.sp,
-                fontWeight = FontWeight.SemiBold, maxLines = 1,
+                fontWeight = FontWeight.Medium, maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
@@ -3431,7 +3485,7 @@ private fun GroupCard(
                                 contentAlignment = Alignment.Center
                             ) {
                                 if (overflow) {
-                                    Text("+${count - 3}", color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                                    Text("+${count - 3}", color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Medium)
                                 }
                             }
                         }
@@ -3784,7 +3838,7 @@ private fun TabSwitcher(
                         Modifier.size(22.dp).border(2.dp, TextMain, RoundedCornerShape(6.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(tabs.size.toString(), color = TextMain, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(tabs.size.toString(), color = TextMain, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                     }
                 }
                 Box(
@@ -4132,6 +4186,44 @@ private fun GroupPopupOverlay(
     var grab by remember { mutableStateOf(Offset.Zero) }     // finger offset inside the held card
     var lastSwap by remember { mutableLongStateOf(0L) }
     val popupBounds = remember { mutableStateMapOf<Long, Rect>() }
+    val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
+    var gridBounds by remember { mutableStateOf(Rect.Zero) }
+    val liveEntry by rememberUpdatedState(entry)
+    val liveReorder by rememberUpdatedState(onReorder)
+    val screenDensity = androidx.compose.ui.platform.LocalDensity.current.density
+
+    // While a tab is held: scroll the grid when the finger is near its top/bottom edge,
+    // and swap places with whichever tab is under the finger. Runs every frame, so it keeps
+    // working when the finger is still and the list is the thing moving.
+    LaunchedEffect(dragId) {
+        if (dragId == null) return@LaunchedEffect
+        while (dragId != null) {
+            val me = dragId ?: break
+            val b = gridBounds
+            val edge = 96f * screenDensity
+            val maxStep = 16f * screenDensity
+            val y = finger.y
+            val dy = when {
+                b.height <= 0f -> 0f
+                y < b.top + edge -> -((b.top + edge - y).coerceAtMost(edge) / edge) * maxStep
+                y > b.bottom - edge -> ((y - (b.bottom - edge)).coerceAtMost(edge) / edge) * maxStep
+                else -> 0f
+            }
+            if (dy != 0f) gridState.dispatchRawDelta(dy)
+            val now = System.currentTimeMillis()
+            if (now - lastSwap > 260) {
+                val tabsNow = liveEntry.tabs
+                val target = tabsNow.firstOrNull { t -> t.id != me && popupBounds[t.id]?.contains(finger) == true }
+                if (target != null) {
+                    val from = tabsNow.indexOfFirst { it.id == me }
+                    val to = tabsNow.indexOfFirst { it.id == target.id }
+                    lastSwap = now
+                    liveReorder(me, target.id, to > from)
+                }
+            }
+            androidx.compose.runtime.withFrameNanos { }
+        }
+    }
     Box(
         Modifier.fillMaxSize()
             .background(Color(0xB3000000))
@@ -4205,8 +4297,9 @@ private fun GroupPopupOverlay(
                 }
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(2),
+                    state = gridState,
                     userScrollEnabled = dragId == null,
-                    modifier = Modifier.heightIn(max = 520.dp),
+                    modifier = Modifier.heightIn(max = 520.dp).onGloballyPositioned { gridBounds = it.boundsInRoot() },
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
@@ -4238,19 +4331,7 @@ private fun GroupPopupOverlay(
                                         },
                                         onDrag = { change, amount ->
                                             change.consume()
-                                            finger += amount
-                                            val me = dragId ?: return@detectDragGesturesAfterLongPress
-                                            val now = System.currentTimeMillis()
-                                            if (now - lastSwap < 220) return@detectDragGesturesAfterLongPress
-                                            val target = entry.tabs.firstOrNull { t ->
-                                                t.id != me && popupBounds[t.id]?.contains(finger) == true
-                                            }
-                                            if (target != null) {
-                                                val from = entry.tabs.indexOfFirst { it.id == me }
-                                                val to = entry.tabs.indexOfFirst { it.id == target.id }
-                                                lastSwap = now
-                                                onReorder(me, target.id, to > from)
-                                            }
+                                            finger += amount // swapping + auto-scroll happen in the frame loop above
                                         },
                                         onDragEnd = { dragId = null },
                                         onDragCancel = { dragId = null }
@@ -4434,7 +4515,7 @@ private fun highlight(text: String, term: String): androidx.compose.ui.text.Anno
             append(text)
         } else {
             append(text.substring(0, i))
-            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(text.substring(i, i + term.length)) }
+            withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(text.substring(i, i + term.length)) }
             append(text.substring(i + term.length))
         }
     }
@@ -4443,7 +4524,7 @@ private fun suggestionText(s: String, term: String): androidx.compose.ui.text.An
     buildAnnotatedString {
         if (s.startsWith(term, ignoreCase = true)) {
             append(s.substring(0, term.length))
-            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(s.substring(term.length)) }
+            withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(s.substring(term.length)) }
         } else {
             append(s)
         }
@@ -4669,7 +4750,7 @@ private fun LinkLibraryPanel(
 ) {
     Column(Modifier.fillMaxSize().background(Bg).padding(17.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(title, color = TextMain, fontSize = 23.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Text(title, color = TextMain, fontSize = 23.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
             IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Close", tint = TextMain) }
         }
         if (entries.isEmpty()) {
@@ -4747,7 +4828,7 @@ private fun TabCountButton(count: Int, selected: Boolean, onClick: () -> Unit) {
             Text(
                 if (count > 99) ":D" else count.toString(),
                 color = if (selected) Accent else TextMain,
-                fontSize = 11.sp, fontWeight = FontWeight.Bold
+                fontSize = 11.sp, fontWeight = FontWeight.Medium
             )
         }
     }
@@ -4801,7 +4882,7 @@ private fun SiteBadge(tab: BrowserTab, size: androidx.compose.ui.unit.Dp) {
         ) {
             Text(
                 host.first().uppercaseChar().toString(),
-                color = Color.White, fontSize = (size.value * 0.5f).sp, fontWeight = FontWeight.Bold
+                color = Color.White, fontSize = (size.value * 0.5f).sp, fontWeight = FontWeight.Medium
             )
         }
     }

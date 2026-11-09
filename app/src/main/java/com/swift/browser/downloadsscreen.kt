@@ -16,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -85,6 +86,22 @@ fun DownloadsScreen(onClose: () -> Unit, onOpenSettings: () -> Unit) {
     var filter by remember { mutableStateOf("All") }
     var searching by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
+    // Removed rows are hidden at once; the file is really deleted only after the Undo bar goes away.
+    val pending = remember { mutableStateMapOf<Long, Boolean>() } // id -> also delete file
+    val snack = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    fun commit(id: Long) { pending.remove(id)?.let { DownloadEngine.remove(id, it) } }
+    DisposableEffect(Unit) { onDispose { pending.keys.toList().forEach { commit(it) } } }
+    val onRemove: (DownloadItem, Boolean) -> Unit = { d, deleteFile ->
+        pending[d.id] = deleteFile
+        scope.launch {
+            val r = snack.showSnackbar(
+                message = (if (deleteFile) "Deleted " else "Removed ") + d.filename,
+                actionLabel = "Undo", duration = SnackbarDuration.Short
+            )
+            if (r == SnackbarResult.ActionPerformed) pending.remove(d.id) else commit(d.id)
+        }
+    }
     val totalSpace = remember {
         runCatching {
             android.os.StatFs(android.os.Environment.getExternalStorageDirectory().path).totalBytes
@@ -92,16 +109,17 @@ fun DownloadsScreen(onClose: () -> Unit, onOpenSettings: () -> Unit) {
     }
     val fmt = { n: Long -> android.text.format.Formatter.formatFileSize(context, n) }
 
-    val shown = all.filter {
+    val shown = all.filter { !pending.containsKey(it.id) }.filter {
         (filter == "All" || kindOf(it) == filter) && (query.isBlank() || it.filename.contains(query, true))
     }
     val active = shown.filter { it.state != DlState.DONE }.sortedByDescending { it.created }
     val finished = shown.filter { it.state == DlState.DONE }.sortedByDescending { it.finished }
     val byDay = LinkedHashMap<String, MutableList<DownloadItem>>()
     finished.forEach { byDay.getOrPut(dayLabel(it.finished)) { mutableListOf() }.add(it) }
-    val used = all.filter { it.state == DlState.DONE }.sumOf { maxOf(it.total, it.done) }
+    val used = all.filter { it.state == DlState.DONE && !pending.containsKey(it.id) }.sumOf { maxOf(it.total, it.done) }
 
-    Column(Modifier.fillMaxSize().background(DBg)) {
+    Box(Modifier.fillMaxSize().background(DBg)) {
+    Column(Modifier.fillMaxSize()) {
         Row(
             Modifier.fillMaxWidth().padding(start = 17.dp, end = 6.dp, top = 10.dp, bottom = 2.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -177,14 +195,24 @@ fun DownloadsScreen(onClose: () -> Unit, onOpenSettings: () -> Unit) {
             LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(bottom = 24.dp)) {
                 if (active.isNotEmpty()) {
                     item(key = "h-now") { SectionTitle("Just now") }
-                    items(active, key = { it.id }) { d -> DownloadRowItem(d, fmt) }
+                    items(active, key = { it.id }) { d -> DownloadRowItem(d, fmt, onRemove) }
                 }
                 byDay.forEach { (label, list) ->
                     item(key = "h-$label") { SectionTitle(label) }
-                    items(list, key = { it.id }) { d -> DownloadRowItem(d, fmt) }
+                    items(list, key = { it.id }) { d -> DownloadRowItem(d, fmt, onRemove) }
                 }
             }
         }
+    }
+    SnackbarHost(
+        hostState = snack,
+        modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(12.dp)
+    ) { data ->
+        Snackbar(
+            snackbarData = data, containerColor = Color(0xFF2B2E34),
+            contentColor = DText, actionColor = DRing, shape = RoundedCornerShape(16.dp)
+        )
+    }
     }
 }
 
@@ -207,7 +235,7 @@ private fun etaText(d: DownloadItem): String? {
 }
 
 @Composable
-private fun DownloadRowItem(d: DownloadItem, fmt: (Long) -> String) {
+private fun DownloadRowItem(d: DownloadItem, fmt: (Long) -> String, onRemove: (DownloadItem, Boolean) -> Unit) {
     val context = LocalContext.current
     val done = d.state == DlState.DONE
     val failed = d.state == DlState.FAILED
@@ -293,11 +321,11 @@ private fun DownloadRowItem(d: DownloadItem, fmt: (Long) -> String) {
                     }
                     MenuItem("Remove from list", Icons.Default.PlaylistRemove) {
                         menu = false
-                        DownloadEngine.remove(d.id, deleteFile = false)
+                        onRemove(d, false)
                     }
                     MenuItem("Delete file", Icons.Default.Delete) {
                         menu = false
-                        DownloadEngine.remove(d.id, deleteFile = true)
+                        onRemove(d, true)
                     }
                 }
             }

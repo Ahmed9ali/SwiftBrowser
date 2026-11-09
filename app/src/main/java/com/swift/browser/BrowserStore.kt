@@ -28,7 +28,24 @@ class BrowserStore(context: Context) {
         writePairs("history", items.take(500))
     }
 
-    fun clearHistory() = prefs.edit().remove("history").apply()
+    fun clearHistory() = prefs.edit().remove("history").remove("queries").apply()
+
+    /** Things typed into the address bar as searches (newest first), for suggestions. */
+    fun queries(): List<String> {
+        val raw = prefs.getString("queries", null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { arr.getString(it) }
+        }.getOrDefault(emptyList())
+    }
+
+    fun addQuery(q: String) {
+        val t = q.trim()
+        if (t.isEmpty()) return
+        val items = queries().filterNot { it.equals(t, ignoreCase = true) }.toMutableList()
+        items.add(0, t)
+        prefs.edit().putString("queries", JSONArray(items.take(200)).toString()).apply()
+    }
 
     private fun readPairs(key: String): List<Pair<String, String>> {
         val raw = prefs.getString(key, null) ?: return emptyList()
