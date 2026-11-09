@@ -45,7 +45,9 @@ data class DownloadItem(
     val created: Long = System.currentTimeMillis(),
     val finished: Long = 0L,
     val uri: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    /** Bytes finished per segment when downloaded over several connections (empty = single stream). */
+    val segs: List<Long> = emptyList()
 )
 
 /**
@@ -76,6 +78,11 @@ object DownloadEngine {
             prefs().edit().putInt("max_parallel", v.coerceIn(1, 8)).apply()
             pump()
         }
+
+    /** Connections used for one file (like IDM / ADM). 1 = off. */
+    var connections: Int
+        get() = prefs().getInt("connections", 6)
+        set(v) { prefs().edit().putInt("connections", v.coerceIn(1, 16)).apply() }
 
     private fun prefs() = app.getSharedPreferences("swift_dl_engine", Context.MODE_PRIVATE)
 
@@ -199,72 +206,59 @@ object DownloadEngine {
 
     // ---------- worker (background thread) ----------
 
+    private const val MIN_SEG = 512 * 1024L // don't split small files
+
+    private fun open(item: DownloadItem, url: String, range: String?): HttpURLConnection =
+        (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 20_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", item.userAgent ?: android.webkit.WebSettings.getDefaultUserAgent(app))
+            setRequestProperty("Accept", "*/*")
+            setRequestProperty("Accept-Encoding", "identity")
+            item.referer?.takeIf { it.startsWith("http") }?.let { setRequestProperty("Referer", it) }
+            item.cookie?.takeIf { it.isNotBlank() }?.let { setRequestProperty("Cookie", it) }
+            if (range != null) setRequestProperty("Range", range)
+        }
+
     private fun work(first: DownloadItem) {
         val id = first.id
         val flag = flags[id] ?: return
         val part = partFile(id)
-        var conn: HttpURLConnection? = null
         try {
-            var offset = if (part.exists()) part.length() else 0L
-            conn = (URL(first.url).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15_000
-                readTimeout = 20_000
-                instanceFollowRedirects = true
-                setRequestProperty("User-Agent", first.userAgent ?: android.webkit.WebSettings.getDefaultUserAgent(app))
-                setRequestProperty("Accept", "*/*")
-                setRequestProperty("Accept-Encoding", "identity")
-                first.referer?.takeIf { it.startsWith("http") }?.let { setRequestProperty("Referer", it) }
-                first.cookie?.takeIf { it.isNotBlank() }?.let { setRequestProperty("Cookie", it) }
-                if (offset > 0) setRequestProperty("Range", "bytes=$offset-")
+            // 1. Probe: does the server do ranges, and how big is the file?
+            var url = first.url
+            var total = first.total
+            var ranged = first.segs.isNotEmpty()
+            var serverMime: String? = null
+            if (!ranged || total <= 0) {
+                val probe = open(first, first.url, "bytes=0-0")
+                try {
+                    val code = probe.responseCode
+                    url = probe.url.toString()
+                    serverMime = probe.contentType?.substringBefore(';')?.trim()
+                    if (code == 206) {
+                        total = probe.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: -1L
+                        ranged = total > 0
+                    } else if (code in 200..299) {
+                        total = probe.contentLengthLong
+                        ranged = false
+                    } else throw java.io.IOException("Server returned $code")
+                } finally { runCatching { probe.disconnect() } }
             }
-            val code = conn.responseCode
-            if (code == 416 && offset > 0) {
-                // Everything was already downloaded.
-                finish(id, part, first, offset)
-                return
-            }
-            if (code !in 200..299) throw java.io.IOException("Server returned $code")
 
-            val append = code == 206 && offset > 0
-            if (!append) offset = 0L
-            val total = when {
-                code == 206 -> conn.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: -1L
-                else -> conn.contentLengthLong
+            val wanted = connections
+            val n = if (ranged && total >= MIN_SEG * 2) minOf(wanted.toLong(), total / MIN_SEG).toInt().coerceAtLeast(1) else 1
+            if (ranged && n > 1) {
+                multi(first, url, total, n, part, flag)
+            } else {
+                single(first, url, total, part, flag)
             }
-            val serverMime = conn.contentType?.substringBefore(';')?.trim()
-            postProgress(id, offset, total, 0L)
-
-            var done = offset
-            var lastPost = 0L
-            var lastBytes = done
-            var lastTime = System.currentTimeMillis()
-            conn.inputStream.use { input ->
-                FileOutputStream(part, append).use { out ->
-                    val buf = ByteArray(64 * 1024)
-                    while (true) {
-                        if (flag.get() != 0) break
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        out.write(buf, 0, n)
-                        done += n
-                        val now = System.currentTimeMillis()
-                        if (now - lastPost >= 400) {
-                            val speed = ((done - lastBytes) * 1000L / (now - lastTime).coerceAtLeast(1))
-                            lastBytes = done
-                            lastTime = now
-                            lastPost = now
-                            postProgress(id, done, total, speed)
-                        }
-                    }
-                }
-            }
+            val done = if (part.exists()) part.length() else 0L
             when (flag.get()) {
-                1 -> main.post { setState(id) { it.copy(state = DlState.PAUSED, speed = 0, done = done) }; after() }
-                2 -> { part.delete() }
-                else -> {
-                    if (total > 0 && done < total) throw java.io.IOException("Connection lost")
-                    finish(id, part, first.copy(mime = first.mime ?: serverMime), done)
-                }
+                1 -> {} // state already posted by the downloader
+                2 -> part.delete()
+                else -> finish(id, part, first.copy(mime = first.mime ?: serverMime), if (total > 0) total else done)
             }
         } catch (e: Exception) {
             val f = flag.get()
@@ -274,14 +268,124 @@ object DownloadEngine {
                 val msg = e.message ?: "Download failed"
                 main.post { setState(id) { it.copy(state = DlState.FAILED, speed = 0, error = msg) }; after() }
             }
-        } finally {
-            runCatching { conn?.disconnect() }
         }
     }
 
-    private fun postProgress(id: Long, done: Long, total: Long, speed: Long) {
+    /** One stream (server has no ranges, or file is tiny / unknown size). */
+    private fun single(first: DownloadItem, url: String, total: Long, part: File, flag: AtomicInteger) {
+        val id = first.id
+        var offset = if (part.exists() && first.segs.isEmpty()) part.length() else 0L
+        var conn = open(first, url, if (offset > 0) "bytes=$offset-" else null)
+        try {
+            val code = conn.responseCode
+            if (code == 416 && offset > 0) return
+            if (code !in 200..299) throw java.io.IOException("Server returned $code")
+            val append = code == 206 && offset > 0
+            if (!append) offset = 0L
+            var done = offset
+            var lastPost = 0L; var lastBytes = done; var lastTime = System.currentTimeMillis()
+            conn.inputStream.use { input ->
+                FileOutputStream(part, append).use { out ->
+                    val buf = ByteArray(128 * 1024)
+                    while (flag.get() == 0) {
+                        val r = input.read(buf)
+                        if (r < 0) break
+                        out.write(buf, 0, r)
+                        done += r
+                        val now = System.currentTimeMillis()
+                        if (now - lastPost >= 400) {
+                            val speed = (done - lastBytes) * 1000L / (now - lastTime).coerceAtLeast(1)
+                            lastBytes = done; lastTime = now; lastPost = now
+                            postProgress(id, done, total, speed, emptyList())
+                        }
+                    }
+                }
+            }
+            if (flag.get() == 1) { main.post { setState(id) { it.copy(state = DlState.PAUSED, speed = 0, done = done, total = total) }; after() }; return }
+            if (flag.get() == 0 && total > 0 && done < total) throw java.io.IOException("Connection lost")
+        } finally { runCatching { conn.disconnect() } }
+    }
+
+    /** Several connections, each filling its own slice of a pre-sized file. */
+    private fun multi(first: DownloadItem, url: String, total: Long, n: Int, part: File, flag: AtomicInteger) {
+        val id = first.id
+        val size = (total + n - 1) / n
+        val starts = LongArray(n) { it * size }
+        val ends = LongArray(n) { minOf((it + 1) * size, total) - 1 }
+        val got = java.util.concurrent.atomic.AtomicLongArray(n)
+        // Resume only if the old split matches this one.
+        if (first.segs.size == n && part.exists() && part.length() == total) {
+            for (i in 0 until n) got.set(i, first.segs[i].coerceIn(0, ends[i] - starts[i] + 1))
+        } else {
+            part.delete()
+        }
+        java.io.RandomAccessFile(part, "rw").use { it.setLength(total) }
+
+        val failure = java.util.concurrent.atomic.AtomicReference<Exception?>(null)
+        val threads = (0 until n).map { i ->
+            Thread({
+                var tries = 0
+                while (flag.get() == 0 && failure.get() == null) {
+                    val from = starts[i] + got.get(i)
+                    if (from > ends[i]) break
+                    try {
+                        val c = open(first, url, "bytes=$from-${ends[i]}")
+                        try {
+                            if (c.responseCode != 206) throw java.io.IOException("Server stopped supporting ranges (${c.responseCode})")
+                            java.io.RandomAccessFile(part, "rw").use { raf ->
+                                raf.seek(from)
+                                val buf = ByteArray(128 * 1024)
+                                c.inputStream.use { input ->
+                                    while (flag.get() == 0) {
+                                        val room = (ends[i] - starts[i] + 1 - got.get(i)).toInt()
+                                        if (room <= 0) break
+                                        val r = input.read(buf, 0, minOf(buf.size, room))
+                                        if (r < 0) break
+                                        raf.write(buf, 0, r)
+                                        got.addAndGet(i, r.toLong())
+                                    }
+                                }
+                            }
+                        } finally { runCatching { c.disconnect() } }
+                        tries = 0
+                    } catch (e: Exception) {
+                        if (flag.get() != 0) break
+                        if (++tries >= 4) { failure.compareAndSet(null, e); break }
+                        try { Thread.sleep(800L * tries) } catch (_: InterruptedException) {}
+                    }
+                }
+            }, "swift-dl-$id-$i").apply { start() }
+        }
+
+        var lastBytes = (0 until n).sumOf { got.get(it) }
+        var lastTime = System.currentTimeMillis()
+        var speed = 0L
+        while (threads.any { it.isAlive }) {
+            try { Thread.sleep(350) } catch (_: InterruptedException) {}
+            val now = System.currentTimeMillis()
+            val done = (0 until n).sumOf { got.get(it) }
+            val inst = (done - lastBytes) * 1000L / (now - lastTime).coerceAtLeast(1)
+            speed = if (speed == 0L) inst else (speed * 6 + inst * 4) / 10 // light smoothing
+            lastBytes = done; lastTime = now
+            postProgress(id, done, total, speed, (0 until n).map { got.get(it) })
+        }
+        threads.forEach { it.join() }
+        val segsNow = (0 until n).map { got.get(it) }
+        val done = segsNow.sum()
+        failure.get()?.let { if (flag.get() == 0) throw it }
+        when (flag.get()) {
+            1 -> { main.post { setState(id) { it.copy(state = DlState.PAUSED, speed = 0, done = done, total = total, segs = segsNow) }; after() } }
+            0 -> if (done < total) throw java.io.IOException("Connection lost")
+        }
+    }
+
+    private var lastSave = 0L
+
+    private fun postProgress(id: Long, done: Long, total: Long, speed: Long, segs: List<Long>) {
         main.post {
-            setState(id) { it.copy(done = done, total = total, speed = speed) }
+            setState(id) { it.copy(done = done, total = total, speed = speed, segs = segs) }
+            val now = System.currentTimeMillis()
+            if (now - lastSave > 3000) { lastSave = now; save() } // so a crash can still resume
             onTick?.invoke()
         }
     }
@@ -331,7 +435,7 @@ object DownloadEngine {
                     it.copy(
                         state = DlState.DONE, done = size, total = maxOf(size, it.total), speed = 0,
                         finished = System.currentTimeMillis(), uri = finalUri, filename = finalName,
-                        mime = mime, error = null
+                        mime = mime, error = null, segs = emptyList()
                     )
                 }
                 after()
@@ -390,6 +494,7 @@ object DownloadEngine {
                     .put("state", d.state.name).put("done", d.done).put("total", d.total)
                     .put("created", d.created).put("finished", d.finished)
                     .put("uri", d.uri ?: JSONObject.NULL).put("err", d.error ?: JSONObject.NULL)
+                    .put("segs", JSONArray(d.segs))
             )
         }
         prefs().edit().putString("items", arr.toString()).apply()
@@ -410,7 +515,8 @@ object DownloadEngine {
                         state = runCatching { DlState.valueOf(o.getString("state")) }.getOrDefault(DlState.PAUSED),
                         done = o.optLong("done"), total = o.optLong("total", -1L),
                         created = o.optLong("created"), finished = o.optLong("finished"),
-                        uri = o.str("uri"), error = o.str("err")
+                        uri = o.str("uri"), error = o.str("err"),
+                        segs = o.optJSONArray("segs")?.let { a -> (0 until a.length()).map { a.getLong(it) } } ?: emptyList()
                     )
                 )
             }
@@ -458,15 +564,32 @@ object DownloadEngine {
         }
     }
 
+    private fun size(c: Context, n: Long) = android.text.format.Formatter.formatFileSize(c, n)
+
+    private fun eta(secs: Long) = when {
+        secs < 60 -> "$secs secs left"
+        secs < 3600 -> "${secs / 60} min ${secs % 60} secs left"
+        else -> "${secs / 3600} hr ${(secs % 3600) / 60} min left"
+    }
+
     /** Builds the single ongoing notification shown by the foreground service. */
     fun progressNotification(c: Context): Notification {
         ensureChannels(c)
         val active = items.filter { it.state == DlState.RUNNING || it.state == DlState.QUEUED }
         val running = active.filter { it.state == DlState.RUNNING }
         val known = running.filter { it.total > 0 }
-        val pct = if (known.isNotEmpty()) (known.sumOf { it.done } * 100L / known.sumOf { it.total }).toInt() else -1
+        val done = known.sumOf { it.done }
+        val total = known.sumOf { it.total }
+        val speed = running.sumOf { it.speed }
+        val pct = if (total > 0) (done * 100L / total).toInt() else -1
         val title = if (active.size <= 1) (active.firstOrNull()?.filename ?: "Downloads")
         else "Downloading ${active.size} files"
+        val waiting = active.size - running.size
+        val text = buildString {
+            if (total > 0) append("${size(c, done)} / ${size(c, total)}") else append(size(c, running.sumOf { it.done }))
+            if (speed > 0 && total > done) append(" \u2022 ").append(eta((total - done) / speed))
+            if (waiting > 0) append(" \u2022 $waiting waiting")
+        }
         val open = PendingIntent.getActivity(
             c, 0, Intent(c, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE
@@ -474,11 +597,14 @@ object DownloadEngine {
         val b = NotificationCompat.Builder(c, CH_PROGRESS)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle(title)
+            .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-        if (pct >= 0) b.setProgress(100, pct, false).setContentText("$pct%")
-        else b.setProgress(0, 0, true)
+            .setShowWhen(false)
+        if (speed > 0) b.setSubText("${size(c, speed)}/s" + if (pct >= 0) " \u2022 $pct%" else "")
+        else if (pct >= 0) b.setSubText("$pct%")
+        if (pct >= 0) b.setProgress(100, pct, false) else b.setProgress(0, 0, true)
         return b.build()
     }
 }
@@ -538,9 +664,13 @@ class DownloadService : Service() {
         return START_NOT_STICKY
     }
 
+    private var pending = false
+
     private fun refresh() {
-        handler.removeCallbacksAndMessages(null)
+        if (pending) return
+        pending = true
         handler.postDelayed({
+            pending = false
             if (DownloadEngine.activeCount() == 0) {
                 DownloadEngine.onTick = null
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -549,7 +679,7 @@ class DownloadService : Service() {
                 getSystemService(NotificationManager::class.java)
                     .notify(NOTIF_ID, DownloadEngine.progressNotification(this))
             }
-        }, 300)
+        }, 500)
     }
 
     override fun onDestroy() {

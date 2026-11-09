@@ -537,6 +537,8 @@ private fun SwiftBrowserApp() {
     var pendingEditGroup by remember { mutableStateOf<Long?>(null) }
     var showGroupSheet by remember { mutableStateOf(false) }
     var confirmCloseAll by remember { mutableStateOf(false) }
+    // Closing all only touches the kind of tab you are looking at (private vs normal).
+    val closeAllPrivate = showTabs && tabSection == 2
     var editGroupKey by remember { mutableStateOf<Long?>(null) }
     var colorPickKey by remember { mutableStateOf<Long?>(null) }
     var showAddToGroup by remember { mutableStateOf(false) }
@@ -890,6 +892,14 @@ private fun SwiftBrowserApp() {
         showTabs = false
     }
 
+    // "+" in the Groups section: a brand-new group that holds one fresh tab.
+    fun newGroupWithTab() {
+        val gid = groupCounter++
+        val id = idCounter.get()
+        newTab()
+        tabGroups[id] = gid
+        groupUpdated[gid] = System.currentTimeMillis()
+    }
     fun newTabInGroup(gid: Long) {
         val id = idCounter.get()
         newTab()
@@ -1029,7 +1039,7 @@ private fun SwiftBrowserApp() {
     // Delete-all action: closes every tab and lands on a fresh home tab.
     fun closeAllTabs() {
         // Closes the tabs of the section you are looking at (normal or private).
-        val priv = tabSection == 2
+        val priv = showTabs && tabSection == 2
         tabs.filter { it.isPrivate == priv }.forEach { recordClosed(it) }
         tabs.removeAll { it.isPrivate == priv }
         if (!priv) {
@@ -2207,7 +2217,7 @@ private fun SwiftBrowserApp() {
                         onReorder = { src, tgt, after -> moveEntry(src, tgt, after) },
                         onSelect = { selectTab(it) },
                         onClose = { closeTab(it) },
-                        onNew = { newTab(private = tabSection == 2) },
+                        onNew = { if (tabSection == 1) newGroupWithTab() else newTab(private = tabSection == 2) },
                         onGroup = { source, target -> handleGroupDrop(source, target) },
                         onDropOutside = { handleDropOutside(it) },
                         onGroupAll = { groupAllTabs() },
@@ -2374,7 +2384,9 @@ private fun SwiftBrowserApp() {
                             .align(Alignment.Center)
                             .clip(RoundedCornerShape(22.dp))
                             .background(Color(0xFFE8E8EC))
-                            .clickable { newTab(private = tabSection == 2) }
+                            .clickable {
+                                if (showTabs && tabSection == 1) newGroupWithTab() else newTab(private = showTabs && tabSection == 2)
+                            }
                             .padding(horizontal = 14.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -2758,10 +2770,11 @@ private fun SwiftBrowserApp() {
             AlertDialog(
                 onDismissRequest = { confirmCloseAll = false },
                 containerColor = Surface,
-                title = { Text("Close all tabs?", color = TextMain) },
+                title = { Text(if (closeAllPrivate) "Close all private tabs?" else "Close all tabs?", color = TextMain) },
                 text = {
                     Text(
-                        "You are about to close all ${tabs.size} open tabs. This can't be undone.",
+                        if (closeAllPrivate) "You are about to close ${tabs.count { it.isPrivate }} private tabs. Your normal tabs stay open."
+                        else "You are about to close ${tabs.count { !it.isPrivate }} open tabs. Your private tabs stay open. This can't be undone.",
                         color = TextMuted
                     )
                 },
