@@ -83,6 +83,8 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Path
@@ -255,11 +257,13 @@ private fun desktopEquivalent(url: String, desktop: Boolean): String {
 private const val LANG_JS = """
 (function(){
  var l=(document.documentElement.lang||'').toLowerCase().split('-')[0].split('_')[0];
- var t=((document.body&&document.body.innerText)||'').slice(0,1500);
- var sc=[['zh',/[\u4e00-\u9fff]/g],['ja',/[\u3040-\u30ff]/g],['ko',/[\uac00-\ud7af]/g],['ru',/[\u0400-\u04ff]/g],['ar',/[\u0600-\u06ff]/g],['hi',/[\u0900-\u097f]/g],['th',/[\u0e00-\u0e7f]/g],['he',/[\u0590-\u05ff]/g],['el',/[\u0370-\u03ff]/g]];
+ var t=((document.body&&document.body.innerText)||'').slice(0,9000);
+ // Letters only: spaces, digits and punctuation must not dilute the share of a script.
+ var letters=t.replace(/[\s\d!-\/:-@\[-`{-~\u2000-\u206f\u3000-\u303f\uff00-\uff0f]/g,'').length||1;
+ var sc=[['zh',/[\u4e00-\u9fff]/g,0.06,30],['ja',/[\u3040-\u30ff]/g,0.04,30],['ko',/[\uac00-\ud7af]/g,0.06,30],['ru',/[\u0400-\u04ff]/g,0.15,20],['ar',/[\u0600-\u06ff]/g,0.15,20],['hi',/[\u0900-\u097f]/g,0.15,20],['th',/[\u0e00-\u0e7f]/g,0.15,20],['he',/[\u0590-\u05ff]/g,0.15,20],['el',/[\u0370-\u03ff]/g,0.15,20]];
  var best='',bn=0;
- sc.forEach(function(s){var m=t.match(s[1]);var n=m?m.length:0;if(n>bn){bn=n;best=s[0];}});
- if(bn>=20&&bn>t.length*0.15){ if(best==='zh'&&/[\u3040-\u30ff]/.test(t)) best='ja'; return best; }
+ sc.forEach(function(s){var m=t.match(s[1]);var n=m?m.length:0;if(n>=s[3]&&n/letters>=s[2]&&n>bn){bn=n;best=s[0];}});
+ if(best){ if(best==='zh'&&/[\u3040-\u30ff]/.test(t)) best='ja'; return best; }
  return (l&&l.length>=2&&l.length<=3)?l:'';
 })()
 """
@@ -1062,6 +1066,20 @@ private fun SwiftBrowserApp() {
         Toast.makeText(context, if (priv) "Private tabs closed" else "All tabs closed", Toast.LENGTH_SHORT).show()
     }
 
+    // Failed first loads: how often each URL was retried, and which URLs just errored.
+    val retryCounts = HashMap<String, Int>()
+    val erroredUrls = HashSet<String>()
+
+    // Swipe on the address bar: next / previous tab of the same kind (normal or private).
+    fun switchAdjacentTab(dir: Int) {
+        val cur = tabs.firstOrNull { it.id == activeId } ?: return
+        val pool = tabs.filter { it.isPrivate == cur.isPrivate }
+        val i = pool.indexOfFirst { it.id == activeId }
+        val next = pool.getOrNull(i + dir) ?: return
+        captureThumb(activeId)
+        selectTab(next)
+    }
+
     fun deviceLang(): String = java.util.Locale.getDefault().language
 
     fun applyDesktopJs(view: WebView?, tabId: Long) {
@@ -1330,6 +1348,29 @@ private fun SwiftBrowserApp() {
                     return null
                 }
 
+                // First loads often fail with a DNS / connection error and work a moment later
+                // (cold radio, slow resolver). Retry the page quietly a couple of times first.
+                override fun onReceivedError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    error: android.webkit.WebResourceError?
+                ) {
+                    super.onReceivedError(view, request, error)
+                    if (request?.isForMainFrame != true || view == null) return
+                    val code = error?.errorCode ?: return
+                    val retryable = code == WebViewClient.ERROR_HOST_LOOKUP || code == WebViewClient.ERROR_CONNECT ||
+                        code == WebViewClient.ERROR_TIMEOUT || code == WebViewClient.ERROR_IO
+                    val failed = request.url.toString()
+                    erroredUrls.add(failed)
+                    val tries = retryCounts[failed] ?: 0
+                    if (retryable && tries < 3) {
+                        retryCounts[failed] = tries + 1
+                        view.postDelayed({
+                            if (webViews[tabId] === view && (view.url == failed || view.originalUrl == failed)) view.loadUrl(failed)
+                        }, 500L * (tries + 1))
+                    }
+                }
+
                 override fun onPageStarted(
                     view: WebView?,
                     url: String?,
@@ -1357,6 +1398,7 @@ private fun SwiftBrowserApp() {
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (url == null || url.startsWith("about:")) return
+                    if (url in erroredUrls) erroredUrls.remove(url) else retryCounts.remove(url)
                     applyDesktopJs(view, tabId)
                     updateTabById(tabId, url = url)
                     refreshLayouts[tabId]?.endRefresh()
@@ -1618,6 +1660,19 @@ private fun SwiftBrowserApp() {
                 Row(
                     Modifier.weight(1f).height(46.dp).clip(RoundedCornerShape(24.dp))
                         .background(if (addressFocused) Surface3 else Surface2)
+                        .pointerInput(addressFocused) {
+                            if (addressFocused) return@pointerInput // typing: drags select text instead
+                            var total = 0f
+                            detectHorizontalDragGestures(
+                                onDragStart = { total = 0f },
+                                onHorizontalDrag = { change, dx -> total += dx; change.consume() },
+                                onDragEnd = {
+                                    if (kotlin.math.abs(total) > 64.dp.toPx()) switchAdjacentTab(if (total < 0) 1 else -1)
+                                    total = 0f
+                                },
+                                onDragCancel = { total = 0f }
+                            )
+                        }
                         .padding(start = 8.dp, end = 14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -2027,7 +2082,11 @@ private fun SwiftBrowserApp() {
                         Icon(Icons.Default.Download, null, tint = TextMuted, modifier = Modifier.size(26.dp))
                         Spacer(Modifier.width(14.dp))
                         Column(Modifier.weight(1f)) {
-                            Text("Downloading file\u2026", color = TextMain, fontSize = 17.sp)
+                            val activeDl = DownloadEngine.items.count { it.state == DlState.RUNNING || it.state == DlState.QUEUED }
+                            Text(
+                                if (activeDl > 1) "Downloading $activeDl files\u2026" else "Downloading file\u2026",
+                                color = TextMain, fontSize = 17.sp
+                            )
                             Text(
                                 if (appSettings.downloadNotifications) "See notification for download status"
                                 else "See Downloads for download status",
@@ -2180,7 +2239,7 @@ private fun SwiftBrowserApp() {
                         (term.contains('.') || term.startsWith("localhost") || term.startsWith("http"))
                     val isPrivateNow = tabs.firstOrNull { it.id == activeId }?.isPrivate == true
 
-                    // Sites you've been to / bookmarked: best matches first, at most 4.
+                    // Sites you've been to / bookmarked: best matches first, at most 2 (so the keyboard never hides them).
                     val siteHits = remember(term, showSuggestions) {
                         val bm = bookmarksNow().map { Triple(it.first, it.second, true) }
                         val hist = store.history().map { Triple(it.first, it.second, false) }
@@ -2197,17 +2256,17 @@ private fun SwiftBrowserApp() {
                                 }
                                 score to h
                             }
-                            .sortedBy { it.first }.map { it.second }.take(4)
+                            .sortedBy { it.first }.map { it.second }.take(2)
                     }
                     // Searches you typed before that match (not in private tabs).
                     val pastQueries = remember(term, showSuggestions) {
                         if (isPrivateNow) emptyList()
                         else store.queries().filter { it.startsWith(term, true) && !it.equals(term, true) }.take(2)
                     }
-                    // 3-4 keyword suggestions: your past searches first, then the engine's.
+                    // 3 keyword suggestions: your past searches first, then the engine's.
                     val keywordRows = (pastQueries.map { it to true } +
                         webSuggestions.filter { w -> pastQueries.none { it.equals(w, true) } }.map { it to false })
-                        .take(4)
+                        .take(3)
 
                     Column(
                         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
@@ -4209,7 +4268,7 @@ private fun GroupPopupOverlay(
                 y > b.bottom - edge -> ((y - (b.bottom - edge)).coerceAtMost(edge) / edge) * maxStep
                 else -> 0f
             }
-            if (dy != 0f) gridState.dispatchRawDelta(dy)
+            if (dy != 0f) gridState.scrollBy(dy) // + = toward the end of the list, - = toward the start
             val now = System.currentTimeMillis()
             if (now - lastSwap > 260) {
                 val tabsNow = liveEntry.tabs
