@@ -73,6 +73,12 @@ import android.os.Parcel
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -83,7 +89,6 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -266,6 +271,48 @@ private const val LANG_JS = """
  if(best){ if(best==='zh'&&/[\u3040-\u30ff]/.test(t)) best='ja'; return best; }
  return (l&&l.length>=2&&l.length<=3)?l:'';
 })()
+"""
+
+// Long-press on a video: finds the <video> under the finger (also inside shadow DOM, like Reddit's
+// player) and its direct file URL when the page exposes one.
+private const val VIDEO_PROBE_JS = """
+(function(x,y){
+ var all=[];
+ function deep(root){try{root.querySelectorAll('video').forEach(function(v){all.push(v);});
+  root.querySelectorAll('*').forEach(function(n){if(n.shadowRoot)deep(n.shadowRoot);});}catch(e){}}
+ deep(document);
+ var v=null,area=1e12;
+ all.forEach(function(e){var r=e.getBoundingClientRect();
+  if(x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom&&r.width*r.height<area){v=e;area=r.width*r.height;}});
+ if(!v) return '';
+ window.__swiftLpVideo=v;
+ var src=v.currentSrc||v.src||'';
+ if(!src||src.indexOf('blob:')===0||/\.m3u8|\.mpd/i.test(src)){
+  var found='';
+  var ss=v.querySelectorAll('source');
+  for(var j=0;j<ss.length;j++){if(/^https?:/.test(ss[j].src)&&!/\.m3u8|\.mpd/i.test(ss[j].src)){found=ss[j].src;break;}}
+  if(!found){try{var rs=performance.getEntriesByType('resource');
+   for(var k=rs.length-1;k>=0;k--){var n=rs[k].name;
+    if(/\.(mp4|webm|m4v|mov)(\?|#|$)/i.test(n)||/\/DASH_\d+/i.test(n)){found=n;break;}}}catch(e){}}
+  src=found;
+ }
+ return JSON.stringify({src:src});
+})(__X__,__Y__)
+"""
+
+private const val VIDEO_FRAME_JS = """
+(function(){var v=window.__swiftLpVideo;if(!v||!v.videoWidth)return '';
+ try{var s=Math.min(1,1600/v.videoWidth);var c=document.createElement('canvas');
+  c.width=Math.round(v.videoWidth*s);c.height=Math.round(v.videoHeight*s);
+  c.getContext('2d').drawImage(v,0,0,c.width,c.height);return c.toDataURL('image/jpeg',0.92);}
+ catch(e){return '';}})()
+"""
+
+private const val VIDEO_FULLSCREEN_JS = """
+(function(){var v=window.__swiftLpVideo;if(!v)return;
+ try{if(v.paused)v.play();}catch(e){}
+ var f=v.requestFullscreen||v.webkitRequestFullscreen||v.webkitEnterFullscreen;
+ if(f){try{f.call(v);}catch(e){}}})()
 """
 
 // Desktop site: Chrome-style. Forces a wide layout viewport (pages that ask for
@@ -566,6 +613,17 @@ private fun SwiftBrowserApp() {
     // flight must not pop the "translated" card straight back afterwards.
     var translateDismissedUrl by remember { mutableStateOf<String?>(null) }
     var contextMenu by remember { mutableStateOf<ContextTarget?>(null) }
+    // Long-press on a video: Brave-style menu (download, frame, picture-in-picture).
+    var videoTarget by remember { mutableStateOf<VideoTarget?>(null) }
+    var videoTabId by remember { mutableLongStateOf(0L) }
+    // Full screen video (WebView custom view).
+    var fullscreenView by remember { mutableStateOf<android.view.View?>(null) }
+    var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
+    // Swipe on the address bar: the page turns like a book page to the next / previous tab.
+    var swipeActive by remember { mutableStateOf(false) }
+    var swipeP by remember { mutableFloatStateOf(0f) } // -1..1, negative = dragging left (next tab)
+    var swipeCur by remember { mutableStateOf<Bitmap?>(null) }
+    val swipeGen = remember { IntArray(1) }
     var pendingLogin by remember { mutableStateOf<PendingLogin?>(null) }
     val passwordStore = remember { PasswordStore(context) }
     var settingsEntry by remember { mutableStateOf("main") }
@@ -820,6 +878,27 @@ private fun SwiftBrowserApp() {
         if (index >= 0) tabs[index] = tabs[index].copy(url = url, title = title, blockedCount = count)
     }
 
+    // ---- HTTPS first (like Brave): try https for http links, fall back if the site has none ----
+    val httpsUpgrades = remember { HashMap<String, String>() }   // https url we tried -> original http url
+    val noUpgradeHosts = remember { HashSet<String>() }
+    val lastUpgradeAt = remember { HashMap<String, Long>() }
+
+    fun httpsFirst(url: String): String {
+        if (!url.startsWith("http://")) return url
+        val uri = Uri.parse(url)
+        val host = uri.host ?: return url
+        if (uri.port != -1 || host in noUpgradeHosts || host == "localhost" || host.endsWith(".local") ||
+            host.contains(':') || Regex("^[0-9.]+$").matches(host)
+        ) return url
+        val now = System.currentTimeMillis()
+        // The site sent us straight back to http: stop upgrading it.
+        if (now - (lastUpgradeAt[host] ?: 0L) < 6000L) { noUpgradeHosts.add(host); return url }
+        lastUpgradeAt[host] = now
+        val https = "https://" + url.removePrefix("http://")
+        httpsUpgrades[https] = url
+        return https
+    }
+
     fun normalize(input: String): String {
         val value = input.trim()
 
@@ -875,7 +954,7 @@ private fun SwiftBrowserApp() {
             return
         }
 
-        val url = normalize(value)
+        val url = httpsFirst(normalize(value))
         if (url == appSettings.searchUrl(value) && tabs.firstOrNull { it.id == activeId }?.isPrivate != true) {
             store.addQuery(value) // typed searches feed the suggestions
         }
@@ -1067,17 +1146,176 @@ private fun SwiftBrowserApp() {
     }
 
     // Failed first loads: how often each URL was retried, and which URLs just errored.
-    val retryCounts = HashMap<String, Int>()
-    val erroredUrls = HashSet<String>()
+    val retryCounts = remember { HashMap<String, Int>() }
+    val erroredUrls = remember { HashSet<String>() }
 
-    // Swipe on the address bar: next / previous tab of the same kind (normal or private).
-    fun switchAdjacentTab(dir: Int) {
-        val cur = tabs.firstOrNull { it.id == activeId } ?: return
+    // ---- Swipe on the address bar: book-style page turn to the next / previous tab ----
+    // (same kind only: normal tabs stay with normal tabs, private with private)
+    fun neighborFor(dir: Int): BrowserTab? {
+        val cur = tabs.firstOrNull { it.id == activeId } ?: return null
         val pool = tabs.filter { it.isPrivate == cur.isPrivate }
         val i = pool.indexOfFirst { it.id == activeId }
-        val next = pool.getOrNull(i + dir) ?: return
-        captureThumb(activeId)
-        selectTab(next)
+        return pool.getOrNull(i + dir)
+    }
+
+    fun beginSwipe() {
+        val activity = context as? android.app.Activity ?: return
+        if (Build.VERSION.SDK_INT < 26 || webArea.isEmpty) return
+        val gen = ++swipeGen[0]
+        swipeP = 0f
+        val src = android.graphics.Rect(webArea)
+        val bmp = Bitmap.createBitmap(src.width(), src.height(), Bitmap.Config.ARGB_8888)
+        try {
+            // A full-size picture of the page, so it looks identical while it turns.
+            android.view.PixelCopy.request(
+                activity.window, src, bmp,
+                android.view.PixelCopy.OnPixelCopyFinishedListener { r ->
+                    if (r == android.view.PixelCopy.SUCCESS && swipeGen[0] == gen) {
+                        swipeCur = bmp
+                        swipeActive = true
+                    }
+                },
+                Handler(Looper.getMainLooper())
+            )
+        } catch (e: Exception) { /* no animation, the swipe just won't switch */ }
+    }
+
+    fun updateSwipe(totalPx: Float) {
+        val w = context.resources.displayMetrics.widthPixels.toFloat()
+        var p = (totalPx / (w * 0.85f)).coerceIn(-1f, 1f)
+        // No tab on that side: only a small elastic nudge.
+        if (neighborFor(if (p < 0) 1 else -1) == null) p = (p * 0.15f)
+        swipeP = p
+    }
+
+    fun endSwipe(velX: Float) {
+        swipeGen[0]++
+        if (!swipeActive) { swipeP = 0f; return }
+        val p = swipeP
+        val nb = neighborFor(if (p < 0) 1 else -1)
+        val flung = kotlin.math.abs(velX) > 900f && (velX < 0) == (p < 0)
+        val commit = nb != null && (kotlin.math.abs(p) > 0.33f || flung)
+        uiScope.launch {
+            animate(p, if (commit) (if (p < 0) -1f else 1f) else 0f, animationSpec = tween(if (commit) 190 else 160)) { v, _ -> swipeP = v }
+            if (commit && nb != null) {
+                selectTab(nb)
+                delay(120) // let the real page paint before the picture goes away
+            }
+            swipeActive = false
+            swipeP = 0f
+            swipeCur = null
+        }
+    }
+
+    // ---- Video: long-press menu, frame grab, picture-in-picture, fullscreen ----
+    fun probeVideoAt(wv: WebView, tabId: Long, px: Float, py: Float) {
+        @Suppress("DEPRECATION")
+        val sc = wv.scale.takeIf { it > 0f } ?: context.resources.displayMetrics.density
+        val js = VIDEO_PROBE_JS.replace("__X__", (px / sc).toString()).replace("__Y__", (py / sc).toString())
+        wv.evaluateJavascript(js) { raw ->
+            val str = runCatching { org.json.JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
+            if (str.startsWith("{")) {
+                val src = runCatching { org.json.JSONObject(str).optString("src") }.getOrNull()
+                    ?.takeIf { it.startsWith("http") }
+                videoTabId = tabId
+                videoTarget = VideoTarget(src, if (src != null) URLUtil.guessFileName(src, null, "video/mp4") else "Video")
+                wv.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                wv.evaluateJavascript("(function(){var s=window.getSelection&&window.getSelection();if(s)s.removeAllRanges();})()", null)
+            }
+        }
+    }
+
+    fun captureVideoFrame(onBitmap: (Bitmap?) -> Unit) {
+        val wv = webViews[videoTabId]
+        if (wv == null) { onBitmap(null); return }
+        wv.evaluateJavascript(VIDEO_FRAME_JS) { raw ->
+            val str = runCatching { org.json.JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
+            if (!str.startsWith("data:image")) { onBitmap(null); return@evaluateJavascript }
+            val bytes = runCatching { android.util.Base64.decode(str.substringAfter(','), android.util.Base64.DEFAULT) }.getOrNull()
+            onBitmap(bytes?.let { android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size) })
+        }
+    }
+
+    fun copyVideoFrame() {
+        captureVideoFrame { bmp ->
+            if (bmp == null) {
+                Toast.makeText(context, "Can't capture a frame from this video", Toast.LENGTH_SHORT).show()
+                return@captureVideoFrame
+            }
+            runCatching {
+                val dir = File(context.cacheDir, "video_frames").apply { mkdirs() }
+                val f = File(dir, "frame.jpg")
+                f.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+                val uri = androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".fileprovider", f)
+                val cm = context.getSystemService(android.content.ClipboardManager::class.java)
+                cm.setPrimaryClip(android.content.ClipData.newUri(context.contentResolver, "Video frame", uri))
+                Toast.makeText(context, "Video frame copied", Toast.LENGTH_SHORT).show()
+            }.onFailure {
+                Toast.makeText(context, "Couldn't copy the frame", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    fun saveVideoFrame() {
+        captureVideoFrame { bmp ->
+            if (bmp == null) {
+                Toast.makeText(context, "Can't capture a frame from this video", Toast.LENGTH_SHORT).show()
+                return@captureVideoFrame
+            }
+            runCatching {
+                val name = "video_frame_" + System.currentTimeMillis() + ".jpg"
+                if (Build.VERSION.SDK_INT >= 29) {
+                    val cv = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, name)
+                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                        put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SwiftBrowser")
+                    }
+                    val uri = context.contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                        ?: throw java.io.IOException("insert failed")
+                    context.contentResolver.openOutputStream(uri)!!.use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                } else {
+                    val dir = context.getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES) ?: context.filesDir
+                    File(dir, name).outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                }
+                Toast.makeText(context, "Frame saved to Pictures", Toast.LENGTH_SHORT).show()
+            }.onFailure {
+                Toast.makeText(context, "Couldn't save the frame", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    fun exitFullscreen() {
+        val v = fullscreenView ?: return
+        val act = context as? android.app.Activity
+        (v.parent as? android.view.ViewGroup)?.removeView(v)
+        fullscreenView = null
+        fullscreenCallback?.onCustomViewHidden()
+        fullscreenCallback = null
+        if (act != null) {
+            androidx.core.view.WindowCompat.getInsetsController(act.window, act.window.decorView)
+                .show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            act.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+    }
+
+    // Picture-in-Picture: the video goes full screen, then the window shrinks to the video.
+    fun startPictureInPicture() {
+        val wv = webViews[videoTabId] ?: return
+        wv.evaluateJavascript(VIDEO_FULLSCREEN_JS, null)
+        uiScope.launch {
+            delay(600)
+            val act = context as? android.app.Activity
+            if (fullscreenView != null && act != null && Build.VERSION.SDK_INT >= 26) {
+                runCatching {
+                    act.enterPictureInPictureMode(
+                        android.app.PictureInPictureParams.Builder()
+                            .setAspectRatio(android.util.Rational(16, 9)).build()
+                    )
+                }.onFailure { Toast.makeText(context, "Picture-in-Picture isn't available", Toast.LENGTH_SHORT).show() }
+            } else {
+                Toast.makeText(context, "Picture-in-Picture isn't available for this video", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     fun deviceLang(): String = java.util.Locale.getDefault().language
@@ -1213,7 +1451,7 @@ private fun SwiftBrowserApp() {
             settings.setSupportMultipleWindows(false)
             settings.allowFileAccess = false
             settings.allowContentAccess = false
-            settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 settings.safeBrowsingEnabled = true
             }
@@ -1257,6 +1495,13 @@ private fun SwiftBrowserApp() {
                 }
             }, "SwiftPasswords")
 
+            // Remember where the finger went down (needed to find a video under a long press).
+            val lastTouch = FloatArray(2)
+            setOnTouchListener { _, ev ->
+                if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) { lastTouch[0] = ev.x; lastTouch[1] = ev.y }
+                false
+            }
+
             // Press and hold on a link or image: Brave-style menu.
             setOnLongClickListener { v ->
                 val wv = v as WebView
@@ -1268,6 +1513,8 @@ private fun SwiftBrowserApp() {
                 val isImage = type == WebView.HitTestResult.IMAGE_TYPE ||
                     type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
                 if ((!isLink && !isImage) || extra == null || extra.startsWith("javascript:")) {
+                    // Maybe a video: look under the finger (normal text selection still works).
+                    if (!isLink && !isImage) probeVideoAt(wv, tabId, lastTouch[0], lastTouch[1])
                     return@setOnLongClickListener false
                 }
                 wv.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
@@ -1284,6 +1531,29 @@ private fun SwiftBrowserApp() {
             }
 
             webChromeClient = object : WebChromeClient() {
+                override fun onShowCustomView(view: android.view.View?, callback: WebChromeClient.CustomViewCallback?) {
+                    val act = ctx as? android.app.Activity ?: (context as? android.app.Activity)
+                    if (view == null || act == null) { callback?.onCustomViewHidden(); return }
+                    if (fullscreenView != null) exitFullscreen()
+                    view.setBackgroundColor(android.graphics.Color.BLACK)
+                    (act.window.decorView as android.view.ViewGroup).addView(
+                        view,
+                        android.view.ViewGroup.LayoutParams(
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                    )
+                    fullscreenView = view
+                    fullscreenCallback = callback
+                    androidx.core.view.WindowCompat.getInsetsController(act.window, act.window.decorView).apply {
+                        systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                        hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                    }
+                    act.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR
+                }
+
+                override fun onHideCustomView() { exitFullscreen() }
+
                 override fun onReceivedTitle(view: WebView?, title: String?) {
                     val t = title ?: return
                     if (view?.url?.startsWith("about:") == true) return
@@ -1310,7 +1580,28 @@ private fun SwiftBrowserApp() {
                     request: WebResourceRequest?
                 ): Boolean {
                     val uri = request?.url ?: return false
+                    if (uri.scheme == "http" && request.isForMainFrame && view != null) {
+                        val up = httpsFirst(uri.toString())
+                        if (up != uri.toString()) {
+                            view.loadUrl(up)
+                            return true
+                        }
+                    }
                     return uri.scheme !in listOf("http", "https")
+                }
+
+                override fun onReceivedSslError(
+                    view: WebView?,
+                    handler: android.webkit.SslErrorHandler?,
+                    error: android.net.http.SslError?
+                ) {
+                    handler?.cancel()
+                    val failed = error?.url ?: return
+                    // The https upgrade didn't work out: go back to the plain http page.
+                    httpsUpgrades.remove(failed)?.let { http ->
+                        noUpgradeHosts.add(hostOf(http))
+                        view?.post { view.loadUrl(http) }
+                    }
                 }
 
                 override fun shouldInterceptRequest(
@@ -1361,6 +1652,14 @@ private fun SwiftBrowserApp() {
                     val retryable = code == WebViewClient.ERROR_HOST_LOOKUP || code == WebViewClient.ERROR_CONNECT ||
                         code == WebViewClient.ERROR_TIMEOUT || code == WebViewClient.ERROR_IO
                     val failed = request.url.toString()
+                    // https-first didn't work (site has no https): load the http page instead.
+                    if (code != WebViewClient.ERROR_HOST_LOOKUP) {
+                        httpsUpgrades.remove(failed)?.let { http ->
+                            noUpgradeHosts.add(hostOf(http))
+                            view.post { view.loadUrl(http) }
+                            return
+                        }
+                    }
                     erroredUrls.add(failed)
                     val tries = retryCounts[failed] ?: 0
                     if (retryable && tries < 3) {
@@ -1469,6 +1768,7 @@ private fun SwiftBrowserApp() {
 
     BackHandler(enabled = true) {
         when {
+            fullscreenView != null -> exitFullscreen()
             showMenu -> showMenu = false
             findOpen -> {
                 findOpen = false
@@ -1660,18 +1960,41 @@ private fun SwiftBrowserApp() {
                 Row(
                     Modifier.weight(1f).height(46.dp).clip(RoundedCornerShape(24.dp))
                         .background(if (addressFocused) Surface3 else Surface2)
+                        // Swipe on the bar: pages turn to the previous / next tab. The address itself
+                        // never moves; we take the drag before the text field can scroll its text.
                         .pointerInput(addressFocused) {
                             if (addressFocused) return@pointerInput // typing: drags select text instead
-                            var total = 0f
-                            detectHorizontalDragGestures(
-                                onDragStart = { total = 0f },
-                                onHorizontalDrag = { change, dx -> total += dx; change.consume() },
-                                onDragEnd = {
-                                    if (kotlin.math.abs(total) > 64.dp.toPx()) switchAdjacentTab(if (total < 0) 1 else -1)
-                                    total = 0f
-                                },
-                                onDragCancel = { total = 0f }
-                            )
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                val tracker = VelocityTracker()
+                                tracker.addPosition(down.uptimeMillis, down.position)
+                                var total = 0f
+                                var totalY = 0f
+                                var dragging = false
+                                val slop = viewConfiguration.touchSlop
+                                while (true) {
+                                    val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                    val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                                    if (!ch.pressed) {
+                                        if (dragging) endSwipe(tracker.calculateVelocity().x)
+                                        break
+                                    }
+                                    tracker.addPosition(ch.uptimeMillis, ch.position)
+                                    val d = ch.positionChange()
+                                    total += d.x
+                                    totalY += d.y
+                                    if (!dragging && kotlin.math.abs(total) > slop &&
+                                        kotlin.math.abs(total) > kotlin.math.abs(totalY) * 1.5f
+                                    ) {
+                                        dragging = true
+                                        beginSwipe()
+                                    }
+                                    if (dragging) {
+                                        ch.consume()
+                                        updateSwipe(total)
+                                    }
+                                }
+                            }
                         }
                         .padding(start = 8.dp, end = 14.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -1912,6 +2235,34 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
+                // Page-turn animation while swiping the address bar.
+                if (swipeActive) {
+                    val p = swipeP
+                    val a = kotlin.math.abs(p)
+                    val nb = neighborFor(if (p < 0) 1 else -1)
+                    Box(Modifier.fillMaxSize().clipToBounds().background(Bg)) {
+                        // The tab that is being revealed waits underneath and grows into place.
+                        Box(Modifier.fillMaxSize().graphicsLayer { val sc = 0.94f + 0.06f * a; scaleX = sc; scaleY = sc }) {
+                            SwipeTabPreview(nb)
+                            Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = (1f - a) * 0.45f)))
+                        }
+                        // The current page swings away around its spine, like a book page.
+                        swipeCur?.let { bmp ->
+                            Image(
+                                bitmap = bmp.asImageBitmap(), contentDescription = null,
+                                contentScale = ContentScale.FillBounds,
+                                modifier = Modifier.fillMaxSize().graphicsLayer {
+                                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(if (p < 0) 0f else 1f, 0.5f)
+                                    rotationY = (if (p < 0) 1f else -1f) * a * 80f
+                                    cameraDistance = 16f * density
+                                    shadowElevation = 24f * a
+                                    alpha = 1f - 0.12f * a
+                                }
+                            )
+                        }
+                    }
+                }
+
                 // Tapping the search bar dims everything below it — on every
                 // screen (home, results) and every Android version.
                 // The wallpaper blur on home adds on top of this.
@@ -2027,6 +2378,16 @@ private fun SwiftBrowserApp() {
                             bookmarkRefresh++
                             Toast.makeText(context, "Added to bookmarks", Toast.LENGTH_SHORT).show()
                         }
+                    )
+                }
+                videoTarget?.let { vt ->
+                    VideoContextMenu(
+                        target = vt,
+                        onDismiss = { videoTarget = null },
+                        onDownloadVideo = { vt.src?.let { downloadFromUrl(it) } },
+                        onCopyFrame = { copyVideoFrame() },
+                        onDownloadFrame = { saveVideoFrame() },
+                        onPictureInPicture = { startPictureInPicture() }
                     )
                 }
                 pendingLogin?.let { pending ->
@@ -5135,5 +5496,22 @@ private fun sharePage(context: Context, url: String) {
             putExtra(Intent.EXTRA_TEXT, url)
         }
         context.startActivity(Intent.createChooser(send, "Share page"))
+    }
+}
+
+/** The tab waiting under the page while you swipe the address bar. */
+@Composable
+private fun SwipeTabPreview(tab: BrowserTab?) {
+    val bmp = tab?.let { if (it.url == "swift://home") HomeThumbStore ?: ThumbStore[it.id] else ThumbStore[it.id] }
+    if (bmp != null) {
+        Image(
+            bitmap = bmp.asImageBitmap(), contentDescription = null,
+            contentScale = ContentScale.Crop, alignment = Alignment.TopCenter,
+            modifier = Modifier.fillMaxSize()
+        )
+    } else {
+        Box(Modifier.fillMaxSize().background(Surface), contentAlignment = Alignment.Center) {
+            Text(tab?.title ?: "", color = TextMuted, fontSize = 16.sp)
+        }
     }
 }

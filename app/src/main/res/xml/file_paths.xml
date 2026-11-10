@@ -2,5 +2,6 @@
 <paths>
     <!-- KEEP the entries you already had (cache-path etc. for Copy/Share image) and add these: -->
     <external-files-path name="downloads" path="Download/" />
+    <cache-path name="video_frames" path="video_frames/" />    
     <external-files-path name="dl_parts" path="dl_parts/" />
 </paths>
