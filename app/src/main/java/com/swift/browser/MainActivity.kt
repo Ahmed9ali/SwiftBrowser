@@ -1182,7 +1182,7 @@ private fun SwiftBrowserApp() {
 
     fun updateSwipe(totalPx: Float) {
         val w = context.resources.displayMetrics.widthPixels.toFloat()
-        var p = (totalPx / (w * 0.85f)).coerceIn(-1f, 1f)
+        var p = (totalPx / w).coerceIn(-1f, 1f)
         // No tab on that side: only a small elastic nudge.
         if (neighborFor(if (p < 0) 1 else -1) == null) p = (p * 0.15f)
         swipeP = p
@@ -1190,13 +1190,18 @@ private fun SwiftBrowserApp() {
 
     fun endSwipe(velX: Float) {
         swipeGen[0]++
-        if (!swipeActive) { swipeP = 0f; return }
         val p = swipeP
         val nb = neighborFor(if (p < 0) 1 else -1)
         val flung = kotlin.math.abs(velX) > 900f && (velX < 0) == (p < 0)
-        val commit = nb != null && (kotlin.math.abs(p) > 0.33f || flung)
+        val commit = nb != null && (kotlin.math.abs(p) > 0.3f || flung)
+        if (!swipeActive) {
+            // No picture to animate (capture failed / not ready yet): still switch, just without the slide.
+            swipeP = 0f
+            if (commit && nb != null) selectTab(nb)
+            return
+        }
         uiScope.launch {
-            animate(p, if (commit) (if (p < 0) -1f else 1f) else 0f, animationSpec = tween(if (commit) 190 else 160)) { v, _ -> swipeP = v }
+            animate(p, if (commit) (if (p < 0) -1f else 1f) else 0f, animationSpec = tween(if (commit) 200 else 170)) { v, _ -> swipeP = v }
             if (commit && nb != null) {
                 selectTab(nb)
                 delay(120) // let the real page paint before the picture goes away
@@ -1957,45 +1962,12 @@ private fun SwiftBrowserApp() {
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(
+                Box(
                     Modifier.weight(1f).height(46.dp).clip(RoundedCornerShape(24.dp))
                         .background(if (addressFocused) Surface3 else Surface2)
-                        // Swipe on the bar: pages turn to the previous / next tab. The address itself
-                        // never moves; we take the drag before the text field can scroll its text.
-                        .pointerInput(addressFocused) {
-                            if (addressFocused) return@pointerInput // typing: drags select text instead
-                            awaitEachGesture {
-                                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                                val tracker = VelocityTracker()
-                                tracker.addPosition(down.uptimeMillis, down.position)
-                                var total = 0f
-                                var totalY = 0f
-                                var dragging = false
-                                val slop = viewConfiguration.touchSlop
-                                while (true) {
-                                    val ev = awaitPointerEvent(PointerEventPass.Initial)
-                                    val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
-                                    if (!ch.pressed) {
-                                        if (dragging) endSwipe(tracker.calculateVelocity().x)
-                                        break
-                                    }
-                                    tracker.addPosition(ch.uptimeMillis, ch.position)
-                                    val d = ch.positionChange()
-                                    total += d.x
-                                    totalY += d.y
-                                    if (!dragging && kotlin.math.abs(total) > slop &&
-                                        kotlin.math.abs(total) > kotlin.math.abs(totalY) * 1.5f
-                                    ) {
-                                        dragging = true
-                                        beginSwipe()
-                                    }
-                                    if (dragging) {
-                                        ch.consume()
-                                        updateSwipe(total)
-                                    }
-                                }
-                            }
-                        }
+                ) {
+                Row(
+                    Modifier.fillMaxSize()
                         .padding(start = 8.dp, end = 14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -2022,7 +1994,10 @@ private fun SwiftBrowserApp() {
                                 addressFocused = it.isFocused
                                 // Editing a search page shows just the query.
                                 if (it.isFocused && !wasFocused) {
-                                    searchQueryOf(address)?.let { q -> address = q }
+                                    val q = searchQueryOf(address)
+                                    if (q != null) address = q
+                                    // Brave: an empty field with the current page shown as a card below it.
+                                    else if (pageUrl.startsWith("http")) address = ""
                                 }
                                 // Leaving the field without navigating restores the link.
                                 if (!it.isFocused && wasFocused && pageUrl.startsWith("http")) {
@@ -2049,6 +2024,53 @@ private fun SwiftBrowserApp() {
                             Icon(Icons.Default.Close, "Clear address", tint = TextMuted, modifier = Modifier.size(17.dp))
                         }
                     }
+                }
+                // Not editing: this layer owns every touch on the bar, so the address text can
+                // never scroll under the finger. Tap = start typing, horizontal drag = switch tab.
+                if (!addressFocused) {
+                    Box(
+                        Modifier.matchParentSize().pointerInput(Unit) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                val tracker = VelocityTracker()
+                                tracker.addPosition(down.uptimeMillis, down.position)
+                                var total = 0f
+                                var totalY = 0f
+                                var dragging = false
+                                var cancelled = false
+                                val slop = viewConfiguration.touchSlop
+                                while (true) {
+                                    val ev = awaitPointerEvent()
+                                    val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                                    if (!ch.pressed) {
+                                        if (dragging) endSwipe(tracker.calculateVelocity().x)
+                                        else if (!cancelled) {
+                                            addressFocusRequester.requestFocus()
+                                            keyboardController?.show()
+                                        }
+                                        break
+                                    }
+                                    tracker.addPosition(ch.uptimeMillis, ch.position)
+                                    val d = ch.positionChange()
+                                    total += d.x
+                                    totalY += d.y
+                                    if (!dragging && !cancelled) {
+                                        if (kotlin.math.abs(total) > slop && kotlin.math.abs(total) > kotlin.math.abs(totalY)) {
+                                            dragging = true
+                                            beginSwipe()
+                                        } else if (kotlin.math.abs(totalY) > slop) {
+                                            cancelled = true
+                                        }
+                                    }
+                                    if (dragging) {
+                                        ch.consume()
+                                        updateSwipe(total)
+                                    }
+                                }
+                            }
+                        }
+                    )
+                }
                 }
             }
             }
@@ -2235,29 +2257,22 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                // Page-turn animation while swiping the address bar.
+                // Brave-style slide while swiping the address bar: the current page and the
+                // neighbouring tab sit side by side and move together with the finger.
+                // The address bar itself never moves.
                 if (swipeActive) {
                     val p = swipeP
-                    val a = kotlin.math.abs(p)
                     val nb = neighborFor(if (p < 0) 1 else -1)
                     Box(Modifier.fillMaxSize().clipToBounds().background(Bg)) {
-                        // The tab that is being revealed waits underneath and grows into place.
-                        Box(Modifier.fillMaxSize().graphicsLayer { val sc = 0.94f + 0.06f * a; scaleX = sc; scaleY = sc }) {
-                            SwipeTabPreview(nb)
-                            Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = (1f - a) * 0.45f)))
-                        }
-                        // The current page swings away around its spine, like a book page.
+                        Box(Modifier.fillMaxSize().graphicsLayer {
+                            // p<0: next tab arrives from the right; p>0: previous tab from the left.
+                            translationX = (if (p < 0) 1f else -1f) * size.width * (1f - kotlin.math.abs(p))
+                        }) { SwipeTabPreview(nb) }
                         swipeCur?.let { bmp ->
                             Image(
                                 bitmap = bmp.asImageBitmap(), contentDescription = null,
                                 contentScale = ContentScale.FillBounds,
-                                modifier = Modifier.fillMaxSize().graphicsLayer {
-                                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(if (p < 0) 0f else 1f, 0.5f)
-                                    rotationY = (if (p < 0) 1f else -1f) * a * 80f
-                                    cameraDistance = 16f * density
-                                    shadowElevation = 24f * a
-                                    alpha = 1f - 0.12f * a
-                                }
+                                modifier = Modifier.fillMaxSize().graphicsLayer { translationX = p * size.width }
                             )
                         }
                     }
@@ -2282,6 +2297,90 @@ private fun SwiftBrowserApp() {
                                 })
                             }
                     )
+                }
+
+                // Tapping the address bar on a page: the page as a card (share / copy / edit)
+                // with quick-access sites under it, like Brave.
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = addressFocused && address.isBlank() && pageUrl.startsWith("http") && !showTabs,
+                    enter = fadeIn(tween(120)),
+                    exit = fadeOut(tween(80)),
+                    modifier = Modifier.align(Alignment.TopCenter)
+                ) {
+                    val fav = FaviconStore[activeId]
+                    val quick = remember(pageUrl) {
+                        (bookmarksNow() + store.history()).distinctBy { hostOf(it.second).removePrefix("www.") }
+                            .filter { it.second.startsWith("http") }.take(10)
+                    }
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(Surface2)
+                                .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(Modifier.size(30.dp).clip(CircleShape).background(Surface3), contentAlignment = Alignment.Center) {
+                                if (fav != null) Image(bitmap = fav.asImageBitmap(), contentDescription = null, modifier = Modifier.size(22.dp))
+                                else Icon(Icons.Default.Public, null, tint = TextMuted, modifier = Modifier.size(18.dp))
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    pageTitle.ifBlank { hostOf(pageUrl) }, color = TextMain, fontSize = 15.sp, maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    prettyAddress(pageUrl), color = TextMuted, fontSize = 12.sp, maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                )
+                            }
+                            IconButton(onClick = { sharePage(context, pageUrl) }, modifier = Modifier.size(42.dp)) {
+                                Icon(Icons.Default.Share, "Share", tint = TextMain, modifier = Modifier.size(20.dp))
+                            }
+                            IconButton(
+                                onClick = {
+                                    val cm = context.getSystemService(android.content.ClipboardManager::class.java)
+                                    cm.setPrimaryClip(android.content.ClipData.newPlainText("Link", pageUrl))
+                                    Toast.makeText(context, "Link copied", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.size(42.dp)
+                            ) { Icon(Icons.Default.ContentCopy, "Copy link", tint = TextMain, modifier = Modifier.size(20.dp)) }
+                            IconButton(
+                                onClick = { address = pageUrl; showSuggestions = false },
+                                modifier = Modifier.size(42.dp)
+                            ) { Icon(Icons.Default.Edit, "Edit link", tint = TextMain, modifier = Modifier.size(20.dp)) }
+                        }
+                        if (quick.isNotEmpty()) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(top = 14.dp)
+                                    .horizontalScroll(androidx.compose.foundation.rememberScrollState())
+                            ) {
+                                quick.forEach { (title, url) ->
+                                    Column(
+                                        Modifier.width(76.dp).clip(RoundedCornerShape(12.dp))
+                                            .clickable {
+                                                keyboardController?.hide()
+                                                focusManager.clearFocus()
+                                                load(url)
+                                            }
+                                            .padding(vertical = 4.dp),
+                                        horizontalAlignment = Alignment.CenterHorizontally
+                                    ) {
+                                        Box(Modifier.size(50.dp).clip(CircleShape).background(Surface2), contentAlignment = Alignment.Center) {
+                                            Text(
+                                                hostOf(url).removePrefix("www.").take(1).uppercase(),
+                                                color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Medium
+                                            )
+                                        }
+                                        Spacer(Modifier.height(6.dp))
+                                        Text(
+                                            title.ifBlank { hostOf(url) }, color = TextMuted, fontSize = 11.sp, maxLines = 1,
+                                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
@@ -4612,11 +4711,16 @@ private fun GroupPopupOverlay(
     val liveReorder by rememberUpdatedState(onReorder)
     val screenDensity = androidx.compose.ui.platform.LocalDensity.current.density
 
-    // While a tab is held: scroll the grid when the finger is near its top/bottom edge,
-    // and swap places with whichever tab is under the finger. Runs every frame, so it keeps
-    // working when the finger is still and the list is the thing moving.
+    // While a tab is held: scroll the grid when the finger is near its top/bottom edge.
+    // Like Brave, nothing shifts while you are travelling: a tab only makes room once the
+    // finger has rested on the slot (or past the first / last row) for a moment, and never
+    // while the list is still scrolling. Only tabs that are really on screen count as targets.
     LaunchedEffect(dragId) {
         if (dragId == null) return@LaunchedEffect
+        var dwellId: Long? = null
+        var dwellAfter = false
+        var dwellSince = 0L
+        var lastScrollAt = 0L
         while (dragId != null) {
             val me = dragId ?: break
             val b = gridBounds
@@ -4629,17 +4733,40 @@ private fun GroupPopupOverlay(
                 y > b.bottom - edge -> ((y - (b.bottom - edge)).coerceAtMost(edge) / edge) * maxStep
                 else -> 0f
             }
-            if (dy != 0f) gridState.scrollBy(dy) // + = toward the end of the list, - = toward the start
+            var scrolled = false
+            if (dy != 0f) scrolled = kotlin.math.abs(gridState.scrollBy(dy)) > 0.5f // + = toward the end
             val now = System.currentTimeMillis()
-            if (now - lastSwap > 260) {
-                val tabsNow = liveEntry.tabs
-                val target = tabsNow.firstOrNull { t -> t.id != me && popupBounds[t.id]?.contains(finger) == true }
-                if (target != null) {
-                    val from = tabsNow.indexOfFirst { it.id == me }
-                    val to = tabsNow.indexOfFirst { it.id == target.id }
-                    lastSwap = now
-                    liveReorder(me, target.id, to > from)
-                }
+            if (scrolled) lastScrollAt = now
+
+            val tabsNow = liveEntry.tabs
+            val visible = HashSet<Any>().apply { gridState.layoutInfo.visibleItemsInfo.forEach { add(it.key) } }
+            fun rectOf(id: Long): Rect? = if (id in visible) popupBounds[id] else null
+            val from = tabsNow.indexOfFirst { it.id == me }
+            val firstT = tabsNow.firstOrNull()
+            val lastT = tabsNow.lastOrNull()
+            val firstR = firstT?.let { rectOf(it.id) }
+            val lastR = lastT?.let { rectOf(it.id) }
+            var target: Long? = null
+            var after = false
+            val hit = tabsNow.firstOrNull { t -> t.id != me && rectOf(t.id)?.contains(finger) == true }
+            if (hit != null) {
+                target = hit.id
+                after = tabsNow.indexOfFirst { it.id == hit.id } > from
+            } else if (firstT != null && firstT.id != me && firstR != null && finger.y < firstR.top) {
+                target = firstT.id; after = false          // above the first row -> first slot
+            } else if (lastT != null && lastT.id != me && lastR != null && finger.y > lastR.bottom) {
+                target = lastT.id; after = true            // below the last row -> last slot
+            }
+
+            val settled = now - lastScrollAt > 160 && now - lastSwap > 300
+            if (target == null || !settled) {
+                dwellId = null
+            } else if (dwellId != target || dwellAfter != after) {
+                dwellId = target; dwellAfter = after; dwellSince = now
+            } else if (now - dwellSince >= 350) {
+                lastSwap = now
+                dwellId = null
+                liveReorder(me, target, after)
             }
             androidx.compose.runtime.withFrameNanos { }
         }
@@ -4726,6 +4853,7 @@ private fun GroupPopupOverlay(
                 ) {
                     gridItems(entry.tabs, key = { it.id }) { tab ->
                         val held = dragId == tab.id
+                        DisposableEffect(tab.id) { onDispose { popupBounds.remove(tab.id) } }
                         Box(
                             Modifier.fillMaxWidth().height(176.dp)
                                 .then(if (held) Modifier else Modifier.animateItem())
