@@ -1583,8 +1583,6 @@ private fun SwiftBrowserApp() {
                 ): Boolean {
                     val uri = request?.url ?: return false
                     
-                    // We removed the strict isMaliciousMainFrameRedirect check here so shortlinks work.
-                    // The pop-up blocker and ad-host blocker still handle spam.
                     if (currentBlockingEnabled && request.isForMainFrame &&
                         (blocker.isAdHost(uri.host) || blocker.isSpamRedirect(uri.toString(), firstParty[tabId], request.hasGesture()))) {
                         countBlocked(tabId)
@@ -1635,8 +1633,6 @@ private fun SwiftBrowserApp() {
                     return null
                 }
 
-                // FIXED: The "Webpage not available" flash. 
-                // Instead of immediately showing the error, we retry silently.
                 override fun onReceivedError(
                     view: WebView?,
                     request: WebResourceRequest?,
@@ -1646,7 +1642,6 @@ private fun SwiftBrowserApp() {
                     if (request?.isForMainFrame != true || view == null) return
                     val code = error?.errorCode ?: return
                     
-                    // Ignore errors if the page actually loaded successfully (common WebView bug)
                     if (view.progress >= 100) return
 
                     val retryable = code == WebViewClient.ERROR_HOST_LOOKUP || code == WebViewClient.ERROR_CONNECT ||
@@ -1664,7 +1659,6 @@ private fun SwiftBrowserApp() {
                     erroredUrls.add(failed)
                     val tries = retryCounts[failed] ?: 0
                     
-                    // Retry up to 3 times quickly before giving up
                     if (retryable && tries < 3) {
                         retryCounts[failed] = tries + 1
                         view.postDelayed({
@@ -1705,7 +1699,6 @@ private fun SwiftBrowserApp() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (url == null || url.startsWith("about:")) return
                     
-                    // Only remove from erroredUrls if it successfully finished loading
                     if (url in erroredUrls) erroredUrls.remove(url) 
                     retryCounts.remove(url)
                     

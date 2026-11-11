@@ -23,7 +23,7 @@ const val SHIELDS_JS = """
     }
     return false;
   }
-  var AD_URL = /(popunder|popads|propeller|exoclick|adsterra|clickadu|hilltopads|onclickalgo|trafficjunky|juicyads|adcash|popcash|monetag|realsrv|mondiad|richads|\/pop\.js|clickunder|adsco\.re|go\.oclasrv|nudus|luckyday)/i;
+  var AD_URL = /(popunder|popads|propeller|exoclick|adsterra|clickadu|hilltopads|onclickalgo|trafficjunky|juicyads|adcash|popcash|monetag|realsrv|mondiad|richads|\/pop\.js|clickunder|adsco\.re|go\.oclasrv|nudus|luckyday|brolackview)/i;
   function stubWindow() {
     return { closed: false, focus: function () {}, blur: function () {}, close: function () {},
       postMessage: function () {}, location: { href: '' }, document: { write: function () {}, close: function () {} } };
@@ -36,6 +36,8 @@ const val SHIELDS_JS = """
       return realOpen.apply(window, arguments);
     };
   } catch (e) {}
+  
+  // Block programmatic clicks to spam URLs
   try {
     var realClick = HTMLAnchorElement.prototype.click;
     HTMLAnchorElement.prototype.click = function () {
@@ -47,8 +49,6 @@ const val SHIELDS_JS = """
   } catch (e) {}
 
   // ---------- 2. Anti-Adblock Bypass (Safe Method) ----------
-  // We removed the aggressive dimension spoofing that broke Bitly. 
-  // Instead, we only spoof the global variables that anti-adblock scripts look for.
   (function() {
     if (!window.adsbygoogle) window.adsbygoogle = { push: function(){}, loaded: true };
     if (!window.canRunAds) window.canRunAds = true;
@@ -79,9 +79,10 @@ const val SHIELDS_JS = """
     '[id^="ad-slot-"]', '[id*="-ad-slot"]', '[id*="-ad-container"]',
     'div[class^="ad-"]', 'div[class^="ads-"]', 'div[id^="ad-"]',
     '.ad-placeholder', '.ad-label', '.ads-label', '.ad-overlay',
-    // Specific native banners
+    // Specific native banners (NUDUS, etc.)
     'a[href*="skillify"]', 'img[src*="nudus"]', 'a[href*="nudus"]', 'img[src*="banner"]',
-    // Anti-Adblock Modals (Removes the "Turn off AdBlock" popups)
+    'img[src*="brolackview"]', 'a[href*="brolackview"]',
+    // Anti-Adblock Modals
     '[class*="adblock"]', '[id*="adblock"]', '.adblock-modal', '#adblock-modal',
     '[class*="ad-block"]', '[id*="ad-block"]', '.anti-adblock', '#anti-adblock'
   ];
@@ -150,7 +151,6 @@ const val SHIELDS_JS = """
 
   // ---------- 4. YouTube ----------
   if (IS_YT) {
-    // Only strip ads on standard watch pages, not shorts or mobile views to prevent breaking playback.
     if (location.pathname.indexOf('/shorts/') === -1) {
       var KEYS = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
       function strip(o) {
@@ -175,60 +175,9 @@ const val SHIELDS_JS = """
         Response.prototype.json = function () { return rj.apply(this, arguments).then(strip); };
       } catch (e) {}
     }
-
-    var wasAd = false;
-    function clickAll(sel) {
-      var n = document.querySelectorAll(sel);
-      for (var i = 0; i < n.length; i++) { try { n[i].click(); } catch (e) {} }
-    }
-    setInterval(function () {
-      var player = document.querySelector('.html5-video-player') || document.getElementById('movie_player');
-      var v = document.querySelector('video.html5-main-video') || document.querySelector('video');
-      var ad = (player && player.classList.contains('ad-showing')) || !!document.querySelector('.ad-showing');
-      if (ad) {
-        wasAd = true;
-        clickAll('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-container button, .videoAdUiSkipButton');
-        clickAll('.ytp-ad-overlay-close-button');
-        if (v && isFinite(v.duration) && v.duration > 0) {
-          v.muted = true;
-          v.playbackRate = 16;
-          try { v.currentTime = v.duration; } catch (e) {}
-        }
-      } else if (wasAd) {
-        wasAd = false;
-        if (v) { v.muted = false; v.playbackRate = 1; }
-      }
-    }, 250);
   }
 
-  // ---------- 5. fingerprinting protection ----------
-  (function () {
-    if (/(cloudflare|challenge|captcha|turnstile)\./i.test(H)) return;
-    var seed = 0;
-    try {
-      var s = (location.hostname || '') + '|' + (navigator.userAgent || '');
-      for (var i = 0; i < s.length; i++) seed = (seed * 31 + s.charCodeAt(i)) | 0;
-    } catch (e) {}
-    function noiseAt(i) {
-      var x = (i * 2654435761 + seed) >>> 0;
-      x = (x * 1103515245 + 12345) >>> 0;
-      return (x >>> 16) & 0x07;
-    }
-
-    try {
-      var getImgData = CanvasRenderingContext2D.prototype.getImageData;
-      CanvasRenderingContext2D.prototype.getImageData = function () {
-        var img = getImgData.apply(this, arguments);
-        try {
-          var d = img.data;
-          for (var i = 0; i < d.length; i += 4 * 97) d[i] = (d[i] + noiseAt(i)) & 0xff;
-        } catch (e) {}
-        return img;
-      };
-    } catch (e) {}
-  })();
-
-  // ---------- 6. fetch / XHR / beacon / WebSocket shim ----------
+  // ---------- 5. fetch / XHR shim (Optimized for speed) ----------
   (function () {
     var hosts = null;
     try {
@@ -242,13 +191,13 @@ const val SHIELDS_JS = """
       if (u === undefined || u === null) return false;
       try {
         var s = String(u);
-        if (s.indexOf(':') === 0) return false;
-        if (!/^[a-z][a-z0-9+.\-]*:/i.test(s) && s.charAt(0) !== '/') s = 'https://' + s;
+        // Quick exit for common local/data URLs
+        if (s.indexOf(':') === 0 || s.indexOf('//') === 0) return false;
+        
         var host = '';
         try { host = new URL(s, location.href).hostname.toLowerCase(); } catch (e) { return false; }
         if (!host) return false;
         
-        // Whitelist CAPTCHAs and essential CDNs in the shim!
         if (host.endsWith('cloudflare.com') || host.endsWith('hcaptcha.com') || 
             host.endsWith('google.com') || host.endsWith('gstatic.com') || host.endsWith('jsdelivr.net')) return false;
         
@@ -267,7 +216,7 @@ const val SHIELDS_JS = """
       var realFetch = window.fetch;
       window.fetch = function (input) {
         var url = (typeof input === 'string') ? input : (input && input.url) || '';
-        if (isAdUrl(url)) return Promise.reject(new TypeError('Failed to fetch'));
+        if (url && isAdUrl(url)) return Promise.reject(new TypeError('Failed to fetch'));
         return realFetch.apply(this, arguments);
       };
     } catch (e) {}

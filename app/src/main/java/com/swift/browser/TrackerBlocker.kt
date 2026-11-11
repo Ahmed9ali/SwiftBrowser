@@ -20,8 +20,6 @@ class TrackerBlocker(context: Context) {
         "/vast.xml", "/vast?", "adtag", "/ad.php?", "/click.php?", "/clickunder"
     )
 
-    // Removed generic "analytics.js" and "ads.js" from here, as it breaks sites.
-    // Now we only block very specific known ad bait scripts.
     private val alwaysBlockParts = listOf(
         "/pagead.js", "/adsbygoogle.js", "/pagead/js/adsbygoogle", "/pagead/js/",
         "/pagead/viewthroughconversion", "/doubleclick/", "/googleadservices/", "/ads/pagead",
@@ -33,7 +31,11 @@ class TrackerBlocker(context: Context) {
         "/api/stats/ads", "/pagead/", "/ptracking", "/get_midroll_info", "/api/stats/atr", "adformat=", "&ad_type="
     )
 
-    // Parameters / paths that ad-network click URLs carry (never part of a normal page address).
+    // Hardcoded known spam redirect hosts to immediately block the blank page issue
+    private val hardcodedSpamHosts = setOf(
+        "brolackview.ink", "brolackview.com", "brolack.com", "nudus.com", "adsterra.com"
+    )
+
     private val redirectParts = listOf(
         "zoneid=", "campaignid=", "clickid=", "click_id=", "aff_sub", "subid=", "sub_id=", "pubid=", "adzone",
         "/popunder", "/popads", "/clickunder", "/pop.php", "/click.php", "/ad.php", "/redirect.php?ad",
@@ -45,6 +47,7 @@ class TrackerBlocker(context: Context) {
 
     fun isAdHost(host: String?): Boolean {
         var h = host?.lowercase(Locale.ROOT) ?: return false
+        if (h in hardcodedSpamHosts) return true
         while (true) {
             if (h in blockedHosts) return true
             val dot = h.indexOf('.')
@@ -56,20 +59,20 @@ class TrackerBlocker(context: Context) {
     fun blockedHostsJson(): String {
         val obj = org.json.JSONObject()
         blockedHosts.forEach { obj.put(it, true) }
+        hardcodedSpamHosts.forEach { obj.put(it, true) }
         return obj.toString()
     }
 
     private fun sameSite(a: String, b: String) = a == b || a.endsWith(".$b") || b.endsWith(".$a")
 
-    /**
-     * A page that sends you somewhere else on its own (no tap) and the target looks like an ad
-     * click: the classic spam redirect of shortlink / streaming / download sites. Taps are never touched.
-     */
     fun isSpamRedirect(url: String, pageUrl: String?, hasGesture: Boolean): Boolean {
-        if (hasGesture) return false
+        if (hasGesture) return false // Let user-intended clicks through
         val host = hostOf(url) ?: return false
         val pageHost = hostOf(pageUrl) ?: return false
         if (sameSite(host, pageHost)) return false
+        
+        // Block if it goes to a known spam host or has spam parameters
+        if (isAdHost(host)) return true
         val lower = url.lowercase(Locale.ROOT)
         return redirectParts.any { lower.contains(it) }
     }
