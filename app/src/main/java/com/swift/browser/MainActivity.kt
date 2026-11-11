@@ -617,6 +617,7 @@ private fun SwiftBrowserApp() {
     val desktopSites = remember { mutableStateMapOf<Long, Boolean>() }
     var translateOffer by remember { mutableStateOf<Pair<Long, String>?>(null) }
     var translateDone by remember { mutableStateOf<Pair<Long, String>?>(null) }
+    var translateBusy by remember { mutableStateOf<Pair<Long, String>?>(null) } // translating now: the card shows a spinner
     var translateMenu by remember { mutableStateOf(false) }
     // Page whose translate banner the user swiped away: a translation still in
     // flight must not pop the "translated" card straight back afterwards.
@@ -1355,6 +1356,8 @@ private fun SwiftBrowserApp() {
         val startTab = activeId
         val startUrl = pageUrl
         val offered = knownSource ?: translateOffer?.second.orEmpty()
+        // The same card stays on screen and shows a spinner; it turns into "Page translated / Undo" when done.
+        translateBusy = startTab to offered
         translateOffer = null
         translateDone = null
         translateMenu = false
@@ -1363,11 +1366,14 @@ private fun SwiftBrowserApp() {
         fun startTranslation(rawSource: String) {
             val src = TranslateEngine.normalize(rawSource)
             val tgt = appSettings.translateTarget
+            if (translateBusy?.first == startTab) translateBusy = startTab to rawSource
             if (src == null) {
+                translateBusy = null
                 Toast.makeText(context, "Offline translation doesn't support this page's language", Toast.LENGTH_LONG).show()
                 return
             }
             if (src == tgt) {
+                translateBusy = null
                 Toast.makeText(context, "This page is already in " + TranslateEngine.displayName(tgt), Toast.LENGTH_SHORT).show()
                 return
             }
@@ -1382,10 +1388,16 @@ private fun SwiftBrowserApp() {
                     }
                     if (activeId == startTab && pageUrl == startUrl) {
                         wv.evaluateJavascript(TRANSLATE_JS + "\nwindow.__swiftTr.start('" + src + "');", null)
+                        // Safety: never leave the spinner up forever (e.g. a page with no text).
+                        delay(20000)
+                        if (translateBusy?.first == startTab) translateBusy = null
+                    } else {
+                        translateBusy = null
                     }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    translateBusy = null
                     Toast.makeText(context, e.message ?: "Translation failed", Toast.LENGTH_LONG).show()
                 }
             }
@@ -1494,6 +1506,7 @@ private fun SwiftBrowserApp() {
                 webView = this,
                 getTarget = { appSettings.translateTarget },
                 onFirstApplied = { sourceLang ->
+                    if (translateBusy?.first == tabId) translateBusy = null
                     if (tabId == activeId && translateDismissedUrl != pageUrl) translateDone = activeId to sourceLang
                 },
                 onError = { error ->
@@ -1704,6 +1717,7 @@ private fun SwiftBrowserApp() {
                     if (url == null || url.startsWith("about:")) return
                     if (translateOffer?.first == tabId) translateOffer = null
                     if (translateDone?.first == tabId) translateDone = null
+                    if (translateBusy?.first == tabId) translateBusy = null
                     if (tabId == activeId) translateDismissedUrl = null
                     applyDesktopJs(view, tabId)
                     firstParty[tabId] = url
@@ -2588,21 +2602,36 @@ private fun SwiftBrowserApp() {
 
                 // Brave-style translate card: "Translate page?" first, then "Page translated / Undo".
                 // Goes away by itself, or swipe it up.
-                val banner = translateDone ?: translateOffer
-                val bannerDone = translateDone != null
+                val banner = translateDone ?: translateBusy ?: translateOffer
+                val loaded = loadProgress >= 100 // never pop up (or start counting down) while the page is loading
+                // The card keeps its last text while it slides away, so it can't flash other content.
+                val lastBanner = remember { arrayOfNulls<Pair<Long, String>>(1) }
+                val lastKind = remember { IntArray(1) } // 0 offer, 1 translating, 2 translated
+                if (banner != null) {
+                    lastBanner[0] = banner
+                    lastKind[0] = if (translateDone != null) 2 else if (translateBusy != null) 1 else 0
+                }
+                val bannerDone = lastKind[0] == 2
+                val bannerBusy = lastKind[0] == 1
+                // Lives outside the card: resetting it when the card is dismissed made it jump back
+                // for a frame before disappearing (the jitter on swipe-up).
+                var swipeY by remember { mutableFloatStateOf(0f) }
+                LaunchedEffect(banner != null) { if (banner != null) swipeY = 0f }
                 // Set when the card was swiped away: it is already off screen, so it must not
                 // play the normal slide-out (that was the jump you saw).
                 var bannerSwiped by remember { mutableStateOf(false) }
-                LaunchedEffect(banner) {
+                LaunchedEffect(banner, lastKind[0], loaded) {
                     if (banner != null) {
                         bannerSwiped = false
-                        delay(if (bannerDone) 8000 else 9000)
-                        if (translateDone == banner) translateDone = null
-                        if (translateOffer == banner) translateOffer = null
+                        if (loaded && !bannerBusy) {
+                            delay(if (bannerDone) 8000 else 12000)
+                            if (translateDone == banner) translateDone = null
+                            if (translateOffer == banner) translateOffer = null
+                        }
                     }
                 }
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = banner != null && banner.first == activeId && !showTabs && !showSuggestions &&
+                    visible = banner != null && loaded && banner.first == activeId && !showTabs && !showSuggestions &&
                         address != "swift://bookmarks" && address != "swift://history" &&
                         address != "swift://downloads" && address != "swift://settings",
                     enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { -it }),
@@ -2610,13 +2639,12 @@ private fun SwiftBrowserApp() {
                     else fadeOut(tween(120)) + slideOutVertically(targetOffsetY = { -it }),
                     modifier = Modifier.align(Alignment.TopCenter)
                 ) {
-                    val code = banner?.second ?: ""
+                    val code = lastBanner[0]?.second ?: ""
                     val fromName = java.util.Locale(code).getDisplayLanguage()
                     val from = fromName.ifBlank { "Detected language" }
                     val to = TranslateEngine.displayName(appSettings.translateTarget)
                     // The swipe offset is a plain state, so the card follows the finger exactly
                     // (no coroutine per drag step). Letting go animates it back or off the top.
-                    var swipeY by remember(banner) { mutableFloatStateOf(0f) }
                     val bannerScope = rememberCoroutineScope()
                     var settleJob by remember(banner) { mutableStateOf<Job?>(null) }
                     fun dismissBanner() {
@@ -2625,6 +2653,7 @@ private fun SwiftBrowserApp() {
                         translateDismissedUrl = pageUrl
                         translateOffer = null
                         translateDone = null
+                        translateBusy = null
                     }
                     Row(
                         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
@@ -2683,6 +2712,7 @@ private fun SwiftBrowserApp() {
                                     translateDismissedUrl = pageUrl
                                     translateOffer = null
                                     translateDone = null
+                                    translateBusy = null
                                     val sp = context.getSharedPreferences("swift_translate", Context.MODE_PRIVATE)
                                     val set = (sp.getStringSet("never", emptySet()) ?: emptySet()).toMutableSet()
                                     set.add(hostOf(pageUrl))
@@ -2695,11 +2725,17 @@ private fun SwiftBrowserApp() {
                             }
                         }
                         Box(Modifier.width(1.dp).height(28.dp).background(Surface3))
-                        TextButton(onClick = { if (bannerDone) undoTranslate() else translatePageInPlace() }) {
-                            Text(
-                                if (bannerDone) "Undo" else "Translate",
-                                color = Accent, fontWeight = FontWeight.Medium
-                            )
+                        if (bannerBusy) {
+                            Box(Modifier.width(72.dp).height(48.dp), contentAlignment = Alignment.Center) {
+                                CircularProgressIndicator(Modifier.size(24.dp), color = Accent, strokeWidth = 2.5.dp)
+                            }
+                        } else {
+                            TextButton(onClick = { if (bannerDone) undoTranslate() else translatePageInPlace() }) {
+                                Text(
+                                    if (bannerDone) "Undo" else "Translate",
+                                    color = Accent, fontWeight = FontWeight.Medium
+                                )
+                            }
                         }
                     }
                 }
@@ -3244,7 +3280,15 @@ private fun SwiftBrowserApp() {
                             address = "swift://settings"
                             showSuggestions = false
                         }
-                        MenuRow(Icons.Default.Public, "Set as default browser") {
+                        // Only offered while another browser (or none) is the default.
+                        val isDefaultBrowser = remember {
+                            runCatching {
+                                val probe = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("http://www.example.com"))
+                                context.packageManager.resolveActivity(probe, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
+                                    ?.activityInfo?.packageName == context.packageName
+                            }.getOrDefault(false)
+                        }
+                        if (!isDefaultBrowser) MenuRow(Icons.Default.Public, "Set as default browser") {
                             showMenu = false
                             runCatching {
                                 context.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
