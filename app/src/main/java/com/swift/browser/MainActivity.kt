@@ -137,7 +137,6 @@ private val TextMain = Color(0xFFF4F4F5)
 private val TextMuted = Color(0xFF9A9DA5)
 private val Green = Color(0xFF65C98A)
 
-// Everything needed to bring the browser back exactly as it was left.
 private class SavedSession(
     val tabs: List<BrowserTab>,
     val activeId: Long,
@@ -183,7 +182,6 @@ private fun loadSession(context: Context): SavedSession? {
     }
 }
 
-// Bookmarks kept in this app's own storage (first run imports any old ones).
 private class BookmarkStore(context: Context, legacy: () -> List<Pair<String, String>>) {
     private val prefs = context.getSharedPreferences("swift_bookmarks", Context.MODE_PRIVATE)
 
@@ -225,20 +223,14 @@ private class BookmarkStore(context: Context, legacy: () -> List<Pair<String, St
     }
 }
 
-// Last snapshot of the homepage: every home tab shows it in the tab overview.
 private var HomeThumbStore by mutableStateOf<Bitmap?>(null)
 
-// Desktop user agent: same Chrome version as this phone's WebView (a stale version
-// next to modern features makes some sites distrust the browser and show errors).
 private fun desktopUserAgent(context: Context): String {
     val def = android.webkit.WebSettings.getDefaultUserAgent(context)
     val major = Regex("Chrome/(\\d+)").find(def)?.groupValues?.get(1) ?: "124"
     return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$major.0.0.0 Safari/537.36"
 }
 
-// Only well-known mobile hosts are swapped for their desktop host. Every other site is
-// simply reloaded at the same address with the desktop user agent (like Chrome does);
-// guessing "www." for unknown sites sent some of them to a 404 page.
 private fun desktopEquivalent(url: String, desktop: Boolean): String {
     if (!desktop) return url
     return runCatching {
@@ -258,13 +250,10 @@ private fun desktopEquivalent(url: String, desktop: Boolean): String {
     }.getOrDefault(url)
 }
 
-// Page language detection (for the auto translate offer): html lang first, then
-// the dominant non-Latin script of the visible text.
 private const val LANG_JS = """
 (function(){
  var l=(document.documentElement.lang||'').toLowerCase().split('-')[0].split('_')[0];
  var t=((document.body&&document.body.innerText)||'').slice(0,9000);
- // Letters only: spaces, digits and punctuation must not dilute the share of a script.
  var letters=t.replace(/[\s\d!-\/:-@\[-`{-~\u2000-\u206f\u3000-\u303f\uff00-\uff0f]/g,'').length||1;
  var sc=[['zh',/[\u4e00-\u9fff]/g,0.06,30],['ja',/[\u3040-\u30ff]/g,0.04,30],['ko',/[\uac00-\ud7af]/g,0.06,30],['ru',/[\u0400-\u04ff]/g,0.15,20],['ar',/[\u0600-\u06ff]/g,0.15,20],['hi',/[\u0900-\u097f]/g,0.15,20],['th',/[\u0e00-\u0e7f]/g,0.15,20],['he',/[\u0590-\u05ff]/g,0.15,20],['el',/[\u0370-\u03ff]/g,0.15,20]];
  var best='',bn=0;
@@ -274,8 +263,6 @@ private const val LANG_JS = """
 })()
 """
 
-// Long-press on a video: finds the <video> under the finger (also inside shadow DOM, like Reddit's
-// player) and its direct file URL when the page exposes one.
 private const val VIDEO_PROBE_JS = """
 (function(x,y){
  var all=[];
@@ -316,9 +303,6 @@ private const val VIDEO_FULLSCREEN_JS = """
  if(f){try{f.call(v);}catch(e){}}})()
 """
 
-// Desktop site: Chrome-style. Forces a wide layout viewport (pages that ask for
-// width=device-width otherwise snap back to the phone layout) and hides every
-// "I'm a phone" signal sites check from JavaScript: touch, screen size, pointer media queries.
 private const val DESKTOP_JS = """
 (function(){
  try{
@@ -359,8 +343,6 @@ private const val DESKTOP_JS = """
 })();
 """
 
-// Page translation script lives in TranslateJs.kt (TRANSLATE_JS).
-
 private data class PendingDownload(
     val url: String, val userAgent: String?, val disposition: String?,
     val mime: String?, val referer: String?, val filename: String
@@ -373,10 +355,6 @@ private fun canAutoOpenMime(m: String?): Boolean {
         t.contains("officedocument") || t == "application/msword"
 }
 
-// A blocked request must FAIL, not resolve. An empty 200 response counts as "loaded" on
-// every ad-block tester (and on many real pages), so the shield looks broken. Chromium treats
-// an IOException thrown from the body's read() as a network error, so <script>/<img> fire
-// onerror and fetch() rejects — which is what a real blocker looks like to the page.
 private fun blockedResponse(url: String): WebResourceResponse {
     val mime = when {
         url.contains(".js", true) -> "application/javascript"
@@ -401,9 +379,7 @@ private fun blockedResponse(url: String): WebResourceResponse {
     )
 }
 
-// Per-tab favicons and page thumbnails (shown in tab cards and the group bar).
 private val FaviconStore = mutableStateMapOf<Long, Bitmap>()
-// Favicons by site, for the quick-access tiles under the address bar.
 private val HostFavicons = mutableStateMapOf<String, Bitmap>()
 
 private fun fetchFavicon(host: String): Bitmap? = runCatching {
@@ -413,26 +389,21 @@ private fun fetchFavicon(host: String): Bitmap? = runCatching {
 }.getOrNull()
 private val ThumbStore = mutableStateMapOf<Long, Bitmap>()
 
-// Tab groups (Brave-style drag-to-group). Group ids live far above tab ids.
 private const val GROUP_ID_BASE = 1_000_000L
 private const val NEW_TAB_KEY = -1L
 
-// Brave/Chrome tab-group colors (grey, blue, red, yellow, green, pink, purple, cyan, orange).
 private val GroupColors = listOf(
     Color(0xFF9AA0A6), Color(0xFF8AB4F8), Color(0xFFF28B82),
     Color(0xFFFDD663), Color(0xFF81C995), Color(0xFFFF8BCB),
     Color(0xFFC58AF9), Color(0xFF78D9EC), Color(0xFFFCAD70),
     Color(0xFF4DB6AC), Color(0xFFD4E157), Color(0xFF7986CB)
 )
-// Colors the user picked (group key -> palette index); others use a default.
 private val GroupColorStore = mutableStateMapOf<Long, Int>()
 private val GroupInk = Color(0xFF1B1D22)
 private val PrivateColor = Color(0xFF8E5BFF)
 
-// One card in the tab grid: either a single tab or a group of tabs.
 private data class TabEntry(val key: Long, val isGroup: Boolean, val tabs: List<BrowserTab>)
 
-// Pull-to-refresh container for a WebView (no extra dependency needed).
 private class PullRefreshLayout(context: Context) : android.widget.FrameLayout(context) {
     var onRefresh: (() -> Unit)? = null
     private val density = context.resources.displayMetrics.density
@@ -551,10 +522,7 @@ private class PullRefreshLayout(context: Context) : android.widget.FrameLayout(c
 
 class MainActivity : ComponentActivity() {
     companion object {
-        // Set by the UI; called when the app stops so tabs survive being closed.
         var saver: (() -> Unit)? = null
-
-        // A link opened from outside (or a pinned shortcut): opened in a new tab.
         var pendingUrl by mutableStateOf<String?>(null)
     }
 
@@ -576,14 +544,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleIntent(intent)
-        // Download progress notifications need this on Android 13+.
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
         ) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
         window.statusBarColor = android.graphics.Color.rgb(16, 17, 20)
         window.navigationBarColor = android.graphics.Color.rgb(16, 17, 20)
         setContent {
-            // Slightly smaller text overall, closer to Brave's proportions.
             val d = androidx.compose.ui.platform.LocalDensity.current
             androidx.compose.runtime.CompositionLocalProvider(
                 androidx.compose.ui.platform.LocalDensity provides
@@ -619,7 +585,6 @@ private fun SwiftBrowserApp() {
     var blockingEnabled by remember { mutableStateOf(appSettings.blockTrackers) }
     var privateMode by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
-    // 0 = tabs, 1 = tab groups, 2 = private tabs (shown only while a private tab exists)
     var tabSection by remember { mutableIntStateOf(0) }
     var showShield by remember { mutableStateOf(false) }
     var showTabs by remember { mutableStateOf(false) }
@@ -632,7 +597,6 @@ private fun SwiftBrowserApp() {
     var pendingEditGroup by remember { mutableStateOf<Long?>(null) }
     var showGroupSheet by remember { mutableStateOf(false) }
     var confirmCloseAll by remember { mutableStateOf(false) }
-    // Closing all only touches the kind of tab you are looking at (private vs normal).
     val closeAllPrivate = showTabs && tabSection == 2
     var editGroupKey by remember { mutableStateOf<Long?>(null) }
     var colorPickKey by remember { mutableStateOf<Long?>(null) }
@@ -645,10 +609,9 @@ private fun SwiftBrowserApp() {
     val desktopSites = remember { mutableStateMapOf<Long, Boolean>() }
     var translateOffer by remember { mutableStateOf<Pair<Long, String>?>(null) }
     var translateDone by remember { mutableStateOf<Pair<Long, String>?>(null) }
-    var translateDl by remember { mutableStateOf<Pair<String, Float>?>(null) } // language pack being downloaded for this page: name to 0..1
-    var translateBusy by remember { mutableStateOf<Pair<Long, String>?>(null) } // translating now: the card shows a spinner
+    var translateDl by remember { mutableStateOf<Pair<String, Float>?>(null) }
+    var translateBusy by remember { mutableStateOf<Pair<Long, String>?>(null) }
     var translateMenu by remember { mutableStateOf(false) }
-    // Bumped every time the app comes back to the front (e.g. after choosing the default browser in Settings).
     var defaultCheck by remember { mutableIntStateOf(0) }
     DisposableEffect(Unit) {
         val owner = context as? androidx.lifecycle.LifecycleOwner
@@ -658,23 +621,17 @@ private fun SwiftBrowserApp() {
         owner?.lifecycle?.addObserver(obs)
         onDispose { owner?.lifecycle?.removeObserver(obs) }
     }
-    // Page whose translate banner the user swiped away: a translation still in
-    // flight must not pop the "translated" card straight back afterwards.
     var translateDismissedUrl by remember { mutableStateOf<String?>(null) }
     var contextMenu by remember { mutableStateOf<ContextTarget?>(null) }
-    // Long-press on a video: Brave-style menu (download, frame, picture-in-picture).
     var videoTarget by remember { mutableStateOf<VideoTarget?>(null) }
     var videoTabId by remember { mutableLongStateOf(0L) }
-    // Full screen video (WebView custom view).
     var fullscreenView by remember { mutableStateOf<android.view.View?>(null) }
     var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
-    // Swipe on the address bar: the page turns like a book page to the next / previous tab.
     var swipeActive by remember { mutableStateOf(false) }
-    var swipeP by remember { mutableFloatStateOf(0f) } // -1..1, negative = dragging left (next tab)
+    var swipeP by remember { mutableFloatStateOf(0f) }
     var swipeCur by remember { mutableStateOf<Bitmap?>(null) }
-    var swipeTarget by remember { mutableStateOf<BrowserTab?>(null) } // frozen once the swipe is committed
+    var swipeTarget by remember { mutableStateOf<BrowserTab?>(null) }
     val swipeGen = remember { IntArray(1) }
-    // Page each tab was on when the user went back to the home page: Forward returns to it.
     val homeForward = remember { mutableStateMapOf<Long, String>() }
     var pendingLogin by remember { mutableStateOf<PendingLogin?>(null) }
     val passwordStore = remember { PasswordStore(context) }
@@ -687,7 +644,6 @@ private fun SwiftBrowserApp() {
     var showClearData by remember { mutableStateOf(false) }
     var webSuggestions by remember { mutableStateOf<List<String>>(emptyList()) }
 
-    // "Show the download card for a few seconds" (like Brave's Downloading file... card).
     LaunchedEffect(downloadNoticeAt) {
         if (downloadNoticeAt != 0L) {
             downloadNoticeVisible = true
@@ -696,7 +652,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Our own download engine: opens finished downloads when the Download settings ask for it.
     DisposableEffect(Unit) {
         DownloadEngine.init(context)
         DownloadEngine.onCompleted = { item ->
@@ -713,10 +668,8 @@ private fun SwiftBrowserApp() {
     val pendingLoads = remember { HashMap<Long, String>() }
     val webArea = remember { android.graphics.Rect() }
     var groupCounter by remember { mutableLongStateOf(session?.groupCounter ?: (GROUP_ID_BASE + 1)) }
-    // One WebView per tab: pages, history and network errors never leak between tabs.
     val webViews = remember { HashMap<Long, WebView>() }
     val refreshLayouts = remember { HashMap<Long, PullRefreshLayout>() }
-    // Tabs that were restored but not opened yet load lazily, like Brave.
     val unloaded = remember {
         HashSet<Long>().apply {
             session?.tabs?.filter { it.url.startsWith("http") }?.forEach { add(it.id) }
@@ -763,7 +716,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Snapshot of the homepage exactly as it is on screen (needs Android 8+).
     fun captureHomeThumb(id: Long) {
         if (Build.VERSION.SDK_INT < 26) return
         val activity = context as? android.app.Activity ?: return
@@ -785,11 +737,9 @@ private fun SwiftBrowserApp() {
                 Handler(Looper.getMainLooper())
             )
         } catch (e: Exception) {
-            // Thumbnails are best effort.
         }
     }
 
-    // Snapshot of a tab's page, shown on its card in the tab overview.
     fun captureThumb(id: Long) {
         val tab0 = tabs.firstOrNull { it.id == id } ?: return
         if (tab0.url == "swift://home") {
@@ -811,7 +761,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Brings a restored tab's page back (with its back/forward history when possible).
     fun loadTabContent(id: Long, wv: WebView) {
         var restored = false
         val f = File(context.filesDir, "tab_$id.bin")
@@ -834,11 +783,9 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Saves tabs, groups, page history, thumbnails and icons so that closing
-    // the app and reopening it brings everything back.
     fun saveSession() {
         try {
-            val saveTabs = tabs.filter { !it.isPrivate } // private tabs are never written to disk
+            val saveTabs = tabs.filter { !it.isPrivate }
             val o = org.json.JSONObject()
             o.put("active", activeId)
             o.put("next", idCounter.get())
@@ -902,14 +849,12 @@ private fun SwiftBrowserApp() {
                     savedHome[0] = bmp
                 }
             }
-            // Remove files of tabs that no longer exist.
             val pattern = Regex("^(tab|thumb|fav)_(\\d+)\\.")
             dir.listFiles()?.forEach { f ->
                 val m = pattern.find(f.name)
                 if (m != null && (m.groupValues[2].toLongOrNull() ?: -1L) !in ids) f.delete()
             }
         } catch (e: Exception) {
-            // Saving is best effort; never crash the browser because of it.
         }
     }
 
@@ -930,8 +875,7 @@ private fun SwiftBrowserApp() {
         if (index >= 0) tabs[index] = tabs[index].copy(url = url, title = title, blockedCount = count)
     }
 
-    // ---- HTTPS first (like Brave): try https for http links, fall back if the site has none ----
-    val httpsUpgrades = remember { HashMap<String, String>() }   // https url we tried -> original http url
+    val httpsUpgrades = remember { HashMap<String, String>() }
     val noUpgradeHosts = remember { HashSet<String>() }
     val lastUpgradeAt = remember { HashMap<String, Long>() }
 
@@ -943,7 +887,6 @@ private fun SwiftBrowserApp() {
             host.contains(':') || Regex("^[0-9.]+$").matches(host)
         ) return url
         val now = System.currentTimeMillis()
-        // The site sent us straight back to http: stop upgrading it.
         if (now - (lastUpgradeAt[host] ?: 0L) < 6000L) { noUpgradeHosts.add(host); return url }
         lastUpgradeAt[host] = now
         val https = "https://" + url.removePrefix("http://")
@@ -953,41 +896,22 @@ private fun SwiftBrowserApp() {
 
     fun normalize(input: String): String {
         val value = input.trim()
-
-        if (value.isEmpty()) {
-            return "swift://home"
-        }
-
-        // Real URLs go straight through.
-        if (value.startsWith("http://") || value.startsWith("https://")) {
-            return value
-        }
-
-        // Only navigate to a site when the input really looks like a domain
-        // (e.g. "wikipedia.org"). Bare words like "google", "brave" or
-        // "fydeos" and anything with spaces are search queries.
+        if (value.isEmpty()) return "swift://home"
+        if (value.startsWith("http://") || value.startsWith("https://")) return value
         val looksLikeDomain = value.contains(".") &&
             !value.contains(" ") &&
             value.substringAfterLast('.', "").length >= 2 &&
             value.substringAfterLast('.', "").all { it.isLetterOrDigit() }
-
-        if (!looksLikeDomain) {
-            // Search in-page with Brave Search — results render inside the
-            // app instead of opening a search-engine homepage.
-            return appSettings.searchUrl(value)
-        }
-
+        if (!looksLikeDomain) return appSettings.searchUrl(value)
         return "https://$value"
     }
 
     fun load(input: String) {
         val value = input.trim()
-
         if (value.isEmpty()) {
             load("swift://home")
             return
         }
-
         if (value.startsWith("swift://")) {
             if (value == "swift://home" && pageUrl.startsWith("http")) homeForward[activeId] = pageUrl
             pageUrl = value
@@ -995,7 +919,6 @@ private fun SwiftBrowserApp() {
             pageTitle = if (value == "swift://home") "New tab" else "Swift Browser"
             blockedCount = 0
             updateActiveTab(pageUrl, pageTitle, 0)
-            // Blank the tab's WebView so no old page can show through later.
             activeWebView()?.let { it.loadUrl("about:blank"); it.clearHistory() }
             ThumbStore.remove(activeId)
             findOpen = false
@@ -1006,11 +929,10 @@ private fun SwiftBrowserApp() {
             focusManager.clearFocus()
             return
         }
-
-        homeForward.remove(activeId) // a new page was opened: nothing to go forward to any more
+        homeForward.remove(activeId)
         val url = httpsFirst(normalize(value))
         if (url == appSettings.searchUrl(value) && tabs.firstOrNull { it.id == activeId }?.isPrivate != true) {
-            store.addQuery(value) // typed searches feed the suggestions
+            store.addQuery(value)
         }
         pageUrl = url
         address = url
@@ -1022,8 +944,6 @@ private fun SwiftBrowserApp() {
         activeWebView()?.loadUrl(url)
         showSuggestions = false
         showTabs = false
-        // Hide the keyboard so the loaded page / search results are
-        // immediately visible — like Brave.
         keyboardController?.hide()
         focusManager.clearFocus()
     }
@@ -1039,7 +959,6 @@ private fun SwiftBrowserApp() {
         showTabs = false
     }
 
-    // "+" in the Groups section: a brand-new group that holds one fresh tab.
     fun newGroupWithTab() {
         val gid = groupCounter++
         val id = idCounter.get()
@@ -1088,15 +1007,12 @@ private fun SwiftBrowserApp() {
             return
         }
         val index = tabs.indexOfFirst { it.id == tab.id }
-        // Closing a tab inside a group goes to the neighbouring tab of the same group;
-        // only when the group is empty does it go to the previous tab or group.
         val closedGroup = tabGroups[tab.id]
         val groupMates = if (closedGroup != null) tabs.filter { tabGroups[it.id] == closedGroup } else emptyList()
         val matePos = groupMates.indexOfFirst { it.id == tab.id }
         val remainingMates = groupMates.filter { it.id != tab.id }
         tabs.removeAll { it.id == tab.id }
         tabGroups.remove(tab.id)
-        // There is always at least one normal tab; private tabs live beside them.
         if (tabs.none { !it.isPrivate }) tabs.add(0, BrowserTab(idCounter.getAndIncrement()))
         if (activeId == tab.id) {
             val sameKind = tabs.filter { it.isPrivate == tab.isPrivate }
@@ -1104,34 +1020,28 @@ private fun SwiftBrowserApp() {
                 ?: sameKind.getOrNull((index - 1).coerceAtLeast(0).coerceAtMost(sameKind.size - 1))
                 ?: tabs.lastOrNull { !it.isPrivate } ?: tabs.first()
             selectTab(next)
-            // Closing a tab from the overview must not leave the overview.
             if (fromOverview) showTabs = true
         }
     }
 
-    // Merge the dragged card (tab or whole group) into the drop target.
     fun handleGroupDrop(sourceKey: Long, targetKey: Long) {
         if (sourceKey == targetKey) return
         val sourceGroup = if (sourceKey >= GROUP_ID_BASE) sourceKey else tabGroups[sourceKey]
         val targetGroup = if (targetKey >= GROUP_ID_BASE) targetKey else tabGroups[targetKey]
 
         when {
-            // Group onto group / grouped tab: merge both groups together.
             sourceGroup != null && targetGroup != null && sourceGroup != targetGroup ->
                 tabGroups.keys.filter { tabGroups[it] == sourceGroup }.forEach {
                     tabGroups[it] = targetGroup
                 }
-            // Loose tab onto an existing group: join it.
             sourceGroup == null && targetGroup != null ->
                 tabGroups[sourceKey] = targetGroup
-            // Loose tab onto loose tab: create a new group with both.
             sourceGroup == null && targetGroup == null && targetKey != NEW_TAB_KEY -> {
                 val gid = groupCounter++
                 tabGroups[sourceKey] = gid
                 tabGroups[targetKey] = gid
                 pendingEditGroup = gid
             }
-            // Group onto a loose tab: pull that tab into the group.
             sourceGroup != null && targetGroup == null ->
                 tabGroups[targetKey] = sourceGroup
         }
@@ -1139,7 +1049,6 @@ private fun SwiftBrowserApp() {
         if (resultGid != null) groupUpdated[resultGid] = System.currentTimeMillis()
     }
 
-    // Dropped on empty space: drag a tab out of its group / dissolve a group.
     fun handleDropOutside(key: Long) {
         if (key >= GROUP_ID_BASE) {
             tabGroups.keys.filter { tabGroups[it] == key }.forEach { tabGroups.remove(it) }
@@ -1150,7 +1059,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Reorder: move a tab (or a whole group) before/after another tab or group.
     fun moveEntry(sourceKey: Long, targetKey: Long, after: Boolean) {
         if (sourceKey == targetKey) return
         fun idsOf(key: Long): List<Long> =
@@ -1163,13 +1071,11 @@ private fun SwiftBrowserApp() {
         val idx = if (after) rest.indexOfLast { it.id in tgtIds } + 1 else rest.indexOfFirst { it.id in tgtIds }
         if (idx < 0) return
         rest.addAll(idx.coerceIn(0, rest.size), moving)
-        // Called live while dragging: ignore moves that change nothing.
         if (rest.map { it.id } == tabs.map { it.id }) return
         tabs.clear()
         tabs.addAll(rest)
     }
 
-    // Group-icon action: collect every loose tab into one group.
     fun groupAllTabs() {
         val loose = tabs.filter { tabGroups[it.id] == null && !it.isPrivate }
         if (loose.size < 2) {
@@ -1183,9 +1089,7 @@ private fun SwiftBrowserApp() {
         Toast.makeText(context, "Grouped ${loose.size} tabs", Toast.LENGTH_SHORT).show()
     }
 
-    // Delete-all action: closes every tab and lands on a fresh home tab.
     fun closeAllTabs() {
-        // Closes the tabs of the section you are looking at (normal or private).
         val priv = showTabs && tabSection == 2
         tabs.filter { it.isPrivate == priv }.forEach { recordClosed(it) }
         tabs.removeAll { it.isPrivate == priv }
@@ -1199,12 +1103,9 @@ private fun SwiftBrowserApp() {
         Toast.makeText(context, if (priv) "Private tabs closed" else "All tabs closed", Toast.LENGTH_SHORT).show()
     }
 
-    // Failed first loads: how often each URL was retried, and which URLs just errored.
     val retryCounts = remember { HashMap<String, Int>() }
     val erroredUrls = remember { HashSet<String>() }
 
-    // ---- Swipe on the address bar: book-style page turn to the next / previous tab ----
-    // (same kind only: normal tabs stay with normal tabs, private with private)
     fun neighborFor(dir: Int): BrowserTab? {
         val cur = tabs.firstOrNull { it.id == activeId } ?: return null
         val pool = tabs.filter { it.isPrivate == cur.isPrivate }
@@ -1220,7 +1121,6 @@ private fun SwiftBrowserApp() {
         val src = android.graphics.Rect(webArea)
         val bmp = Bitmap.createBitmap(src.width(), src.height(), Bitmap.Config.ARGB_8888)
         try {
-            // A full-size picture of the page, so it looks identical while it turns.
             android.view.PixelCopy.request(
                 activity.window, src, bmp,
                 android.view.PixelCopy.OnPixelCopyFinishedListener { r ->
@@ -1231,13 +1131,12 @@ private fun SwiftBrowserApp() {
                 },
                 Handler(Looper.getMainLooper())
             )
-        } catch (e: Exception) { /* no animation, the swipe just won't switch */ }
+        } catch (e: Exception) { }
     }
 
     fun updateSwipe(totalPx: Float) {
         val w = context.resources.displayMetrics.widthPixels.toFloat()
         var p = (totalPx / w).coerceIn(-1f, 1f)
-        // No tab on that side: only a small elastic nudge.
         if (neighborFor(if (p < 0) 1 else -1) == null) p = (p * 0.15f)
         swipeP = p
     }
@@ -1249,19 +1148,16 @@ private fun SwiftBrowserApp() {
         val flung = kotlin.math.abs(velX) > 900f && (velX < 0) == (p < 0)
         val commit = nb != null && (kotlin.math.abs(p) > 0.3f || flung)
         if (!swipeActive) {
-            // No picture to animate (capture failed / not ready yet): still switch, just without the slide.
             swipeP = 0f
             if (commit && nb != null) selectTab(nb)
             return
         }
         uiScope.launch {
-            // Freeze the revealed tab: selectTab() changes the active tab, which would otherwise
-            // make the overlay show the NEXT neighbour (the 'blink') until it is removed.
             swipeTarget = if (commit) nb else null
             animate(p, if (commit) (if (p < 0) -1f else 1f) else 0f, animationSpec = tween(if (commit) 200 else 170)) { v, _ -> swipeP = v }
             if (commit && nb != null) {
                 selectTab(nb)
-                delay(120) // let the real page paint before the picture goes away
+                delay(120)
             }
             swipeActive = false
             swipeP = 0f
@@ -1270,7 +1166,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // ---- Video: long-press menu, frame grab, picture-in-picture, fullscreen ----
     fun probeVideoAt(wv: WebView, tabId: Long, px: Float, py: Float) {
         @Suppress("DEPRECATION")
         val sc = wv.scale.takeIf { it > 0f } ?: context.resources.displayMetrics.density
@@ -1361,7 +1256,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Picture-in-Picture: the video goes full screen, then the window shrinks to the video.
     fun startPictureInPicture() {
         val wv = webViews[videoTabId] ?: return
         wv.evaluateJavascript(VIDEO_FULLSCREEN_JS, null)
@@ -1387,15 +1281,11 @@ private fun SwiftBrowserApp() {
         if (desktopSites[tabId] == true) view?.evaluateJavascript(DESKTOP_JS, null)
     }
 
-    // Translates the open page on the device (ML Kit): checks the language packs,
-    // downloads what is missing (with clear errors when offline / Wi-Fi only),
-    // then injects the page script that rewrites the text in place.
     fun translatePageInPlace(knownSource: String? = null) {
         val wv = activeWebView() ?: return
         val startTab = activeId
         val startUrl = pageUrl
         val offered = knownSource ?: translateOffer?.second.orEmpty()
-        // The same card stays on screen and shows a spinner; it turns into "Page translated / Undo" when done.
         translateBusy = startTab to offered
         translateOffer = null
         translateDone = null
@@ -1422,13 +1312,11 @@ private fun SwiftBrowserApp() {
                     TranslateEngine.ensureModels(context, src, tgt, appSettings.wifiOnlyModels, onProgress = { f ->
                         translateDl = srcName to f
                     }) {
-                        // Shown as a bar at the bottom of the page until the pack is on the device.
                         translateDl = srcName to 0f
                     }
                     translateDl = null
                     if (activeId == startTab && pageUrl == startUrl) {
                         wv.evaluateJavascript(TRANSLATE_JS + "\nwindow.__swiftTr.start('" + src + "');", null)
-                        // Safety: never leave the spinner up forever (e.g. a page with no text).
                         delay(20000)
                         if (translateBusy?.first == startTab) translateBusy = null
                     } else {
@@ -1455,8 +1343,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Like Brave: after a page loads, offer to translate it if it isn't in your language
-    // (or translate it straight away when the language pack is already downloaded).
     fun offerTranslateIfNeeded(view: WebView?, tabId: Long, url: String) {
         if (!appSettings.translateOffer && !appSettings.translateAuto) return
         val host = hostOf(url)
@@ -1485,7 +1371,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Puts the original text back in the page itself, no reload needed.
     fun undoTranslate() {
         val wv = activeWebView() ?: return
         translateDone = null
@@ -1497,10 +1382,6 @@ private fun SwiftBrowserApp() {
         canGoForward = activeWebView()?.canGoForward() == true
     }
 
-    // Builds the WebView for one tab. Callbacks only touch the shared UI state
-    // when this tab is the active one; otherwise they update just this tab.
-    // Every download (page links, long-press menu) goes through here so the Download
-    // settings (ask first, notifications) and the "Downloading file..." card always apply.
     fun enqueueDownload(d: PendingDownload) {
         val ua = d.userAgent ?: android.webkit.WebSettings.getDefaultUserAgent(context)
         val cookie = CookieManager.getInstance().getCookie(d.url)
@@ -1517,21 +1398,14 @@ private fun SwiftBrowserApp() {
         if (appSettings.askBeforeDownload) pendingDownload = d else enqueueDownload(d)
     }
 
-    // Shields script (pop-up guard, cosmetic filters, YouTube ad stripping) runs at document start.
     val shieldHandlers = remember { HashMap<Long, androidx.webkit.ScriptHandler>() }
     val shieldsAtStart = androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)
     fun installShields(wv: WebView, id: Long) {
         if (shieldHandlers.containsKey(id)) return
-        if (!shieldsAtStart) {
-            // Older WebViews can't run a script before the page; the onPageStarted
-            // fallback below injects it as early as possible instead.
-            return
-        }
+        if (!shieldsAtStart) return
         try {
             shieldHandlers[id] = androidx.webkit.WebViewCompat.addDocumentStartJavaScript(wv, SHIELDS_JS, setOf("*"))
         } catch (e: Exception) {
-            // Never swallow silently again: if this fails, the onPageStarted fallback is
-            // the only thing keeping shields alive on the page.
             android.util.Log.w("SwiftShields", "addDocumentStartJavaScript failed for tab $id", e)
         }
     }
@@ -1553,22 +1427,18 @@ private fun SwiftBrowserApp() {
 
     fun createWebView(ctx: Context, tabId: Long): WebView {
         return WebView(ctx).apply {
-            // Dark background so a not-yet-painted page never flashes white.
             setBackgroundColor(android.graphics.Color.rgb(16, 17, 20))
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.loadsImagesAutomatically = true
             settings.javaScriptCanOpenWindowsAutomatically = false
             settings.setSupportMultipleWindows(false)
-            
-            // Set UA immediately to avoid mid-session changes that break Cloudflare CAPTCHAs
             settings.userAgentString = android.webkit.WebSettings.getDefaultUserAgent(ctx)
             if (desktopSites[tabId] == true) {
                 settings.userAgentString = desktopUserAgent(ctx)
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
             }
-
             if (currentBlockingEnabled) installShields(this, tabId)
             settings.allowFileAccess = false
             settings.allowContentAccess = false
@@ -1587,7 +1457,6 @@ private fun SwiftBrowserApp() {
             )
             CookieManager.getInstance().setAcceptCookie(true)
 
-            // On-device translation bridge (see WebAppInterface.kt / TranslateJs.kt)
             addJavascriptInterface(WebAppInterface(
                 webView = this,
                 getTarget = { appSettings.translateTarget },
@@ -1600,23 +1469,18 @@ private fun SwiftBrowserApp() {
                 }
             ), "SwiftTranslator")
 
-            // Shields host list for the JS fetch / XHR / beacon / WebSocket shim in SHIELDS_JS.
-            // Exposing the blocklist to JS lets us reject ad requests at the API level (a 403
-            // through shouldInterceptRequest still resolves fetch(), so testers say "not blocked").
             addJavascriptInterface(object {
                 @android.webkit.JavascriptInterface
                 fun getBlockedHosts(): String =
                     try { blocker.blockedHostsJson() } catch (e: Exception) { "{}" }
             }, "SwiftFilter")
 
-            // Saved settings: text size, JavaScript, images, Safe Browsing, third-party cookies.
             appSettings.applyTo(this)
             if (tabs.firstOrNull { it.id == tabId }?.isPrivate == true) {
                 settings.cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
                 settings.saveFormData = false
             }
 
-            // Password Manager: the page reports sign-in submits (never reads anything back).
             addJavascriptInterface(PasswordBridge(this) { host, user, pass ->
                 if (host.isNotEmpty() && passwordStore.offerToSave && !currentPrivateMode && tabs.firstOrNull { it.id == tabId }?.isPrivate != true && !passwordStore.isNever(host)) {
                     val existing = passwordStore.find(host, user)
@@ -1626,14 +1490,12 @@ private fun SwiftBrowserApp() {
                 }
             }, "SwiftPasswords")
 
-            // Remember where the finger went down (needed to find a video under a long press).
             val lastTouch = FloatArray(2)
             setOnTouchListener { _, ev ->
                 if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) { lastTouch[0] = ev.x; lastTouch[1] = ev.y }
                 false
             }
 
-            // Press and hold on a link or image: Brave-style menu.
             setOnLongClickListener { v ->
                 val wv = v as WebView
                 val hit = wv.hitTestResult
@@ -1644,7 +1506,6 @@ private fun SwiftBrowserApp() {
                 val isImage = type == WebView.HitTestResult.IMAGE_TYPE ||
                     type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
                 if ((!isLink && !isImage) || extra == null || extra.startsWith("javascript:")) {
-                    // Maybe a video: look under the finger (normal text selection still works).
                     if (!isLink && !isImage) probeVideoAt(wv, tabId, lastTouch[0], lastTouch[1])
                     return@setOnLongClickListener false
                 }
@@ -1707,14 +1568,9 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
-                // Without this, JS errors from SHIELDS_JS (and any other injected script)
-                // are invisible in Logcat. Watch "adb logcat | grep SwiftWeb" while testing.
                 override fun onConsoleMessage(msg: android.webkit.ConsoleMessage?): Boolean {
                     if (msg != null) {
-                        android.util.Log.d(
-                            "SwiftWeb",
-                            "[${msg.messageLevel()}] ${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})"
-                        )
+                        android.util.Log.d("SwiftWeb", "[${msg.messageLevel()}] ${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
                     }
                     return false
                 }
@@ -1726,16 +1582,9 @@ private fun SwiftBrowserApp() {
                     request: WebResourceRequest?
                 ): Boolean {
                     val uri = request?.url ?: return false
-                    val currentUrl = view?.url ?: ""
                     
-                    // Block unexpected cross-domain redirects (spam/pop-unders)
-                    if (currentBlockingEnabled && request.isForMainFrame && 
-                        blocker.isMaliciousMainFrameRedirect(uri.toString(), currentUrl, request.hasGesture())) {
-                        countBlocked(tabId)
-                        return true
-                    }
-
-                    // Spam redirects / pop-unders that navigate to an ad network are cancelled.
+                    // We removed the strict isMaliciousMainFrameRedirect check here so shortlinks work.
+                    // The pop-up blocker and ad-host blocker still handle spam.
                     if (currentBlockingEnabled && request.isForMainFrame &&
                         (blocker.isAdHost(uri.host) || blocker.isSpamRedirect(uri.toString(), firstParty[tabId], request.hasGesture()))) {
                         countBlocked(tabId)
@@ -1758,7 +1607,6 @@ private fun SwiftBrowserApp() {
                 ) {
                     handler?.cancel()
                     val failed = error?.url ?: return
-                    // The https upgrade didn't work out: go back to the plain http page.
                     httpsUpgrades.remove(failed)?.let { http ->
                         noUpgradeHosts.add(hostOf(http))
                         view?.post { view.loadUrl(http) }
@@ -1778,25 +1626,17 @@ private fun SwiftBrowserApp() {
                         (h == "www.gstatic.com" && url.contains("/translate/"))
                     ) return null
 
-                    // Keep firstParty in sync for the very first subresources of a new page:
-                    // they can arrive before onPageStarted runs, so without this the previous
-                    // page's host would be used.
                     if (req.isForMainFrame) firstParty[tabId] = url
 
                     if (currentBlockingEnabled && blocker.shouldBlock(url, firstParty[tabId] ?: "", req.isForMainFrame)) {
                         countBlocked(tabId)
-                        // A response with a throwing body makes the request fail
-                        // (net::ERR_FAILED), which is what a real blocker looks like to
-                        // the page and to ad-block testers for <script>/<img>/<iframe>.
-                        // fetch/XHR still resolve on a 403 — those are handled by the
-                        // JS shim in SHIELDS_JS (section 5), which rejects the promise.
                         return blockedResponse(url)
                     }
                     return null
                 }
 
-                // First loads often fail with a DNS / connection error and work a moment later
-                // (cold radio, slow resolver). Retry the page quietly a couple of times first.
+                // FIXED: The "Webpage not available" flash. 
+                // Instead of immediately showing the error, we retry silently.
                 override fun onReceivedError(
                     view: WebView?,
                     request: WebResourceRequest?,
@@ -1805,10 +1645,14 @@ private fun SwiftBrowserApp() {
                     super.onReceivedError(view, request, error)
                     if (request?.isForMainFrame != true || view == null) return
                     val code = error?.errorCode ?: return
+                    
+                    // Ignore errors if the page actually loaded successfully (common WebView bug)
+                    if (view.progress >= 100) return
+
                     val retryable = code == WebViewClient.ERROR_HOST_LOOKUP || code == WebViewClient.ERROR_CONNECT ||
                         code == WebViewClient.ERROR_TIMEOUT || code == WebViewClient.ERROR_IO
                     val failed = request.url.toString()
-                    // https-first didn't work (site has no https): load the http page instead.
+                    
                     if (code != WebViewClient.ERROR_HOST_LOOKUP) {
                         httpsUpgrades.remove(failed)?.let { http ->
                             noUpgradeHosts.add(hostOf(http))
@@ -1816,12 +1660,17 @@ private fun SwiftBrowserApp() {
                             return
                         }
                     }
+                    
                     erroredUrls.add(failed)
                     val tries = retryCounts[failed] ?: 0
+                    
+                    // Retry up to 3 times quickly before giving up
                     if (retryable && tries < 3) {
                         retryCounts[failed] = tries + 1
                         view.postDelayed({
-                            if (webViews[tabId] === view && (view.url == failed || view.originalUrl == failed)) view.loadUrl(failed)
+                            if (webViews[tabId] === view && (view.url == failed || view.originalUrl == failed)) {
+                                view.loadUrl(failed)
+                            }
                         }, 500L * (tries + 1))
                     }
                 }
@@ -1832,9 +1681,6 @@ private fun SwiftBrowserApp() {
                     favicon: android.graphics.Bitmap?
                 ) {
                     if (url == null || url.startsWith("about:")) return
-                    // Always inject too (belt and braces): SHIELDS_JS guards against double
-                    // injection with window.__swiftShields. If addDocumentStartJavaScript
-                    // threw during install, this is the only path keeping shields alive.
                     if (currentBlockingEnabled) view?.evaluateJavascript(SHIELDS_JS, null)
                     if (translateOffer?.first == tabId) translateOffer = null
                     if (translateDone?.first == tabId) translateDone = null
@@ -1858,7 +1704,11 @@ private fun SwiftBrowserApp() {
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (url == null || url.startsWith("about:")) return
-                    if (url in erroredUrls) erroredUrls.remove(url) else retryCounts.remove(url)
+                    
+                    // Only remove from erroredUrls if it successfully finished loading
+                    if (url in erroredUrls) erroredUrls.remove(url) 
+                    retryCounts.remove(url)
+                    
                     applyDesktopJs(view, tabId)
                     updateTabById(tabId, url = url)
                     refreshLayouts[tabId]?.endRefresh()
@@ -1892,15 +1742,13 @@ private fun SwiftBrowserApp() {
             }
 
             webViews[tabId] = this
-            // The tab that was open when the app closed comes back right away;
-            // other restored tabs load when you first open them.
             if (tabId == activeId && unloaded.remove(tabId)) loadTabContent(tabId, this)
             pendingLoads.remove(tabId)?.let { loadUrl(it) }
         }
     }
 
     fun bookmarksNow(): List<Pair<String, String>> {
-        val version = bookmarkRefresh // re-read whenever a bookmark changes
+        val version = bookmarkRefresh
         return if (version >= 0) bookmarkStore.list() else emptyList()
     }
 
@@ -1917,7 +1765,6 @@ private fun SwiftBrowserApp() {
         bookmarkRefresh++
     }
 
-    // Back only counts as "history" when the previous entry is a real page.
     fun canGoBackReal(): Boolean {
         val wv = activeWebView() ?: return false
         if (!wv.canGoBack()) return false
@@ -1947,7 +1794,6 @@ private fun SwiftBrowserApp() {
                 refreshNavigation()
             }
             !isHome -> load("swift://home")
-            // Keep the app (and all tabs) alive instead of closing it.
             else -> (context as? android.app.Activity)?.moveTaskToBack(true)
         }
     }
@@ -1958,7 +1804,6 @@ private fun SwiftBrowserApp() {
         load(u)
     }
 
-    // Opens next to the current tab and groups the two (joins the group it is in, if any).
     fun openUrlInNewTabInGroup(u: String) {
         val source = activeId
         openUrlInNewTab(u)
@@ -1971,7 +1816,6 @@ private fun SwiftBrowserApp() {
         load(u)
     }
 
-    // Downloads a link or image straight from the long-press menu.
     fun downloadFromUrl(u: String) {
         startDownload(u, null, null, null, pageUrl)
     }
@@ -1993,8 +1837,6 @@ private fun SwiftBrowserApp() {
         val wv = activeWebView() ?: return
         val on = !(desktopSites[activeId] ?: false)
         desktopSites[activeId] = on
-        // Setting the UA to null does not restore the phone UA on WebView, so
-        // switch back to the real default explicitly.
         wv.settings.userAgentString =
             if (on) desktopUserAgent(context) else android.webkit.WebSettings.getDefaultUserAgent(context)
         wv.settings.useWideViewPort = on
@@ -2003,10 +1845,9 @@ private fun SwiftBrowserApp() {
         wv.settings.builtInZoomControls = true
         wv.settings.displayZoomControls = false
         wv.clearCache(true)
-        wv.reload() // Reload immediately to keep UA consistent with the loaded page
+        wv.reload()
     }
 
-    // Clears cookies, storage and cache of the current site and closes its tabs.
     fun shredSiteData() {
         val url = pageUrl
         val host = hostOf(url)
@@ -2065,8 +1906,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    // Menu button, shared by the normal bottom bar and the tab-overview bar.
-    // The menu itself is drawn as an overlay at the end of this screen.
     @Composable
     fun SettingsMenuBox(dots: Boolean = false) {
         Box {
@@ -2110,9 +1949,6 @@ private fun SwiftBrowserApp() {
                 .statusBarsPadding()
                 .navigationBarsPadding()
         ) {
-            // Browser top bar: just the address pill, app logo inside it
-            // (like Brave's lion inside its omnibox).
-            // Hidden in the tab overview — Brave has no address bar there.
             if (!showTabs && address != "swift://settings" && address != "swift://downloads") {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
@@ -2127,7 +1963,6 @@ private fun SwiftBrowserApp() {
                         .padding(start = 8.dp, end = 14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // App logo inside the search bar.
                     Box(
                         Modifier.size(29.dp).clip(CircleShape)
                             .background(Brush.linearGradient(listOf(Accent, Color(0xFFE94D25)))),
@@ -2148,14 +1983,11 @@ private fun SwiftBrowserApp() {
                             .onFocusChanged {
                                 val wasFocused = addressFocused
                                 addressFocused = it.isFocused
-                                // Editing a search page shows just the query.
                                 if (it.isFocused && !wasFocused) {
                                     val q = searchQueryOf(address)
                                     if (q != null) address = q
-                                    // Brave: an empty field with the current page shown as a card below it.
                                     else if (pageUrl.startsWith("http")) address = ""
                                 }
-                                // Leaving the field without navigating restores the link.
                                 if (!it.isFocused && wasFocused && pageUrl.startsWith("http")) {
                                     address = pageUrl
                                 }
@@ -2171,7 +2003,6 @@ private fun SwiftBrowserApp() {
                             inner()
                         }
                     )
-                    // Only a clear button while typing; otherwise it is just the link.
                     if (addressFocused && address.isNotEmpty()) {
                         IconButton(
                             onClick = { address = ""; showSuggestions = false },
@@ -2181,8 +2012,6 @@ private fun SwiftBrowserApp() {
                         }
                     }
                 }
-                // Not editing: this layer owns every touch on the bar, so the address text can
-                // never scroll under the finger. Tap = start typing, horizontal drag = switch tab.
                 if (!addressFocused) {
                     Box(
                         Modifier.matchParentSize().pointerInput(Unit) {
@@ -2231,7 +2060,6 @@ private fun SwiftBrowserApp() {
             }
             }
 
-            // Find in page bar (menu > Find in page).
             if (findOpen && !showTabs) {
                 val findFocus = remember { androidx.compose.ui.focus.FocusRequester() }
                 LaunchedEffect(Unit) { findFocus.requestFocus() }
@@ -2286,8 +2114,6 @@ private fun SwiftBrowserApp() {
                 }
             }
 
-            // Small protection strip opens the detailed shield dashboard.
-            // Hidden in the tabs overview, like Brave, and while the address card is open.
             if (!showTabs && address != "swift://settings" && address != "swift://downloads" &&
                 !(addressFocused && address.isBlank() && pageUrl.startsWith("http"))) {
             Row(
@@ -2316,7 +2142,6 @@ private fun SwiftBrowserApp() {
             }
             }
 
-            // Thin page-load progress line, like Brave.
             if (!showTabs && !isHome && loadProgress in 1..99) {
                 Box(Modifier.fillMaxWidth().height(2.dp)) {
                     Box(
@@ -2344,8 +2169,6 @@ private fun SwiftBrowserApp() {
                             modifier = Modifier
                                 .fillMaxSize()
                                 .then(
-                                    // Brave-style: the page blurs behind the omnibox
-                                    // while typing (no-op below Android 12).
                                     if (isCurrent && showSuggestions && !isHome) Modifier.blur(14.dp) else Modifier
                                 )
                                 .alpha(if (pageVisible) 1f else 0f),
@@ -2414,15 +2237,11 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                // Brave-style slide while swiping the address bar: the current page and the
-                // neighbouring tab sit side by side and move together with the finger.
-                // The address bar itself never moves.
                 if (swipeActive) {
                     val p = swipeP
                     val nb = swipeTarget ?: neighborFor(if (p < 0) 1 else -1)
                     Box(Modifier.fillMaxSize().clipToBounds().background(Bg)) {
                         Box(Modifier.fillMaxSize().graphicsLayer {
-                            // p<0: next tab arrives from the right; p>0: previous tab from the left.
                             translationX = (if (p < 0) 1f else -1f) * size.width * (1f - kotlin.math.abs(p))
                         }) { SwipeTabPreview(nb) }
                         swipeCur?.let { bmp ->
@@ -2435,9 +2254,6 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
-                // Tapping the search bar dims everything below it — on every
-                // screen (home, results) and every Android version.
-                // The wallpaper blur on home adds on top of this.
                 androidx.compose.animation.AnimatedVisibility(
                     visible = addressFocused && !showTabs,
                     enter = fadeIn(tween(120)),
@@ -2456,8 +2272,6 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                // Tapping the address bar on a page: the page as a card (share / copy / edit)
-                // with quick-access sites under it, like Brave.
                 androidx.compose.animation.AnimatedVisibility(
                     visible = addressFocused && address.isBlank() && pageUrl.startsWith("http") && !showTabs,
                     enter = fadeIn(tween(120)),
@@ -2597,8 +2411,6 @@ private fun SwiftBrowserApp() {
                         },
                         onWebSettingsChanged = { webViews.values.forEach { appSettings.applyTo(it) } },
                         onClearCache = { webViews.values.forEach { it.clearCache(true) } },
-                        // Wire your history store's clear function here to show "Browsing history"
-                        // in the Clear browsing data dialog, e.g. { store.clearHistory() }.
                         onClearHistory = null,
                         onOpenPrivacyDashboard = {
                             address = if (isHome) "" else pageUrl
@@ -2687,7 +2499,6 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
-                // "Downloading file..." card under the address bar, like Brave.
                 androidx.compose.animation.AnimatedVisibility(
                     visible = downloadNoticeVisible && !showTabs &&
                         address != "swift://downloads" && address != "swift://settings",
@@ -2721,7 +2532,6 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
-                // Language pack download for the page: a bar that stays until the download is finished.
                 androidx.compose.animation.AnimatedVisibility(
                     visible = translateDl != null && !showTabs,
                     enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { it }),
@@ -2753,25 +2563,18 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
-                // Brave-style translate card: "Translate page?" first, then "Page translated / Undo".
-                // Goes away by itself, or swipe it up.
                 val banner = translateDone ?: translateBusy ?: translateOffer
-                val loaded = loadProgress >= 100 // never pop up (or start counting down) while the page is loading
-                // The card keeps its last text while it slides away, so it can't flash other content.
+                val loaded = loadProgress >= 100
                 val lastBanner = remember { arrayOfNulls<Pair<Long, String>>(1) }
-                val lastKind = remember { IntArray(1) } // 0 offer, 1 translating, 2 translated
+                val lastKind = remember { IntArray(1) }
                 if (banner != null) {
                     lastBanner[0] = banner
                     lastKind[0] = if (translateDone != null) 2 else if (translateBusy != null) 1 else 0
                 }
                 val bannerDone = lastKind[0] == 2
                 val bannerBusy = lastKind[0] == 1
-                // Lives outside the card: resetting it when the card is dismissed made it jump back
-                // for a frame before disappearing (the jitter on swipe-up).
                 var swipeY by remember { mutableFloatStateOf(0f) }
                 LaunchedEffect(banner != null) { if (banner != null) swipeY = 0f }
-                // Set when the card was swiped away: it is already off screen, so it must not
-                // play the normal slide-out (that was the jump you saw).
                 var bannerSwiped by remember { mutableStateOf(false) }
                 LaunchedEffect(banner, lastKind[0], loaded) {
                     if (banner != null) {
@@ -2796,13 +2599,9 @@ private fun SwiftBrowserApp() {
                     val fromName = java.util.Locale(code).getDisplayLanguage()
                     val from = fromName.ifBlank { "Detected language" }
                     val to = TranslateEngine.displayName(appSettings.translateTarget)
-                    // The swipe offset is a plain state, so the card follows the finger exactly
-                    // (no coroutine per drag step). Letting go animates it back or off the top.
                     val bannerScope = rememberCoroutineScope()
                     var settleJob by remember(banner) { mutableStateOf<Job?>(null) }
                     fun dismissBanner() {
-                        // Swiping the card away also silences the "translated"
-                        // confirmation that would otherwise pop straight back.
                         translateDismissedUrl = pageUrl
                         translateOffer = null
                         translateDone = null
@@ -2893,11 +2692,10 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
-                // Web suggestions for what you type (from the engine chosen in Settings).
                 LaunchedEffect(address, showSuggestions) {
                     val q = address.trim()
                     if (showSuggestions && q.isNotEmpty() && !q.startsWith("http") && !q.startsWith("swift://")) {
-                        delay(120) // keep the old list on screen while the next one loads (no flicker)
+                        delay(120)
                         webSuggestions = withContext(Dispatchers.IO) { fetchSuggestions(q, appSettings.searchEngine) }
                     } else {
                         webSuggestions = emptyList()
@@ -2915,7 +2713,6 @@ private fun SwiftBrowserApp() {
                         (term.contains('.') || term.startsWith("localhost") || term.startsWith("http"))
                     val isPrivateNow = tabs.firstOrNull { it.id == activeId }?.isPrivate == true
 
-                    // Sites you've been to / bookmarked: best matches first, at most 2 (so the keyboard never hides them).
                     val siteHits = remember(term, showSuggestions) {
                         val bm = bookmarksNow().map { Triple(it.first, it.second, true) }
                         val hist = store.history().map { Triple(it.first, it.second, false) }
@@ -2934,12 +2731,10 @@ private fun SwiftBrowserApp() {
                             }
                             .sortedBy { it.first }.map { it.second }.take(2)
                     }
-                    // Searches you typed before that match (not in private tabs).
                     val pastQueries = remember(term, showSuggestions) {
                         if (isPrivateNow) emptyList()
                         else store.queries().filter { it.startsWith(term, true) && !it.equals(term, true) }.take(2)
                     }
-                    // 3 keyword suggestions: your past searches first, then the engine's.
                     val keywordRows = (pastQueries.map { it to true } +
                         webSuggestions.filter { w -> pastQueries.none { it.equals(w, true) } }.map { it to false })
                         .take(3)
@@ -3080,14 +2875,10 @@ private fun SwiftBrowserApp() {
                 }
             }
 
-            // Brave-style group strip: when the open tab belongs to a group, a
-            // slim bar lets you jump between that group's tabs.
             val activeGid = tabGroups[activeId]
             if (!showTabs && activeGid != null) {
                 val members = tabs.filter { tabGroups[it.id] == activeGid }
                 val gColor = groupColorOf(activeGid)
-                // Plain boxes (not IconButton) so sizes are exact: IconButton
-                // inflates itself to a 48dp touch target and distorts the bar.
                 Row(
                     Modifier.fillMaxWidth().height(52.dp).background(Bg)
                         .padding(start = 8.dp, end = 14.dp),
@@ -3122,8 +2913,6 @@ private fun SwiftBrowserApp() {
                                     if (m.url == "swift://home" || hostOf(m.url).isEmpty()) {
                                         SiteBadge(m, 22.dp)
                                     } else {
-                                        // White disc behind the icon (like Brave) so dark
-                                        // logos stay visible on the dark theme.
                                         Box(
                                             Modifier.size(26.dp).clip(CircleShape).background(Color.White),
                                             contentAlignment = Alignment.Center
@@ -3156,10 +2945,7 @@ private fun SwiftBrowserApp() {
                 }
             }
 
-            // Bottom bar — Brave-style. In the tab overview it becomes the
-            // overview bar: "+" centered, settings at the right.
             if (address == "swift://settings" || address == "swift://downloads") {
-                // Settings and Downloads are full screen pages: no toolbar, like Brave.
             } else if (showTabs) {
                 Box(
                     Modifier
@@ -3167,7 +2953,6 @@ private fun SwiftBrowserApp() {
                         .background(Surface)
                         .padding(horizontal = 12.dp, vertical = 4.dp)
                 ) {
-                    // Brave-style "+" pill: light background, dark icon.
                     Row(
                         Modifier
                             .align(Alignment.Center)
@@ -3194,8 +2979,6 @@ private fun SwiftBrowserApp() {
                 horizontalArrangement = Arrangement.SpaceAround,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-
-                // HOME
                 ToolbarButton(
                     Icons.Default.Home,
                     "Home",
@@ -3204,7 +2987,6 @@ private fun SwiftBrowserApp() {
                     load("swift://home")
                 }
 
-                // BOOKMARKS
                 val canBookmarkPage = !isHome && pageUrl.startsWith("http")
                 ToolbarButton(
                     if (canBookmarkPage && isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
@@ -3214,14 +2996,12 @@ private fun SwiftBrowserApp() {
                     if (canBookmarkPage) {
                         toggleBookmark()
                     } else {
-                        // Not on a web page: nothing to save, so open the list instead.
                         address = "swift://bookmarks"
                         showTabs = false
                         showSuggestions = false
                     }
                 }
 
-                // SEARCH
                 ToolbarButton(
                     Icons.Default.Search,
                     "Search"
@@ -3232,7 +3012,6 @@ private fun SwiftBrowserApp() {
                     keyboardController?.show()
                 }
 
-                // TABS
                 val activeIsPrivate = tabs.firstOrNull { it.id == activeId }?.isPrivate == true
                 TabCountButton(tabs.count { it.isPrivate == activeIsPrivate }, showTabs) {
                     if (!showTabs) {
@@ -3246,13 +3025,11 @@ private fun SwiftBrowserApp() {
                     focusManager.clearFocus()
                 }
 
-                // SETTINGS (menu lives here now, not in the top bar)
                 SettingsMenuBox()
             }
             }
         }
 
-        // Brave: the group's tabs open as a popup right over the page.
         val sheetGid = tabGroups[activeId]
         if (showGroupSheet && !showTabs && sheetGid != null) {
             val members = tabs.filter { tabGroups[it.id] == sheetGid }
@@ -3276,7 +3053,6 @@ private fun SwiftBrowserApp() {
                 onReorder = { src, tgt, after -> moveEntry(src, tgt, after) }
             )
         }
-        // Tabs overview menu (like Brave): only tab actions.
         if (showMenu && showTabs) {
             BoxWithConstraints(
                 Modifier.fillMaxSize()
@@ -3433,7 +3209,6 @@ private fun SwiftBrowserApp() {
                             address = "swift://settings"
                             showSuggestions = false
                         }
-                        // Only offered while another browser (or none) is the default.
                         val isDefaultBrowser = remember(defaultCheck) { isDefaultBrowserNow(context) }
                         if (!isDefaultBrowser) MenuRow(Icons.Default.Public, "Set as default browser") {
                             showMenu = false
@@ -3677,7 +3452,6 @@ private fun HomeScreen(
     Box(
         Modifier
             .fillMaxSize()
-            // Tapping anywhere outside a control closes the keyboard.
             .pointerInput(Unit) {
                 detectTapGestures(
                     onTap = { onDismissKeyboard() },
@@ -3687,7 +3461,6 @@ private fun HomeScreen(
             }
     ) {
         WallpaperBackdrop(blurred = searchActive)
-        // Reading scrim so content stays legible over the wallpaper.
         Box(
             Modifier.fillMaxSize().background(
                 Brush.verticalGradient(
@@ -3798,25 +3571,16 @@ private fun HomeScreen(
     }
 }
 
-// Night-mountain wallpaper (no image asset needed).
-// The blurred variant renders the scene into a TINY bitmap and scales it back
-// up with bilinear filtering — that upscale IS the blur, and unlike
-// Modifier.blur() it works on every Android version, not just Android 12+.
 @Composable
 private fun WallpaperBackdrop(blurred: Boolean) {
-    // Sharp wallpaper — always drawn underneath.
     Canvas(Modifier.fillMaxSize()) {
                 val w = size.width
                 val h = size.height
-
-                // Night sky
                 drawRect(
                     Brush.verticalGradient(
                         listOf(Color(0xFF1C2540), Color(0xFF131826), Color(0xFF101114))
                     )
                 )
-
-                // Ambient glows
                 drawCircle(
                     Brush.radialGradient(
                         listOf(Color(0x59FF6B35), Color(0x00FF6B35)),
@@ -3835,8 +3599,6 @@ private fun WallpaperBackdrop(blurred: Boolean) {
                     radius = w * 0.45f,
                     center = Offset(w * 0.12f, h * 0.30f)
                 )
-
-                // Stars (deterministic placement)
                 for (i in 0 until 34) {
                     val sx = (i * 137.508f) % w
                     val sy = (i * 79.377f) % (h * 0.52f)
@@ -3846,20 +3608,13 @@ private fun WallpaperBackdrop(blurred: Boolean) {
                         center = Offset(sx, sy)
                     )
                 }
-
-                // Moon
                 drawCircle(Color(0x2EF2EAD8), radius = w * 0.06f, center = Offset(w * 0.72f, h * 0.09f))
                 drawCircle(Color(0x1AF2EAD8), radius = w * 0.075f, center = Offset(w * 0.72f, h * 0.09f))
-
-                // Snow-capped ridges
                 ridge(Color(0xFF26324B), 0.64f, 0.022f, 0.0f)
                 ridge(Color(0xFF1D2436), 0.74f, 0.028f, 1.7f)
                 ridge(Color(0xFF151A26), 0.85f, 0.034f, 3.4f)
     }
 
-    // The opaque pre-blurred bitmap fades in ON TOP of the sharp wallpaper
-    // when the search bar is active. Unlike Modifier.blur(), this renders
-    // on every Android version and every phone.
     androidx.compose.animation.AnimatedVisibility(
         visible = blurred,
         enter = fadeIn(tween(200)),
@@ -3876,23 +3631,18 @@ private fun WallpaperBackdrop(blurred: Boolean) {
     }
 }
 
-// Renders the wallpaper scene into a deliberately low-resolution bitmap.
 private fun renderWallpaperBitmap(): Bitmap {
     val w = 64
     val h = 144
     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bmp)
     val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-
-    // Night sky
     paint.shader = android.graphics.LinearGradient(
         0f, 0f, 0f, h.toFloat(),
         0xFF1C2540.toInt(), 0xFF101114.toInt(),
         android.graphics.Shader.TileMode.CLAMP
     )
     canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
-
-    // Ambient glows
     paint.shader = android.graphics.RadialGradient(
         w * 0.85f, h * 0.10f, w * 0.55f,
         0x59FF6B35.toInt(), 0x00FF6B35.toInt(),
@@ -3906,14 +3656,10 @@ private fun renderWallpaperBitmap(): Bitmap {
     )
     canvas.drawCircle(w * 0.12f, h * 0.30f, w * 0.45f, paint)
     paint.shader = null
-
-    // Moon
     paint.color = 0x2EF2EAD8.toInt()
     canvas.drawCircle(w * 0.72f, h * 0.09f, w * 0.07f, paint)
     paint.color = 0x1AF2EAD8.toInt()
     canvas.drawCircle(w * 0.72f, h * 0.09f, w * 0.075f, paint)
-
-    // Ridges
     drawFrameworkRidge(canvas, paint, 0xFF26324B.toInt(), 0.64f, 0.022f, 0.0f)
     drawFrameworkRidge(canvas, paint, 0xFF1D2436.toInt(), 0.74f, 0.028f, 1.7f)
     drawFrameworkRidge(canvas, paint, 0xFF151A26.toInt(), 0.85f, 0.034f, 3.4f)
@@ -4072,7 +3818,6 @@ private fun ShieldStat(label: String, value: String, modifier: Modifier = Modifi
     }
 }
 
-// A normal (single) tab card: favicon + title + close, then the page thumbnail.
 @Composable
 private fun SingleTabCard(
     tab: BrowserTab,
@@ -4137,8 +3882,6 @@ private fun SingleTabCard(
     }
 }
 
-// Brave-style group card: dark card tinted with the group's color, colored dot +
-// name + menu, and a 2x2 grid of large page thumbnails.
 @Composable
 private fun GroupCard(
     entry: TabEntry,
@@ -4276,14 +4019,12 @@ private fun TabSwitcher(
     val scope = rememberCoroutineScope()
     LaunchedEffect(Unit) { onOpenGroupConsumed() }
     var searching by remember { mutableStateOf(false) }
-    // A freshly created group asks for its name and color (like Brave).
     LaunchedEffect(editGroupRequest) {
         if (editGroupRequest != null) {
             renameKey = editGroupRequest
             onEditConsumed()
         }
     }
-    // Private section disappears with its last private tab.
     LaunchedEffect(privateTabs.isEmpty(), section) { if (section == 2 && privateTabs.isEmpty()) onSectionChange(0) }
     var dragKey by remember { mutableStateOf<Long?>(null) }
     var dragPos by remember { mutableStateOf(Offset.Zero) }
@@ -4291,10 +4032,8 @@ private fun TabSwitcher(
     var hoverKey by remember { mutableStateOf<Long?>(null) }
     val cardBounds = remember { mutableStateMapOf<Long, Rect>() }
     var gridTopLeft by remember { mutableStateOf(Offset.Zero) }
-    var hoverZone by remember { mutableIntStateOf(0) } // -1 = before target, 0 = merge, 1 = after target
+    var hoverZone by remember { mutableIntStateOf(0) }
     var dragSizePx by remember { mutableStateOf(Offset.Zero) }
-    // Vector from the finger to the held card's centre at pick-up, so the card
-    // stays exactly where it was and simply shrinks around the finger (Brave).
     var grabDelta by remember { mutableStateOf(Offset.Zero) }
     var bandKey by remember { mutableStateOf<Long?>(null) }
     var bandSince by remember { mutableLongStateOf(0L) }
@@ -4313,7 +4052,6 @@ private fun TabSwitcher(
     val density = LocalDensity.current
     val slackPx = with(density) { 7.dp.toPx() }
 
-    // Build grid entries: single tabs plus one card per group.
     val entries = run {
         val list = ArrayList<TabEntry>()
         val seen = mutableSetOf<Long>()
@@ -4334,17 +4072,14 @@ private fun TabSwitcher(
 
     val openEntry = openGroupKey?.let { k -> entries.firstOrNull { it.key == k && it.isGroup } }
 
-    // If the opened group disappeared (ungrouped / all tabs closed), go back to the grid.
     LaunchedEffect(entries) {
         if (openGroupKey != null && entries.none { it.key == openGroupKey && it.isGroup }) {
             openGroupKey = null
         }
     }
 
-    // Back button inside an opened group returns to the grid first.
     BackHandler(enabled = openEntry != null) { openGroupKey = null }
 
-    // Clear bounds of removed cards so drop targeting stays accurate.
     LaunchedEffect(entries) {
         val valid = entries.map { it.key }.toHashSet() + NEW_TAB_KEY
         cardBounds.keys.filterNot { it in valid }.forEach { cardBounds.remove(it) }
@@ -4367,8 +4102,6 @@ private fun TabSwitcher(
 
     fun groupColorFor(key: Long): Color = groupColorOf(key)
 
-    // The finger / held card may travel a little past the list on every side, so a
-    // tab can be dragged all the way to the left, top, right or bottom edge.
     fun clampToGrid(p: Offset): Offset {
         if (gridWidth <= 0 || gridHeight <= 0) return p
         val m = with(density) { 64.dp.toPx() }
@@ -4390,11 +4123,9 @@ private fun TabSwitcher(
         )
     }
 
-    // Where the (shrunk) held card is drawn: shrinks toward the finger, no jump.
     fun heldVisualCenter(): Offset =
         heldCenter(dragPos + grabDelta) - grabDelta * (1f - holdScale)
 
-    // Moves the held card to a new slot right away; the others shift to make room.
     fun liveMove(src: Long, target: Long, after: Boolean) {
         val sig = "$src>$target>$after"
         val now = System.currentTimeMillis()
@@ -4409,8 +4140,6 @@ private fun TabSwitcher(
         }
     }
 
-    // Held card dragged past the edge of the list (left, top, right or bottom) takes the
-    // first / last slot there. Only uses cards that are on screen, never stale positions.
     fun edgeSlot(src: Long): Pair<Long, Boolean>? {
         val onScreen = gridState.layoutInfo.visibleItemsInfo.map { it.key }.toSet()
         val rects = filtered.filter { it.key != src && it.key in onScreen }
@@ -4433,8 +4162,6 @@ private fun TabSwitcher(
         return null
     }
 
-    // Edges of a card: the others shift and the held card takes that slot.
-    // Middle of a card: merge into a group.
     fun updateHover(src: Long) {
         if (dragDistance <= 24f) {
             hoverKey = null
@@ -4455,7 +4182,6 @@ private fun TabSwitcher(
         if (t == null || r == null) {
             hoverKey = null
             hoverZone = 0
-            // Empty space below the last card: move to the end.
             val last = filtered.lastOrNull()
             val lr = last?.let { cardBounds[it.key] }
             if (last != null && lr != null && last.key != src && p.y > lr.bottom) {
@@ -4463,8 +4189,6 @@ private fun TabSwitcher(
             }
             return
         }
-        // Brave-style: judge by how much the held card covers another card.
-        // About half way over a card -> group them. Lingering at the edge -> reorder.
         val vc = heldVisualCenter()
         val hw = dragSizePx.x * holdScale / 2f
         val hh = dragSizePx.y * holdScale / 2f
@@ -4509,7 +4233,6 @@ private fun TabSwitcher(
         val merge = hoverKey
         val mergeRect = merge?.let { cardBounds[it] }
         if (dragDistance > 40f && merge != null && merge != NEW_TAB_KEY && mergeRect != null) {
-            // Merge: the held card flies into the target, then groups with it.
             settling = Settle(key, merge, heldVisualCenter(), mergeRect.center)
             hoverKey = null
             hoverZone = 0
@@ -4532,13 +4255,11 @@ private fun TabSwitcher(
     val latestFinish by rememberUpdatedState({ k: Long -> finishDrag(k) })
     val latestHover by rememberUpdatedState({ k: Long -> updateHover(k) })
 
-    // Opening the overview shows the tab you are on, not the top of the list.
     LaunchedEffect(Unit) {
         val idx = filtered.indexOfFirst { e -> e.tabs.any { it.id == activeId } }
         if (idx > 0) gridState.scrollToItem(idx)
     }
 
-    // Dragging near the top/bottom edge scrolls the list.
     LaunchedEffect(dragKey) {
         if (dragKey == null) return@LaunchedEffect
         val edge = with(density) { 96.dp.toPx() }
@@ -4557,10 +4278,8 @@ private fun TabSwitcher(
         }
     }
 
-    // ---------- Main tab grid ----------
     Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize().background(Bg)) {
-        // Brave-style header: centered switch between Tabs and Tab groups.
         Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
             Row(
                 Modifier.align(Alignment.Center)
@@ -4592,7 +4311,6 @@ private fun TabSwitcher(
                 ) {
                     Icon(Icons.Default.GridView, "Tab groups", tint = TextMain, modifier = Modifier.size(22.dp))
                 }
-                // Appears when the first private tab is opened, like Brave.
                 if (privateTabs.isNotEmpty()) {
                     Box(
                         Modifier.width(58.dp).height(40.dp)
@@ -4613,7 +4331,6 @@ private fun TabSwitcher(
             }
         }
 
-        // "Search your tabs" opens a full search screen (tabs list + web search), like Brave.
         Row(
             Modifier
                 .fillMaxWidth()
@@ -4631,7 +4348,6 @@ private fun TabSwitcher(
         }
 
         Box(
-            // Clipped to the list, so a dragged tab slides UNDER the search bar, not over it.
             Modifier.weight(1f).fillMaxWidth()
                 .clip(androidx.compose.ui.graphics.RectangleShape)
                 .onGloballyPositioned {
@@ -4640,8 +4356,6 @@ private fun TabSwitcher(
                     gridWidth = it.size.width
                 }
                 .pointerInput(Unit) {
-                    // Follows the finger for the whole drag (even if the held card scrolls
-                    // out of the list) and finishes the drag when the finger lifts.
                     awaitPointerEventScope {
                         while (true) {
                             val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
@@ -4680,8 +4394,6 @@ private fun TabSwitcher(
                     val isActiveEntry = activeMember.id == activeId
                     val isHovered = hoverKey == entry.key && dragKey != entry.key
 
-                    // Brave: the card under the dragged tab shrinks a little to
-                    // "absorb" it.
                     val absorbing = (isHovered && hoverZone == 0) || settling?.target == entry.key
                     val cardScale by animateFloatAsState(
                         targetValue = if (absorbing) 0.9f else 1f,
@@ -4692,7 +4404,6 @@ private fun TabSwitcher(
                         label = "absorb"
                     )
 
-                    // Items that scroll away must not leave stale drop targets behind.
                     DisposableEffect(entry.key) {
                         onDispose {
                             cardBounds.remove(entry.key)
@@ -4700,8 +4411,6 @@ private fun TabSwitcher(
                         }
                     }
 
-                    // A long press only STARTS the drag here; the list itself follows the
-                    // finger and finishes the drop, so dragging works across scrolling.
                     val dragModifier = Modifier
                         .alpha(if (dragKey == entry.key) 0f else 1f)
                         .pointerInput(entry.key) {
@@ -4724,7 +4433,6 @@ private fun TabSwitcher(
                             )
                         }
 
-                    // When cards shift to make room, each one slides from its old slot.
                     val moveAnim = remember { Animatable(Offset.Zero, Offset.VectorConverter) }
                     Box(
                         Modifier.fillMaxWidth().height(196.dp)
@@ -4801,8 +4509,6 @@ private fun TabSwitcher(
                 }
             }
 
-            // The real card (same size) is held under the finger while dragging.
-            // On drop it shrinks and flies into the target.
             dragKey?.let { key ->
                 val dragged = entries.firstOrNull { it.key == key }
                 if (dragged != null && dragSizePx.x > 0f) {
@@ -4855,7 +4561,6 @@ private fun TabSwitcher(
         }
     }
 
-    // ---------- Group popup (Brave: a small sheet over the dimmed grid) ----------
     if (openEntry != null) {
         GroupPopupOverlay(
             entry = openEntry,
@@ -4875,7 +4580,6 @@ private fun TabSwitcher(
         )
     }
 
-    // ---------- Search screen: matching tabs list + web search ----------
     if (searching) {
         BackHandler { searching = false }
         TabSearchScreen(
@@ -4902,8 +4606,6 @@ private fun TabSwitcher(
     }
 }
 
-// The group's tabs as a rounded popup over a dimmed screen. Used both in the
-// tab overview and directly over a web page (from the group bar).
 @Composable
 private fun GroupPopupOverlay(
     entry: TabEntry,
@@ -4922,13 +4624,12 @@ private fun GroupPopupOverlay(
     onReorder: (Long, Long, Boolean) -> Unit = { _, _, _ -> }
 ) {
     var popupMenu by remember { mutableStateOf(false) }
-    // Long-press a tab and drag it onto another one to swap places inside the group.
     var dragId by remember { mutableStateOf<Long?>(null) }
-    var finger by remember { mutableStateOf(Offset.Zero) }   // finger position in root coordinates
+    var finger by remember { mutableStateOf(Offset.Zero) }
     var heldTab by remember { mutableStateOf<BrowserTab?>(null) }
     var heldSize by remember { mutableStateOf(androidx.compose.ui.geometry.Size.Zero) }
     var popupOrigin by remember { mutableStateOf(Offset.Zero) }
-    var grab by remember { mutableStateOf(Offset.Zero) }     // finger offset inside the held card
+    var grab by remember { mutableStateOf(Offset.Zero) }
     var lastSwap by remember { mutableLongStateOf(0L) }
     val popupBounds = remember { mutableStateMapOf<Long, Rect>() }
     val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
@@ -4937,10 +4638,6 @@ private fun GroupPopupOverlay(
     val liveReorder by rememberUpdatedState(onReorder)
     val screenDensity = androidx.compose.ui.platform.LocalDensity.current.density
 
-    // While a tab is held: scroll the grid when the finger is near its top/bottom edge.
-    // Like Brave, nothing shifts while you are travelling: a tab only makes room once the
-    // finger has rested on the slot (or past the first / last row) for a moment, and never
-    // while the list is still scrolling. Only tabs that are really on screen count as targets.
     LaunchedEffect(dragId) {
         if (dragId == null) return@LaunchedEffect
         var dwellId: Long? = null
@@ -4960,7 +4657,7 @@ private fun GroupPopupOverlay(
                 else -> 0f
             }
             var scrolled = false
-            if (dy != 0f) scrolled = kotlin.math.abs(gridState.scrollBy(dy)) > 0.5f // + = toward the end
+            if (dy != 0f) scrolled = kotlin.math.abs(gridState.scrollBy(dy)) > 0.5f
             val now = System.currentTimeMillis()
             if (scrolled) lastScrollAt = now
 
@@ -4979,10 +4676,10 @@ private fun GroupPopupOverlay(
                 target = hit.id
                 after = tabsNow.indexOfFirst { it.id == hit.id } > from
             } else if (firstT != null && firstT.id != me && firstR != null && finger.y < firstR.top) {
-                target = firstT.id; after = false          // above the first row -> first slot
+                target = firstT.id; after = false
             } else if (lastT != null && lastT.id != me && lastR != null &&
                 (finger.y > lastR.bottom || (finger.y >= lastR.top && finger.x > lastR.right))) {
-                target = lastT.id; after = true            // below the last row -> last slot
+                target = lastT.id; after = true
             }
 
             val settled = now - lastScrollAt > 160 && now - lastSwap > 300
@@ -5076,15 +4773,12 @@ private fun GroupPopupOverlay(
                     userScrollEnabled = dragId == null,
                     modifier = Modifier.heightIn(max = 520.dp)
                         .onGloballyPositioned { gridBounds = it.boundsInRoot() }
-                        // Long-press + drag is handled here, not on a card: a card is thrown away by the
-                        // lazy grid once it scrolls far off screen, which used to cancel the drag halfway.
                         .pointerInput(Unit) {
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                                 val origin = gridBounds.topLeft
                                 val startRoot = origin + down.position
                                 val slop = viewConfiguration.touchSlop
-                                // Wait for a long press without disturbing taps / scrolling.
                                 var pressed = true
                                 val lp = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
                                     while (true) {
@@ -5145,8 +4839,6 @@ private fun GroupPopupOverlay(
                 }
             }
         }
-        // The held tab follows the finger no matter how far the list scrolls, but is clipped
-        // to the list, so pulling it up slides it UNDER the group header instead of over it.
         heldTab?.let { ht ->
             val dens = androidx.compose.ui.platform.LocalDensity.current
             val gb = gridBounds
@@ -5175,7 +4867,6 @@ private fun GroupPopupOverlay(
     }
 }
 
-// Tap a group's color circle any time to pick another color.
 @Composable
 private fun GroupColorPickerDialog(key: Long, onDismiss: () -> Unit) {
     val current = GroupColorStore[key] ?: (key % GroupColors.size).toInt()
@@ -5214,7 +4905,6 @@ private fun GroupColorPickerDialog(key: Long, onDismiss: () -> Unit) {
     )
 }
 
-// Menu building blocks (Brave-style menu).
 @Composable
 private fun MenuRow(
     icon: ImageVector,
@@ -5269,7 +4959,6 @@ private fun MenuCircleButton(
     }
 }
 
-// Name + color picker for a group (opens when a group is created or edited).
 @Composable
 private fun GroupEditDialog(
     key: Long,
@@ -5349,7 +5038,6 @@ private fun suggestionText(s: String, term: String): androidx.compose.ui.text.An
         }
     }
 
-// Search-engine suggestions for the typed text (best effort; empty on any failure).
 private fun fetchSuggestions(q: String, engine: String = "brave"): List<String> {
     val enc = Uri.encode(q)
     val primary = when (engine) {
@@ -5358,7 +5046,6 @@ private fun fetchSuggestions(q: String, engine: String = "brave"): List<String> 
         "bing" -> "https://api.bing.com/osjson.aspx?query=$enc"
         else -> "https://search.brave.com/api/suggest?q=$enc&rich=false"
     }
-    // The chosen engine first; the others only if it returns nothing.
     val urls = listOf(
         primary,
         "https://duckduckgo.com/ac/?type=list&q=$enc",
@@ -5438,7 +5125,6 @@ private fun SearchResultRow(
     }
 }
 
-// Brave-style tab search: a list of matching tabs/groups, then web search entries.
 @Composable
 private fun TabSearchScreen(
     tabs: List<BrowserTab>,
@@ -5630,7 +5316,6 @@ private fun ToolbarButton(
     }
 }
 
-// Tabs button: a rounded box with the number of open tabs (like Brave).
 @Composable
 private fun TabCountButton(count: Int, selected: Boolean, onClick: () -> Unit) {
     Box(
@@ -5658,7 +5343,6 @@ private data class Settle(val source: Long, val target: Long, val from: Offset, 
 private fun groupColorOf(key: Long): Color =
     GroupColors[(GroupColorStore[key] ?: (key % GroupColors.size).toInt()).coerceIn(0, GroupColors.size - 1)]
 
-// Dark card background tinted with the group's color (Brave style).
 private fun groupTint(c: Color): Color = lerp(Color(0xFF16181C), c, 0.34f)
 
 private fun groupLabel(names: Map<Long, String>, key: Long, count: Int): String =
@@ -5677,8 +5361,6 @@ private fun relativeTime(ts: Long): String {
     }
 }
 
-// Site icon: the page's real favicon when known, else a colored letter,
-// or a home icon for the start page.
 @Composable
 private fun SiteBadge(tab: BrowserTab, size: androidx.compose.ui.unit.Dp) {
     val host = hostOf(tab.url)
@@ -5707,7 +5389,6 @@ private fun SiteBadge(tab: BrowserTab, size: androidx.compose.ui.unit.Dp) {
     }
 }
 
-// "Tab groups" section: one row per group — preview, color dot, name, age.
 @Composable
 private fun GroupListSection(
     entries: List<TabEntry>,
@@ -5811,15 +5492,12 @@ private val SiteColors = listOf(
 private fun hostOf(url: String): String =
     runCatching { Uri.parse(url).host }.getOrNull()?.removePrefix("www.") ?: ""
 
-// Query of a Brave Search results URL, or null for any other URL.
 private fun searchQueryOf(url: String): String? {
     val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
     if (uri.host != "search.brave.com" || uri.path?.startsWith("/search") != true) return null
     return uri.getQueryParameter("q")
 }
 
-// What the address bar shows when not editing: a clean link, with the
-// search engine's address replaced by Swift's own name.
 private fun prettyAddress(url: String): String {
     searchQueryOf(url)?.let { return "swift://search/$it" }
     if (url.startsWith("http://") || url.startsWith("https://")) {
@@ -5828,8 +5506,6 @@ private fun prettyAddress(url: String): String {
     return url
 }
 
-// Page thumbnail (real snapshot of the page); falls back to favicon + site
-// name until a snapshot exists.
 @Composable
 private fun PagePreview(
     tab: BrowserTab,
@@ -5887,7 +5563,6 @@ private fun PagePreview(
     }
 }
 
-/** True when this app is the phone's default browser (role check on Android 10+, link resolution otherwise). */
 private fun isDefaultBrowserNow(context: Context): Boolean {
     if (Build.VERSION.SDK_INT >= 29) {
         val held = runCatching {
@@ -5897,8 +5572,6 @@ private fun isDefaultBrowserNow(context: Context): Boolean {
         }.getOrDefault(false)
         if (held) return true
     }
-    // Link resolution: covers phones whose "default apps" screen doesn't use the browser role,
-    // and a plain "Always" choice made in the link chooser.
     return runCatching {
         val probe = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://www.example.com"))
             .addCategory(Intent.CATEGORY_BROWSABLE)
@@ -5920,7 +5593,6 @@ private fun sharePage(context: Context, url: String) {
     }
 }
 
-/** The tab waiting under the page while you swipe the address bar. */
 @Composable
 private fun SwipeTabPreview(tab: BrowserTab?) {
     val bmp = tab?.let { if (it.url == "swift://home") HomeThumbStore ?: ThumbStore[it.id] else ThumbStore[it.id] }

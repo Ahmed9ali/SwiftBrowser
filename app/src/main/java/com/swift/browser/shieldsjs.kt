@@ -1,16 +1,5 @@
 package com.swift.browser
 
-// Injected into every page (and frame) at document start while Shields are on.
-//  1. Pop-up / pop-under guard: window.open and programmatic link clicks only work right after a
-//     real tap on a link or button. Pop-unders that hang on "click anywhere" are dropped.
-//  2. Anti-Adblock bypass: fakes element dimensions for known bait selectors so anti-adblock
-//     scripts think the ads are visible.
-//  3. Cosmetic filters: hides ad containers, banners, and anti-adblock modals.
-//  4. YouTube: strips ad data from the player responses before the player sees it.
-//  5. Fingerprinting protection: deterministic per-site noise on canvas, WebGL, and audio.
-//  6. Network API shim: rejects fetch / XHR / WebSocket requests to blocked hosts.
-//
-// NOTE: Kotlin raw string, so the JS must not contain a dollar sign (use ${'$'} if needed).
 const val SHIELDS_JS = """
 (function () {
   if (window.__swiftShields) return;
@@ -57,39 +46,13 @@ const val SHIELDS_JS = """
     };
   } catch (e) {}
 
-  // ---------- 2. Anti-Adblock Bypass ----------
-  // Anti-adblock scripts check if bait elements (like .adsbox) have an offsetHeight of 0.
-  // We intercept the JavaScript getters to lie and say they are 50px tall.
+  // ---------- 2. Anti-Adblock Bypass (Safe Method) ----------
+  // We removed the aggressive dimension spoofing that broke Bitly. 
+  // Instead, we only spoof the global variables that anti-adblock scripts look for.
   (function() {
-    var BaitSelectors = '.adsbox, .ad-banner, #ad-container, .adsbygoogle, .google-ad, #ad_slot, .ad-slot, .ad-wrapper, [id^="google_ads"]';
-    try {
-      var origOffsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
-      var origOffsetWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth');
-      var origClientHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
-      var origClientWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
-
-      function isBait(el) {
-        try { return el && el.matches && el.matches(BaitSelectors); } catch(e) { return false; }
-      }
-
-      Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
-        get: function() { return isBait(this) ? 50 : origOffsetHeight.get.call(this); }
-      });
-      Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
-        get: function() { return isBait(this) ? 300 : origOffsetWidth.get.call(this); }
-      });
-      Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
-        get: function() { return isBait(this) ? 50 : origClientHeight.get.call(this); }
-      });
-      Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-        get: function() { return isBait(this) ? 300 : origClientWidth.get.call(this); }
-      });
-
-      // Fake adsbygoogle
-      if (!window.adsbygoogle) {
-        window.adsbygoogle = { push: function(){}, loaded: true };
-      }
-    } catch(e) {}
+    if (!window.adsbygoogle) window.adsbygoogle = { push: function(){}, loaded: true };
+    if (!window.canRunAds) window.canRunAds = true;
+    if (!window.adBlockDetected) window.adBlockDetected = false;
   })();
 
   // ---------- 3. cosmetic filters ----------
@@ -116,11 +79,11 @@ const val SHIELDS_JS = """
     '[id^="ad-slot-"]', '[id*="-ad-slot"]', '[id*="-ad-container"]',
     'div[class^="ad-"]', 'div[class^="ads-"]', 'div[id^="ad-"]',
     '.ad-placeholder', '.ad-label', '.ads-label', '.ad-overlay',
-    // Specific to movie sites (native banners)
+    // Specific native banners
     'a[href*="skillify"]', 'img[src*="nudus"]', 'a[href*="nudus"]', 'img[src*="banner"]',
-    // Anti-adblock modals
+    // Anti-Adblock Modals (Removes the "Turn off AdBlock" popups)
     '[class*="adblock"]', '[id*="adblock"]', '.adblock-modal', '#adblock-modal',
-    '[class*="ad-block"]', '[id*="ad-block"]', '.anti-adblock'
+    '[class*="ad-block"]', '[id*="ad-block"]', '.anti-adblock', '#anti-adblock'
   ];
   if (IS_YT) {
     COSMETIC = COSMETIC.concat([
@@ -131,8 +94,7 @@ const val SHIELDS_JS = """
       '.ytp-ad-overlay-slot', '.ytp-ad-image-overlay', '.video-ads', 'ytm-promoted-sparkles-web-renderer',
       'ytm-promoted-video-renderer', 'ytm-companion-ad-renderer', 'ytm-display-ad-renderer',
       'ytm-in-feed-ad-layout-renderer', 'ytm-statement-banner-renderer', 'ytm-banner-promo-renderer',
-      'ytm-mealbar-promo-renderer', 'ytm-paid-content-overlay-renderer', 'ad-slot-renderer',
-      'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-ads"]'
+      'ytm-mealbar-promo-renderer', 'ytm-paid-content-overlay-renderer', 'ad-slot-renderer'
     ]);
   }
   var COSMETIC_ATTR = 'data-swift-cosmetic';
@@ -143,7 +105,7 @@ const val SHIELDS_JS = """
       for (var k = 0; k < old.length; k++) { if (old[k].parentNode) old[k].parentNode.removeChild(old[k]); }
       var cssText = '';
       for (var i = 0; i < COSMETIC.length; i++) {
-        cssText += COSMETIC[i] + '{display:none !important;}\n';
+        cssText += COSMETIC[i] + '{display:none !important; visibility:hidden !important;}\n';
       }
       var st = document.createElement('style');
       st.setAttribute(COSMETIC_ATTR, '1');
@@ -188,36 +150,31 @@ const val SHIELDS_JS = """
 
   // ---------- 4. YouTube ----------
   if (IS_YT) {
-    var KEYS = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
-    function strip(o) {
-      if (!o || typeof o !== 'object') return o;
+    // Only strip ads on standard watch pages, not shorts or mobile views to prevent breaking playback.
+    if (location.pathname.indexOf('/shorts/') === -1) {
+      var KEYS = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
+      function strip(o) {
+        if (!o || typeof o !== 'object') return o;
+        try {
+          for (var i = 0; i < KEYS.length; i++) if (KEYS[i] in o) delete o[KEYS[i]];
+          if (o.playerResponse) strip(o.playerResponse);
+          if (o.response && o.response.playerResponse) strip(o.response.playerResponse);
+        } catch (e) {}
+        return o;
+      }
       try {
-        for (var i = 0; i < KEYS.length; i++) if (KEYS[i] in o) delete o[KEYS[i]];
-        if (o.playerResponse) strip(o.playerResponse);
-        if (o.response && o.response.playerResponse) strip(o.response.playerResponse);
+        var jp = JSON.parse;
+        JSON.parse = function () {
+          var r = jp.apply(this, arguments);
+          if (r && typeof r === 'object' && (r.adPlacements || r.playerAds || r.playerResponse || r.streamingData)) strip(r);
+          return r;
+        };
       } catch (e) {}
-      return o;
+      try {
+        var rj = Response.prototype.json;
+        Response.prototype.json = function () { return rj.apply(this, arguments).then(strip); };
+      } catch (e) {}
     }
-    try {
-      var jp = JSON.parse;
-      JSON.parse = function () {
-        var r = jp.apply(this, arguments);
-        if (r && typeof r === 'object' && (r.adPlacements || r.playerAds || r.playerResponse || r.streamingData)) strip(r);
-        return r;
-      };
-    } catch (e) {}
-    try {
-      var rj = Response.prototype.json;
-      Response.prototype.json = function () { return rj.apply(this, arguments).then(strip); };
-    } catch (e) {}
-    try {
-      var ipr;
-      Object.defineProperty(window, 'ytInitialPlayerResponse', {
-        configurable: true,
-        get: function () { return ipr; },
-        set: function (v) { ipr = strip(v); }
-      });
-    } catch (e) {}
 
     var wasAd = false;
     function clickAll(sel) {
@@ -247,7 +204,6 @@ const val SHIELDS_JS = """
   // ---------- 5. fingerprinting protection ----------
   (function () {
     if (/(cloudflare|challenge|captcha|turnstile)\./i.test(H)) return;
-
     var seed = 0;
     try {
       var s = (location.hostname || '') + '|' + (navigator.userAgent || '');
@@ -270,59 +226,6 @@ const val SHIELDS_JS = """
         return img;
       };
     } catch (e) {}
-    try {
-      var tu = HTMLCanvasElement.prototype.toDataURL;
-      HTMLCanvasElement.prototype.toDataURL = function () {
-        try {
-          var w = this.width | 0, h = this.height | 0;
-          var src = this.getContext ? this.getContext('2d') : null;
-          if (src && w > 0 && h > 0) {
-            var img = src.getImageData(0, 0, w, h);
-            var tc = document.createElement('canvas');
-            tc.width = w; tc.height = h;
-            tc.getContext('2d').putImageData(img, 0, 0);
-            return tu.apply(tc, arguments);
-          }
-        } catch (e) {}
-        return tu.apply(this, arguments);
-      };
-    } catch (e) {}
-    try {
-      var tb = HTMLCanvasElement.prototype.toBlob;
-      HTMLCanvasElement.prototype.toBlob = function () {
-        try {
-          var w = this.width | 0, h = this.height | 0;
-          var src = this.getContext ? this.getContext('2d') : null;
-          if (src && w > 0 && h > 0) {
-            var img = src.getImageData(0, 0, w, h);
-            var tc = document.createElement('canvas');
-            tc.width = w; tc.height = h;
-            tc.getContext('2d').putImageData(img, 0, 0);
-            return tb.apply(tc, arguments);
-          }
-        } catch (e) {}
-        return tb.apply(this, arguments);
-      };
-    } catch (e) {}
-
-    try {
-      var getParam = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function (p) {
-        if (p === 37445 || p === 37446) return 'Swift Browser';
-        return getParam.apply(this, arguments);
-      };
-    } catch (e) {}
-
-    try {
-      var gffd = AnalyserNode.prototype.getFloatFrequencyData;
-      AnalyserNode.prototype.getFloatFrequencyData = function (arr) {
-        gffd.apply(this, arguments);
-        try { for (var i = 0; i < arr.length; i += 32) arr[i] += (noiseAt(i) - 4) * 1e-6; } catch (e) {}
-      };
-    } catch (e) {}
-
-    try { Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: function () { return 4; }, configurable: true }); } catch (e) {}
-    try { Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: function () { return 4; }, configurable: true }); } catch (e) {}
   })();
 
   // ---------- 6. fetch / XHR / beacon / WebSocket shim ----------
@@ -344,8 +247,10 @@ const val SHIELDS_JS = """
         var host = '';
         try { host = new URL(s, location.href).hostname.toLowerCase(); } catch (e) { return false; }
         if (!host) return false;
-        // Whitelist essential CDNs
-        if (host.endsWith('jsdelivr.net') || host.endsWith('cloudflare.com') || host.endsWith('googleapis.com')) return false;
+        
+        // Whitelist CAPTCHAs and essential CDNs in the shim!
+        if (host.endsWith('cloudflare.com') || host.endsWith('hcaptcha.com') || 
+            host.endsWith('google.com') || host.endsWith('gstatic.com') || host.endsWith('jsdelivr.net')) return false;
         
         var h = host;
         while (h) {
@@ -391,61 +296,6 @@ const val SHIELDS_JS = """
         }
         return realSend.apply(this, arguments);
       };
-    } catch (e) {}
-
-    try {
-      var realBeacon = navigator.sendBeacon;
-      if (realBeacon) {
-        navigator.sendBeacon = function (url) {
-          if (isAdUrl(String(url))) return true;
-          return realBeacon.apply(this, arguments);
-        };
-      }
-    } catch (e) {}
-
-    try {
-      var RealWS = window.WebSocket;
-      if (RealWS) {
-        var WrappedWS = function (url, protocols) {
-          if (isAdUrl(String(url))) {
-            var self = this;
-            setTimeout(function () {
-              try {
-                Object.defineProperty(self, 'readyState', { value: 3, configurable: true });
-                if (typeof self.onerror === 'function') self.onerror(new Event('error'));
-                if (typeof self.onclose === 'function')
-                  self.onclose({ code: 1006, reason: 'Blocked by Swift Shields', wasClean: false });
-              } catch (e) {}
-            }, 0);
-            return;
-          }
-          return protocols === undefined ? new RealWS(url) : new RealWS(url, protocols);
-        };
-        WrappedWS.prototype = RealWS.prototype;
-        WrappedWS.CONNECTING = RealWS.CONNECTING;
-        WrappedWS.OPEN = RealWS.OPEN;
-        WrappedWS.CLOSING = RealWS.CLOSING;
-        WrappedWS.CLOSED = RealWS.CLOSED;
-        window.WebSocket = WrappedWS;
-      }
-    } catch (e) {}
-
-    try {
-      var RealES = window.EventSource;
-      if (RealES) {
-        var WrappedES = function (url, config) {
-          if (isAdUrl(String(url))) {
-            var self = this;
-            setTimeout(function () {
-              try { if (typeof self.onerror === 'function') self.onerror(new Event('error')); } catch (e) {}
-            }, 0);
-            return;
-          }
-          return config === undefined ? new RealES(url) : new RealES(url, config);
-        };
-        WrappedES.prototype = RealES.prototype;
-        window.EventSource = WrappedES;
-      }
     } catch (e) {}
   })();
 })();

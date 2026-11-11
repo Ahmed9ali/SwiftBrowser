@@ -4,13 +4,6 @@ import android.content.Context
 import android.net.Uri
 import java.util.Locale
 
-/**
- * Shields request filter (a small, Brave-like subset):
- *  - ad / tracker / pop-up network hosts from assets/trackers.txt (subdomains included),
- *  - third-party URLs that look like ad requests (ad server paths, pop-under scripts),
- *  - first-party ad endpoints of YouTube (ad stats, mid-roll info, pagead calls).
- * Cosmetic hiding, pop-up blocking and YouTube ad stripping are done by the injected SHIELDS_JS.
- */
 class TrackerBlocker(context: Context) {
     private val blockedHosts: Set<String> = context.assets.open("trackers.txt")
         .bufferedReader()
@@ -20,31 +13,22 @@ class TrackerBlocker(context: Context) {
                 .toSet()
         }
 
-    // Third-party only: these fragments are very rarely part of real content.
     private val adPathParts = listOf(
         "/pagead/", "/adserver", "/adframe", "/adsbygoogle", "/ads/show", "/ads/serve", "/ad/serve",
         "/banner_ads", "/bannerads", "/popunder", "/popads", "/pop.js", "/prebid", "/adview",
-        "/ad-manager", "/advert.", "/adverts/", "/ads.js", "/ads.php", "/adx.js", "show_ads", "ad_banner",
+        "/ad-manager", "/advert.", "/adverts/", "/ads.php", "/adx.js", "show_ads", "ad_banner",
         "/vast.xml", "/vast?", "adtag", "/ad.php?", "/click.php?", "/clickunder"
     )
 
-    // Well-known ad / bait script names: blocked even when a site serves them from its own domain.
+    // Removed generic "analytics.js" and "ads.js" from here, as it breaks sites.
+    // Now we only block very specific known ad bait scripts.
     private val alwaysBlockParts = listOf(
-        // Google ad endpoints
         "/pagead.js", "/adsbygoogle.js", "/pagead/js/adsbygoogle", "/pagead/js/",
         "/pagead/viewthroughconversion", "/doubleclick/", "/googleadservices/", "/ads/pagead",
-        // Generic first-party bait script names. Ad-block testers (and many real pages)
-        // serve their own "ads.js" / "analytics.js" from a first-party URL, so a host list
-        // cannot catch them — these names must be blocked even for the page's own host.
-        // The leading slash guarantees "/uploads.js" or "/threads.js" are never matched.
-        "/ads.js", "/ad.js", "/advertisement.js", "/advert.js", "/adsense.js",
-        "/analytics.js", "/tracker.js", "/tracking.js", "/track.js",
-        "/pixel.js", "/beacon.js", "/gpt.js", "/prebid.js",
-        // Anti-adblock detection scripts
+        "/advertisement.js", "/adsense.js", "/beacon.js", "/gpt.js", "/prebid.js",
         "blockadblock", "fuckadblock", "adblock-detect", "detectadblock", "adblockcheck"
     )
 
-    // Ad endpoints that live on the site's own domain (checked even for first-party requests).
     private val youtubeAdParts = listOf(
         "/api/stats/ads", "/pagead/", "/ptracking", "/get_midroll_info", "/api/stats/atr", "adformat=", "&ad_type="
     )
@@ -52,22 +36,16 @@ class TrackerBlocker(context: Context) {
     private fun hostOf(url: String?): String? =
         runCatching { Uri.parse(url ?: "").host?.lowercase(Locale.ROOT) }.getOrNull()
 
-    /** True when [host] (or a parent domain of it) is in the block list. */
     fun isAdHost(host: String?): Boolean {
         var h = host?.lowercase(Locale.ROOT) ?: return false
         while (true) {
             if (h in blockedHosts) return true
             val dot = h.indexOf('.')
-            if (dot < 0 || h.indexOf('.', dot + 1) < 0) return false // never match a bare TLD
+            if (dot < 0 || h.indexOf('.', dot + 1) < 0) return false
             h = h.substring(dot + 1)
         }
     }
 
-    /**
-     * The full blocklist as a JSON object { "host": true, ... }, so the JS shim in
-     * SHIELDS_JS can reject fetch / XHR / beacon / WebSocket requests without a
-     * bridge round-trip per request.
-     */
     fun blockedHostsJson(): String {
         val obj = org.json.JSONObject()
         blockedHosts.forEach { obj.put(it, true) }
@@ -76,55 +54,26 @@ class TrackerBlocker(context: Context) {
 
     private fun sameSite(a: String, b: String) = a == b || a.endsWith(".$b") || b.endsWith(".$a")
 
-    // Parameters / paths that ad-network click URLs carry (never part of a normal page address).
-    private val redirectParts = listOf(
-        "zoneid=", "campaignid=", "clickid=", "click_id=", "aff_sub", "subid=", "sub_id=", "pubid=", "adzone",
-        "/popunder", "/popads", "/clickunder", "/pop.php", "/click.php", "/ad.php", "/redirect.php?ad",
-        "utm_medium=pop", "utm_source=pop", "utm_medium=push", "utm_source=push", "tracking.php?", "/go.php?id="
-    )
-
-    /**
-     * A page that sends you somewhere else on its own (no tap) and the target looks like an ad
-     * click: the classic spam redirect of shortlink / streaming / download sites. Taps are never touched.
-     */
-    fun isSpamRedirect(url: String, pageUrl: String?, hasGesture: Boolean): Boolean {
-        if (hasGesture) return false
-        val host = hostOf(url) ?: return false
-        val pageHost = hostOf(pageUrl) ?: return false
-        if (sameSite(host, pageHost)) return false
-        val lower = url.lowercase(Locale.ROOT)
-        return redirectParts.any { lower.contains(it) }
-    }
-
-    /**
-     * Checks if a navigation is an unexpected cross-domain redirect.
-     * Many movie/streaming sites use pop-unders that hijack clicks and navigate
-     * the main frame to a spam domain when the real video link is clicked.
-     */
-    fun isMaliciousMainFrameRedirect(url: String, currentPageUrl: String?, hasGesture: Boolean): Boolean {
-        if (hasGesture || currentPageUrl == null) return false
-        val targetHost = hostOf(url) ?: return false
-        val currentHost = hostOf(currentPageUrl) ?: return false
-        
-        if (sameSite(targetHost, currentHost)) return false
-        
-        val allowedDomains = listOf(
-            "google.com", "cloudflare.com", "hcaptcha.com", 
-            "recaptcha.net", "stripe.com", "paypal.com"
-        )
-        if (allowedDomains.any { targetHost.endsWith(it) || currentHost.endsWith(it) }) return false
-
-        return true
-    }
+    // Removed the aggressive `isMaliciousMainFrameRedirect` entirely. 
+    // Shortlinks (bitly, gofile) require cross-domain navigation to work. 
+    // The pop-up blocker and ad-host blocker handle the spam.
 
     fun shouldBlock(requestUrl: String, pageUrl: String?, isMainFrame: Boolean = false): Boolean {
         val requestHost = hostOf(requestUrl) ?: return false
         val pageHost = hostOf(pageUrl)
 
-        // Whitelist essential CDNs so sites don't break
-        if (requestHost.endsWith("jsdelivr.net") || requestHost.endsWith("cloudflare.com") || 
-            requestHost.endsWith("googleapis.com") || requestHost.endsWith("gstatic.com")) return false
+        // 1. CRITICAL WHITELIST: Never block these or the web breaks.
+        if (requestHost.endsWith("google.com") && requestUrl.contains("recaptcha")) return false
+        if (requestHost == "challenges.cloudflare.com") return false
+        if (requestHost.endsWith("hcaptcha.com")) return false
+        if (requestHost.endsWith("jsdelivr.net") || requestHost.endsWith("googleapis.com") || requestHost.endsWith("gstatic.com")) return false
+        
+        // YouTube needs its APIs to load Shorts and Videos
+        if (requestHost.endsWith("youtube.com") || requestHost.endsWith("googlevideo.com")) {
+            if (requestUrl.contains("/youtubei/v1/player") || requestUrl.contains("/youtubei/v1/next")) return false
+        }
 
+        // 2. Block known ad hosts
         if (isAdHost(requestHost)) {
             if (isMainFrame && pageHost == null) return false
             return !(pageHost != null && sameSite(requestHost, pageHost))
