@@ -549,7 +549,7 @@ private fun LanguagesPage(
         scope.launch {
             busy[lang] = "download"
             try {
-                TranslateEngine.downloadWithDependencies(lang, settings.translateTarget)
+                TranslateEngine.downloadWithDependencies(context, lang, settings.translateTarget)
                 downloaded = runCatching { TranslateEngine.downloadedLanguages() }.getOrDefault((downloaded ?: emptySet()) + lang)
                 toast("${TranslateEngine.displayName(lang)} is ready offline")
             } catch (e: CancellationException) {
@@ -654,17 +654,17 @@ private fun LanguagesPage(
                 if (haveList.isNotEmpty()) {
                     item(key = "label-have") { SectionLabel("Downloaded") }
                     items(haveList, key = { "d-" + it.first }) { (code, name) ->
-                        LangRow(name, true, busy[code], { download(code) }, { confirmDelete = code })
+                        LangRow(name, true, busy[code], TranslateEngine.progress[code], { download(code) }, { confirmDelete = code })
                     }
                 }
                 item(key = "label-all") { SectionLabel("Available") }
                 items(availableList, key = { "a-" + it.first }) { (code, name) ->
-                    LangRow(name, false, busy[code], { download(code) }, { confirmDelete = code })
+                    LangRow(name, false, busy[code], TranslateEngine.progress[code], { download(code) }, { confirmDelete = code })
                 }
             } else {
                 item(key = "label-results") { SectionLabel("Results") }
                 items(matches, key = { "m-" + it.first }) { (code, name) ->
-                    LangRow(name, code in have, busy[code], { download(code) }, { confirmDelete = code })
+                    LangRow(name, code in have, busy[code], TranslateEngine.progress[code], { download(code) }, { confirmDelete = code })
                 }
             }
         }
@@ -692,6 +692,7 @@ private fun LangRow(
     name: String,
     isDownloaded: Boolean,
     busy: String?,
+    progress: Float?,
     onDownload: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -700,7 +701,7 @@ private fun LangRow(
             Text(name, color = SText, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
                 when {
-                    busy == "download" -> "Downloading..."
+                    busy == "download" -> if (progress != null) "Downloading... ${(progress * 100).toInt()}%" else "Downloading..."
                     busy == "delete" -> "Deleting..."
                     isDownloaded -> "Ready offline"
                     else -> "About ${TranslateEngine.MODEL_MB} MB"
@@ -709,6 +710,13 @@ private fun LangRow(
             )
         }
         when {
+            busy == "download" && progress != null -> Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                // The ring fills as the pack downloads.
+                CircularProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier.size(28.dp), color = SAccent, trackColor = SSurface3, strokeWidth = 3.dp
+                )
+            }
             busy != null -> CircularProgressIndicator(Modifier.size(22.dp).padding(2.dp), color = SAccent, strokeWidth = 2.dp)
             isDownloaded -> IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, "Delete", tint = SMuted) }
             else -> IconButton(onClick = onDownload) { Icon(Icons.Default.Download, "Download", tint = SAccent) }

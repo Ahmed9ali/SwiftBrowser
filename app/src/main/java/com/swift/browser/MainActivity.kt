@@ -617,8 +617,19 @@ private fun SwiftBrowserApp() {
     val desktopSites = remember { mutableStateMapOf<Long, Boolean>() }
     var translateOffer by remember { mutableStateOf<Pair<Long, String>?>(null) }
     var translateDone by remember { mutableStateOf<Pair<Long, String>?>(null) }
+    var translateDl by remember { mutableStateOf<Pair<String, Float>?>(null) } // language pack being downloaded for this page: name to 0..1
     var translateBusy by remember { mutableStateOf<Pair<Long, String>?>(null) } // translating now: the card shows a spinner
     var translateMenu by remember { mutableStateOf(false) }
+    // Bumped every time the app comes back to the front (e.g. after choosing the default browser in Settings).
+    var defaultCheck by remember { mutableIntStateOf(0) }
+    DisposableEffect(Unit) {
+        val owner = context as? androidx.lifecycle.LifecycleOwner
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) defaultCheck++
+        }
+        owner?.lifecycle?.addObserver(obs)
+        onDispose { owner?.lifecycle?.removeObserver(obs) }
+    }
     // Page whose translate banner the user swiped away: a translation still in
     // flight must not pop the "translated" card straight back afterwards.
     var translateDismissedUrl by remember { mutableStateOf<String?>(null) }
@@ -1379,13 +1390,14 @@ private fun SwiftBrowserApp() {
             }
             uiScope.launch {
                 try {
-                    TranslateEngine.ensureModels(context, src, tgt, appSettings.wifiOnlyModels) {
-                        Toast.makeText(
-                            context,
-                            "Downloading language pack (about " + TranslateEngine.MODEL_MB + " MB)...",
-                            Toast.LENGTH_LONG
-                        ).show()
+                    val srcName = TranslateEngine.displayName(src)
+                    TranslateEngine.ensureModels(context, src, tgt, appSettings.wifiOnlyModels, onProgress = { f ->
+                        translateDl = srcName to f
+                    }) {
+                        // Shown as a bar at the bottom of the page until the pack is on the device.
+                        translateDl = srcName to 0f
                     }
+                    translateDl = null
                     if (activeId == startTab && pageUrl == startUrl) {
                         wv.evaluateJavascript(TRANSLATE_JS + "\nwindow.__swiftTr.start('" + src + "');", null)
                         // Safety: never leave the spinner up forever (e.g. a page with no text).
@@ -1395,8 +1407,10 @@ private fun SwiftBrowserApp() {
                         translateBusy = null
                     }
                 } catch (e: CancellationException) {
+                    translateDl = null
                     throw e
                 } catch (e: Exception) {
+                    translateDl = null
                     translateBusy = null
                     Toast.makeText(context, e.message ?: "Translation failed", Toast.LENGTH_LONG).show()
                 }
@@ -1475,6 +1489,29 @@ private fun SwiftBrowserApp() {
         if (appSettings.askBeforeDownload) pendingDownload = d else enqueueDownload(d)
     }
 
+    // Shields script (pop-up guard, cosmetic filters, YouTube ad stripping) runs at document start.
+    val shieldHandlers = remember { HashMap<Long, androidx.webkit.ScriptHandler>() }
+    val shieldsAtStart = androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)
+    fun installShields(wv: WebView, id: Long) {
+        if (!shieldsAtStart || shieldHandlers.containsKey(id)) return
+        runCatching { shieldHandlers[id] = androidx.webkit.WebViewCompat.addDocumentStartJavaScript(wv, SHIELDS_JS, setOf("*")) }
+    }
+    fun removeShields(id: Long) { shieldHandlers.remove(id)?.let { runCatching { it.remove() } } }
+    LaunchedEffect(blockingEnabled) {
+        webViews.forEach { (id, wv) -> if (blockingEnabled) installShields(wv, id) else removeShields(id) }
+    }
+    fun countBlocked(tabId: Long) {
+        Handler(Looper.getMainLooper()).post {
+            totalBlocked++
+            val i = tabs.indexOfFirst { it.id == tabId }
+            if (i >= 0) {
+                val c = tabs[i].blockedCount + 1
+                tabs[i] = tabs[i].copy(blockedCount = c)
+                if (tabId == activeId) blockedCount = c
+            }
+        }
+    }
+
     fun createWebView(ctx: Context, tabId: Long): WebView {
         return WebView(ctx).apply {
             // Dark background so a not-yet-painted page never flashes white.
@@ -1484,6 +1521,7 @@ private fun SwiftBrowserApp() {
             settings.loadsImagesAutomatically = true
             settings.javaScriptCanOpenWindowsAutomatically = false
             settings.setSupportMultipleWindows(false)
+            if (currentBlockingEnabled) installShields(this, tabId)
             settings.allowFileAccess = false
             settings.allowContentAccess = false
             settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
@@ -1619,6 +1657,12 @@ private fun SwiftBrowserApp() {
                     request: WebResourceRequest?
                 ): Boolean {
                     val uri = request?.url ?: return false
+                    // Spam redirects / pop-unders that navigate to an ad network are cancelled.
+                    if (currentBlockingEnabled && request.isForMainFrame &&
+                        (blocker.isAdHost(uri.host) || blocker.isSpamRedirect(uri.toString(), firstParty[tabId], request.hasGesture()))) {
+                        countBlocked(tabId)
+                        return true
+                    }
                     if (uri.scheme == "http" && request.isForMainFrame && view != null) {
                         val up = httpsFirst(uri.toString())
                         if (up != uri.toString()) {
@@ -1656,16 +1700,8 @@ private fun SwiftBrowserApp() {
                         (h == "www.gstatic.com" && url.contains("/translate/"))
                     ) return null
 
-                    if (currentBlockingEnabled && blocker.shouldBlock(url, firstParty[tabId] ?: "")) {
-                        Handler(Looper.getMainLooper()).post {
-                            totalBlocked++
-                            val i = tabs.indexOfFirst { it.id == tabId }
-                            if (i >= 0) {
-                                val c = tabs[i].blockedCount + 1
-                                tabs[i] = tabs[i].copy(blockedCount = c)
-                                if (tabId == activeId) blockedCount = c
-                            }
-                        }
+                    if (currentBlockingEnabled && blocker.shouldBlock(url, firstParty[tabId] ?: "", req.isForMainFrame)) {
+                        countBlocked(tabId)
                         return WebResourceResponse(
                             "text/plain",
                             "utf-8",
@@ -1715,6 +1751,8 @@ private fun SwiftBrowserApp() {
                     favicon: android.graphics.Bitmap?
                 ) {
                     if (url == null || url.startsWith("about:")) return
+                    // Older WebViews can't run a script before the page: inject as early as we can.
+                    if (currentBlockingEnabled && !shieldsAtStart) view?.evaluateJavascript(SHIELDS_JS, null)
                     if (translateOffer?.first == tabId) translateOffer = null
                     if (translateDone?.first == tabId) translateDone = null
                     if (translateBusy?.first == tabId) translateBusy = null
@@ -2600,6 +2638,38 @@ private fun SwiftBrowserApp() {
                     }
                 }
 
+                // Language pack download for the page: a bar that stays until the download is finished.
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = translateDl != null && !showTabs,
+                    enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { it }),
+                    exit = fadeOut(tween(120)) + slideOutVertically(targetOffsetY = { it }),
+                    modifier = Modifier.align(Alignment.BottomCenter)
+                ) {
+                    val last = remember { arrayOfNulls<Pair<String, Float>>(1) }
+                    translateDl?.let { last[0] = it }
+                    val (dlName, dlFrac) = last[0] ?: ("" to 0f)
+                    Column(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)
+                            .clip(RoundedCornerShape(16.dp)).background(Color(0xFF2B2E34))
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "Downloading $dlName language pack",
+                                color = TextMain, fontSize = 14.sp, modifier = Modifier.weight(1f), maxLines = 1,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                            )
+                            Text("${(dlFrac * 100).toInt()}%", color = Accent, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        LinearProgressIndicator(
+                            progress = { dlFrac },
+                            modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                            color = Accent, trackColor = Surface3
+                        )
+                    }
+                }
+
                 // Brave-style translate card: "Translate page?" first, then "Page translated / Undo".
                 // Goes away by itself, or swipe it up.
                 val banner = translateDone ?: translateBusy ?: translateOffer
@@ -3281,13 +3351,7 @@ private fun SwiftBrowserApp() {
                             showSuggestions = false
                         }
                         // Only offered while another browser (or none) is the default.
-                        val isDefaultBrowser = remember {
-                            runCatching {
-                                val probe = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("http://www.example.com"))
-                                context.packageManager.resolveActivity(probe, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
-                                    ?.activityInfo?.packageName == context.packageName
-                            }.getOrDefault(false)
-                        }
+                        val isDefaultBrowser = remember(defaultCheck) { isDefaultBrowserNow(context) }
                         if (!isDefaultBrowser) MenuRow(Icons.Default.Public, "Set as default browser") {
                             showMenu = false
                             runCatching {
@@ -5738,6 +5802,28 @@ private fun PagePreview(
             }
         }
     }
+}
+
+/** True when this app is the phone's default browser (role check on Android 10+, link resolution otherwise). */
+private fun isDefaultBrowserNow(context: Context): Boolean {
+    if (Build.VERSION.SDK_INT >= 29) {
+        val held = runCatching {
+            val rm = context.getSystemService(android.app.role.RoleManager::class.java)
+            rm != null && rm.isRoleAvailable(android.app.role.RoleManager.ROLE_BROWSER) &&
+                rm.isRoleHeld(android.app.role.RoleManager.ROLE_BROWSER)
+        }.getOrDefault(false)
+        if (held) return true
+    }
+    // Link resolution: covers phones whose "default apps" screen doesn't use the browser role,
+    // and a plain "Always" choice made in the link chooser.
+    return runCatching {
+        val probe = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://www.example.com"))
+            .addCategory(Intent.CATEGORY_BROWSABLE)
+        val pm = context.packageManager
+        listOf(android.content.pm.PackageManager.MATCH_DEFAULT_ONLY, 0).any { flags ->
+            pm.resolveActivity(probe, flags)?.activityInfo?.packageName == context.packageName
+        }
+    }.getOrDefault(false)
 }
 
 private fun sharePage(context: Context, url: String) {

@@ -1,6 +1,12 @@
 package com.swift.browser
 
+import android.app.DownloadManager
 import android.content.Context
+import androidx.compose.runtime.mutableStateMapOf
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.util.LruCache
@@ -34,6 +40,89 @@ object TranslateEngine {
     private val manager get() = RemoteModelManager.getInstance()
     private val translators = LinkedHashMap<String, Translator>()
     private val cache = LruCache<String, String>(3000)
+
+    /** Download progress (0..1) per language code while its pack is being downloaded. */
+    val progress = mutableStateMapOf<String, Float>()
+
+    // ---------------------------------------------------------------- download progress
+
+    /** ML Kit downloads its packs through Android's DownloadManager; read how far they are. */
+    private fun dmFraction(context: Context): Float? = runCatching {
+        val dm = context.getSystemService(DownloadManager::class.java)
+        val q = DownloadManager.Query().setFilterByStatus(
+            DownloadManager.STATUS_RUNNING or DownloadManager.STATUS_PENDING or DownloadManager.STATUS_PAUSED
+        )
+        dm.query(q)?.use { c ->
+            var so = 0L
+            var tot = 0L
+            while (c.moveToNext()) {
+                so += c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
+                val t = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+                if (t > 0) tot += t
+            }
+            if (tot > 0) (so.toFloat() / tot).coerceIn(0f, 1f) else null
+        }
+    }.getOrNull()
+
+    /**
+     * ML Kit starts the pack download inside Android's DownloadManager, which posts its own
+     * notification. The app already shows the progress itself, so ask the system to keep these
+     * downloads hidden (needs DOWNLOAD_WITHOUT_NOTIFICATION; ignored silently if the phone refuses).
+     */
+    private fun hideSystemNotifications(context: Context) {
+        runCatching {
+            val dm = context.getSystemService(DownloadManager::class.java)
+            val q = DownloadManager.Query().setFilterByStatus(
+                DownloadManager.STATUS_RUNNING or DownloadManager.STATUS_PENDING or DownloadManager.STATUS_PAUSED
+            )
+            val ids = ArrayList<Long>()
+            dm.query(q)?.use { c ->
+                while (c.moveToNext()) ids.add(c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_ID)))
+            }
+            val base = android.net.Uri.parse("content://downloads/my_downloads")
+            for (id in ids) {
+                runCatching {
+                    context.contentResolver.update(
+                        android.content.ContentUris.withAppendedId(base, id),
+                        android.content.ContentValues().apply { put("visibility", 2) }, // 2 = hidden
+                        null, null
+                    )
+                }
+            }
+        }
+    }
+
+    private fun dirBytes(f: java.io.File?): Long =
+        if (f == null || !f.exists()) 0L else if (f.isFile) f.length() else (f.listFiles()?.sumOf { dirBytes(it) } ?: 0L)
+
+    private fun storedBytes(context: Context): Long =
+        dirBytes(context.filesDir) + dirBytes(context.noBackupFilesDir) + dirBytes(context.getExternalFilesDir(null))
+
+    /**
+     * Runs [block] while reporting 0..1 progress for the packs in [models] that are not on the
+     * device yet: finished packs count fully, the running one from DownloadManager's byte counts
+     * (or, when those are not available, from how much the app's storage has grown).
+     */
+    private suspend fun <T> tracking(context: Context, models: List<String>, report: (Float) -> Unit, block: suspend () -> T): T =
+        coroutineScope {
+            val before = runCatching { downloadedLanguages() }.getOrDefault(emptySet())
+            val need = models.distinct().filter { it !in before }
+            val startBytes = storedBytes(context)
+            val job = launch {
+                while (isActive) {
+                    hideSystemNotifications(context)
+                    val have = runCatching { downloadedLanguages() }.getOrDefault(before)
+                    val done = need.count { it in have }
+                    val total = need.size.coerceAtLeast(1)
+                    val grown = ((storedBytes(context) - startBytes).toFloat() / (MODEL_MB * 1024f * 1024f * total)).coerceIn(0f, 0.97f)
+                    val cur = dmFraction(context)
+                    val f = if (cur != null) (done + cur.coerceAtMost(0.99f)) / total else maxOf(done.toFloat() / total, grown)
+                    report(f.coerceIn(0f, 0.99f))
+                    delay(300)
+                }
+            }
+            try { block() } finally { job.cancel() }
+        }
 
     // ---------------------------------------------------------------- languages
 
@@ -88,9 +177,18 @@ object TranslateEngine {
      * Downloads [lang] plus English (the bridge language ML Kit translates
      * through) and the user's target language, so it works fully offline after.
      */
-    suspend fun downloadWithDependencies(lang: String, target: String) {
+    suspend fun downloadWithDependencies(context: Context, lang: String, target: String) {
         val have = downloadedLanguages()
         val wanted = listOf(lang, "en", target).distinct().filter { it !in have }
+        progress[lang] = 0f
+        try {
+            tracking(context, wanted, { progress[lang] = it }) { downloadAll(wanted, lang) }
+        } finally {
+            progress.remove(lang)
+        }
+    }
+
+    private suspend fun downloadAll(wanted: List<String>, lang: String) {
         for (l in wanted) {
             try {
                 withTimeout(DOWNLOAD_TIMEOUT_MS) {
@@ -128,6 +226,7 @@ object TranslateEngine {
         src: String,
         tgt: String,
         wifiOnly: Boolean,
+        onProgress: (Float) -> Unit = {},
         onDownloading: () -> Unit
     ) {
         val have = downloadedLanguages()
@@ -147,7 +246,10 @@ object TranslateEngine {
         val limit = if (missing.isEmpty() && !online) OFFLINE_CHECK_TIMEOUT_MS else DOWNLOAD_TIMEOUT_MS
         try {
             withTimeout(limit) {
-                translatorFor(src, tgt).downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
+                val run: suspend () -> Unit = {
+                    translatorFor(src, tgt).downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
+                }
+                if (missing.isNotEmpty()) tracking(context, listOf(src, tgt, "en"), onProgress) { run() } else run()
             }
         } catch (e: TimeoutCancellationException) {
             throw TranslateException(
