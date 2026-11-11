@@ -33,6 +33,13 @@ class TrackerBlocker(context: Context) {
         "/api/stats/ads", "/pagead/", "/ptracking", "/get_midroll_info", "/api/stats/atr", "adformat=", "&ad_type="
     )
 
+    // Parameters / paths that ad-network click URLs carry (never part of a normal page address).
+    private val redirectParts = listOf(
+        "zoneid=", "campaignid=", "clickid=", "click_id=", "aff_sub", "subid=", "sub_id=", "pubid=", "adzone",
+        "/popunder", "/popads", "/clickunder", "/pop.php", "/click.php", "/ad.php", "/redirect.php?ad",
+        "utm_medium=pop", "utm_source=pop", "utm_medium=push", "utm_source=push", "tracking.php?", "/go.php?id="
+    )
+
     private fun hostOf(url: String?): String? =
         runCatching { Uri.parse(url ?: "").host?.lowercase(Locale.ROOT) }.getOrNull()
 
@@ -54,9 +61,18 @@ class TrackerBlocker(context: Context) {
 
     private fun sameSite(a: String, b: String) = a == b || a.endsWith(".$b") || b.endsWith(".$a")
 
-    // Removed the aggressive `isMaliciousMainFrameRedirect` entirely. 
-    // Shortlinks (bitly, gofile) require cross-domain navigation to work. 
-    // The pop-up blocker and ad-host blocker handle the spam.
+    /**
+     * A page that sends you somewhere else on its own (no tap) and the target looks like an ad
+     * click: the classic spam redirect of shortlink / streaming / download sites. Taps are never touched.
+     */
+    fun isSpamRedirect(url: String, pageUrl: String?, hasGesture: Boolean): Boolean {
+        if (hasGesture) return false
+        val host = hostOf(url) ?: return false
+        val pageHost = hostOf(pageUrl) ?: return false
+        if (sameSite(host, pageHost)) return false
+        val lower = url.lowercase(Locale.ROOT)
+        return redirectParts.any { lower.contains(it) }
+    }
 
     fun shouldBlock(requestUrl: String, pageUrl: String?, isMainFrame: Boolean = false): Boolean {
         val requestHost = hostOf(requestUrl) ?: return false
