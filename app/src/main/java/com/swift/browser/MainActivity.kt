@@ -1560,6 +1560,15 @@ private fun SwiftBrowserApp() {
             settings.loadsImagesAutomatically = true
             settings.javaScriptCanOpenWindowsAutomatically = false
             settings.setSupportMultipleWindows(false)
+            
+            // Set UA immediately to avoid mid-session changes that break Cloudflare CAPTCHAs
+            settings.userAgentString = android.webkit.WebSettings.getDefaultUserAgent(ctx)
+            if (desktopSites[tabId] == true) {
+                settings.userAgentString = desktopUserAgent(ctx)
+                settings.useWideViewPort = true
+                settings.loadWithOverviewMode = true
+            }
+
             if (currentBlockingEnabled) installShields(this, tabId)
             settings.allowFileAccess = false
             settings.allowContentAccess = false
@@ -1717,6 +1726,15 @@ private fun SwiftBrowserApp() {
                     request: WebResourceRequest?
                 ): Boolean {
                     val uri = request?.url ?: return false
+                    val currentUrl = view?.url ?: ""
+                    
+                    // Block unexpected cross-domain redirects (spam/pop-unders)
+                    if (currentBlockingEnabled && request.isForMainFrame && 
+                        blocker.isMaliciousMainFrameRedirect(uri.toString(), currentUrl, request.hasGesture())) {
+                        countBlocked(tabId)
+                        return true
+                    }
+
                     // Spam redirects / pop-unders that navigate to an ad network are cancelled.
                     if (currentBlockingEnabled && request.isForMainFrame &&
                         (blocker.isAdHost(uri.host) || blocker.isSpamRedirect(uri.toString(), firstParty[tabId], request.hasGesture()))) {
@@ -1985,7 +2003,7 @@ private fun SwiftBrowserApp() {
         wv.settings.builtInZoomControls = true
         wv.settings.displayZoomControls = false
         wv.clearCache(true)
-        wv.loadUrl(desktopEquivalent(wv.url ?: pageUrl, on))
+        wv.reload() // Reload immediately to keep UA consistent with the loaded page
     }
 
     // Clears cookies, storage and cache of the current site and closes its tabs.

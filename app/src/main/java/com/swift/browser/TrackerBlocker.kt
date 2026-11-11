@@ -94,6 +94,31 @@ class TrackerBlocker(context: Context) {
         return redirectParts.any { lower.contains(it) }
     }
 
+    /**
+     * Checks if a navigation is an unexpected cross-domain redirect.
+     * Many movie/streaming sites use pop-unders that hijack clicks and navigate
+     * the main frame to a spam domain when the real video link is clicked.
+     */
+    fun isMaliciousMainFrameRedirect(url: String, currentPageUrl: String?, hasGesture: Boolean): Boolean {
+        // Allow explicit user gestures (real link clicks) and first-party subpages
+        if (hasGesture || currentPageUrl == null) return false
+        val targetHost = hostOf(url) ?: return false
+        val currentHost = hostOf(currentPageUrl) ?: return false
+        
+        // Allow same-site navigation
+        if (sameSite(targetHost, currentHost)) return false
+        
+        // Allow common authentication / payment / CDN domains
+        val allowedDomains = listOf(
+            "google.com", "cloudflare.com", "hcaptcha.com", 
+            "recaptcha.net", "stripe.com", "paypal.com"
+        )
+        if (allowedDomains.any { targetHost.endsWith(it) || currentHost.endsWith(it) }) return false
+
+        // Block entirely unrelated domains
+        return true
+    }
+
     fun shouldBlock(requestUrl: String, pageUrl: String?, isMainFrame: Boolean = false): Boolean {
         val requestHost = hostOf(requestUrl) ?: return false
         val pageHost = hostOf(pageUrl)

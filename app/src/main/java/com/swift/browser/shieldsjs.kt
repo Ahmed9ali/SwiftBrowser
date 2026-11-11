@@ -10,6 +10,7 @@ package com.swift.browser
 //     elements, and skips whatever ad still starts.
 //  4. Fingerprinting protection (Brave "farbling" lite): deterministic per-site noise on canvas,
 //     WebGL vendor/renderer and audio data plus a smaller navigator surface. Pages keep working.
+//     Skips spoofing on Cloudflare/CAPTCHA pages to avoid failing bot checks.
 //  5. Network API shim: rejects fetch / XHR / sendBeacon / WebSocket / EventSource requests to
 //     any host in the tracker blocklist. WebView's shouldInterceptRequest cannot make fetch()
 //     reject (a 403 response is still a valid response, so the promise resolves), which is why
@@ -215,6 +216,11 @@ const val SHIELDS_JS = """
 
   // ---------- 4. fingerprinting protection ----------
   (function () {
+    // Skip fingerprinting spoofing on Cloudflare/CAPTCHA domains to avoid breaking challenges
+    if (/(cloudflare|challenge|captcha|turnstile)\./i.test(H)) {
+      return;
+    }
+
     var seed = 0;
     try {
       var s = (location.hostname || '') + '|' + (navigator.userAgent || '');
