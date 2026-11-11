@@ -1591,6 +1591,15 @@ private fun SwiftBrowserApp() {
                 }
             ), "SwiftTranslator")
 
+            // Shields host list for the JS fetch / XHR / beacon / WebSocket shim in SHIELDS_JS.
+            // Exposing the blocklist to JS lets us reject ad requests at the API level (a 403
+            // through shouldInterceptRequest still resolves fetch(), so testers say "not blocked").
+            addJavascriptInterface(object {
+                @android.webkit.JavascriptInterface
+                fun getBlockedHosts(): String =
+                    try { blocker.blockedHostsJson() } catch (e: Exception) { "{}" }
+            }, "SwiftFilter")
+
             // Saved settings: text size, JavaScript, images, Safe Browsing, third-party cookies.
             appSettings.applyTo(this)
             if (tabs.firstOrNull { it.id == tabId }?.isPrivate == true) {
@@ -1760,8 +1769,9 @@ private fun SwiftBrowserApp() {
                         countBlocked(tabId)
                         // A response with a throwing body makes the request fail
                         // (net::ERR_FAILED), which is what a real blocker looks like to
-                        // the page and to ad-block testers. An empty 200 response would
-                        // resolve successfully and count as "loaded".
+                        // the page and to ad-block testers for <script>/<img>/<iframe>.
+                        // fetch/XHR still resolve on a 403 — those are handled by the
+                        // JS shim in SHIELDS_JS (section 5), which rejects the promise.
                         return blockedResponse(url)
                     }
                     return null

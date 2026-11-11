@@ -10,6 +10,10 @@ package com.swift.browser
 //     elements, and skips whatever ad still starts.
 //  4. Fingerprinting protection (Brave "farbling" lite): deterministic per-site noise on canvas,
 //     WebGL vendor/renderer and audio data plus a smaller navigator surface. Pages keep working.
+//  5. Network API shim: rejects fetch / XHR / sendBeacon / WebSocket / EventSource requests to
+//     any host in the tracker blocklist. WebView's shouldInterceptRequest cannot make fetch()
+//     reject (a 403 response is still a valid response, so the promise resolves), which is why
+//     ad-block testers scored us low even when the request never reached the network.
 //
 // NOTE: Kotlin raw string, so the JS must not contain a dollar sign (use ${'$'} if needed).
 const val SHIELDS_JS = """
@@ -291,6 +295,140 @@ const val SHIELDS_JS = """
     // Navigator surface: smaller and more common values, so the page sees a "boring" device.
     try { Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: function () { return 4; }, configurable: true }); } catch (e) {}
     try { Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: function () { return 4; }, configurable: true }); } catch (e) {}
+  })();
+
+  // ---------- 5. fetch / XHR / beacon / WebSocket shim ----------
+  // shouldInterceptRequest cannot make fetch() reject: a 403 response is a valid
+  // HTTP response, so fetch resolves with r.ok=false. Ad-block testers and most
+  // trackers only treat a request as blocked when the promise rejects (net::ERR_FAILED).
+  // Brave achieves this by rejecting at the network layer; stock WebView cannot, so
+  // we override the JS APIs that pages use to talk to ad hosts. Scripts, images and
+  // iframes are already blocked by shouldInterceptRequest; this shim covers the rest.
+  (function () {
+    var hosts = null;
+    try {
+      if (window.SwiftFilter && window.SwiftFilter.getBlockedHosts) {
+        hosts = JSON.parse(window.SwiftFilter.getBlockedHosts());
+      }
+    } catch (e) {}
+    if (!hosts) return;
+
+    function isAdUrl(u) {
+      if (u === undefined || u === null) return false;
+      try {
+        var s = String(u);
+        if (s.indexOf(':') === 0) return false;           // javascript:, data:, blob:
+        if (!/^[a-z][a-z0-9+.\-]*:/i.test(s) && s.charAt(0) !== '/') s = 'https://' + s;
+        var host = '';
+        try { host = new URL(s, location.href).hostname.toLowerCase(); } catch (e) { return false; }
+        if (!host) return false;
+        var h = host;
+        while (h) {
+          if (hosts[h]) return true;
+          var dot = h.indexOf('.');
+          if (dot < 0) return false;
+          h = h.substring(dot + 1);
+        }
+      } catch (e) {}
+      return false;
+    }
+
+    // fetch
+    try {
+      var realFetch = window.fetch;
+      window.fetch = function (input) {
+        var url = (typeof input === 'string') ? input : (input && input.url) || '';
+        if (isAdUrl(url)) {
+          return Promise.reject(new TypeError('Failed to fetch'));
+        }
+        return realFetch.apply(this, arguments);
+      };
+    } catch (e) {}
+
+    // XMLHttpRequest
+    try {
+      var XHR = window.XMLHttpRequest;
+      var realOpen = XHR.prototype.open;
+      var realSend = XHR.prototype.send;
+      XHR.prototype.open = function (method, url) {
+        try { this.__swiftBlocked = isAdUrl(String(url)); } catch (e) { this.__swiftBlocked = false; }
+        return realOpen.apply(this, arguments);
+      };
+      XHR.prototype.send = function () {
+        if (this.__swiftBlocked) {
+          var xhr = this;
+          setTimeout(function () {
+            try {
+              Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
+              Object.defineProperty(xhr, 'status', { value: 0, configurable: true });
+              Object.defineProperty(xhr, 'statusText', { value: '', configurable: true });
+              if (typeof xhr.onerror === 'function') xhr.onerror(new Event('error'));
+              if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange(new Event('readystatechange'));
+            } catch (e) {}
+          }, 0);
+          return;
+        }
+        return realSend.apply(this, arguments);
+      };
+    } catch (e) {}
+
+    // navigator.sendBeacon
+    try {
+      var realBeacon = navigator.sendBeacon;
+      if (realBeacon) {
+        navigator.sendBeacon = function (url) {
+          if (isAdUrl(String(url))) return true; // pretend success, don't send
+          return realBeacon.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+
+    // WebSocket to an ad host: fail the connection.
+    try {
+      var RealWS = window.WebSocket;
+      if (RealWS) {
+        var WrappedWS = function (url, protocols) {
+          if (isAdUrl(String(url))) {
+            var self = this;
+            setTimeout(function () {
+              try {
+                Object.defineProperty(self, 'readyState', { value: 3, configurable: true });
+                if (typeof self.onerror === 'function') self.onerror(new Event('error'));
+                if (typeof self.onclose === 'function')
+                  self.onclose({ code: 1006, reason: 'Blocked by Swift Shields', wasClean: false });
+              } catch (e) {}
+            }, 0);
+            return;
+          }
+          return protocols === undefined ? new RealWS(url) : new RealWS(url, protocols);
+        };
+        WrappedWS.prototype = RealWS.prototype;
+        WrappedWS.CONNECTING = RealWS.CONNECTING;
+        WrappedWS.OPEN = RealWS.OPEN;
+        WrappedWS.CLOSING = RealWS.CLOSING;
+        WrappedWS.CLOSED = RealWS.CLOSED;
+        window.WebSocket = WrappedWS;
+      }
+    } catch (e) {}
+
+    // EventSource (server-sent events) — same pattern as XHR, rarely used by trackers.
+    try {
+      var RealES = window.EventSource;
+      if (RealES) {
+        var WrappedES = function (url, config) {
+          if (isAdUrl(String(url))) {
+            var self = this;
+            setTimeout(function () {
+              try { if (typeof self.onerror === 'function') self.onerror(new Event('error')); } catch (e) {}
+            }, 0);
+            return;
+          }
+          return config === undefined ? new RealES(url) : new RealES(url, config);
+        };
+        WrappedES.prototype = RealES.prototype;
+        window.EventSource = WrappedES;
+      }
+    } catch (e) {}
   })();
 })();
 """

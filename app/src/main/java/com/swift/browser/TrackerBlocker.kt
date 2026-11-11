@@ -61,6 +61,17 @@ class TrackerBlocker(context: Context) {
         }
     }
 
+    /**
+     * The full blocklist as a JSON object { "host": true, ... }, so the JS shim in
+     * SHIELDS_JS can reject fetch / XHR / beacon / WebSocket requests without a
+     * bridge round-trip per request.
+     */
+    fun blockedHostsJson(): String {
+        val obj = org.json.JSONObject()
+        blockedHosts.forEach { obj.put(it, true) }
+        return obj.toString()
+    }
+
     private fun sameSite(a: String, b: String) = a == b || a.endsWith(".$b") || b.endsWith(".$a")
 
     // Parameters / paths that ad-network click URLs carry (never part of a normal page address).
