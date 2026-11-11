@@ -323,3 +323,25 @@ sdkconfig.ad.xiaomi.com
 sdkconfig.ad.intl.xiaomi.com
 tracking.rus.miui.com
 click.oneplus.cn
+# --- additional hosts seen during testing (ad-block tester)
+ads.microsoft.com
+c.bing.com
+segment.com
+segment.io
+segmentapis.com
+amplitude.com
+heapanalytics.com
+adobedtm.com
+matomo.cloud
+
+# --- social pixels (never block the main site itself)
+connect.facebook.net
+pixel.facebook.com
+graph.facebook.com
+an.facebook.com
+
+# --- Yahoo / Verizon additional endpoints
+adserver.yahoo.com
+ssp.yahoo.com
+udc.yahoo.com
+beap-bc.yahoo.com

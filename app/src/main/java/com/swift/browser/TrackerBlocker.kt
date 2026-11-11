@@ -30,8 +30,16 @@ class TrackerBlocker(context: Context) {
 
     // Well-known ad / bait script names: blocked even when a site serves them from its own domain.
     private val alwaysBlockParts = listOf(
-        "/pagead.js", "/adsbygoogle.js", "/pagead/js/adsbygoogle", "/pagead/js/", "/pagead/viewthroughconversion",
-        "/doubleclick/", "/googleadservices/", "/ads/pagead"
+        // Google ad endpoints
+        "/pagead.js", "/adsbygoogle.js", "/pagead/js/adsbygoogle", "/pagead/js/",
+        "/pagead/viewthroughconversion", "/doubleclick/", "/googleadservices/", "/ads/pagead",
+        // Generic first-party bait script names. Ad-block testers (and many real pages)
+        // serve their own "ads.js" / "analytics.js" from a first-party URL, so a host list
+        // cannot catch them — these names must be blocked even for the page's own host.
+        // The leading slash guarantees "/uploads.js" or "/threads.js" are never matched.
+        "/ads.js", "/ad.js", "/advertisement.js", "/advert.js", "/adsense.js",
+        "/analytics.js", "/tracker.js", "/tracking.js", "/track.js",
+        "/pixel.js", "/beacon.js", "/gpt.js", "/prebid.js"
     )
 
     // Ad endpoints that live on the site's own domain (checked even for first-party requests).

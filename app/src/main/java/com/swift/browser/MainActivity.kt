@@ -373,6 +373,34 @@ private fun canAutoOpenMime(m: String?): Boolean {
         t.contains("officedocument") || t == "application/msword"
 }
 
+// A blocked request must FAIL, not resolve. An empty 200 response counts as "loaded" on
+// every ad-block tester (and on many real pages), so the shield looks broken. Chromium treats
+// an IOException thrown from the body's read() as a network error, so <script>/<img> fire
+// onerror and fetch() rejects — which is what a real blocker looks like to the page.
+private fun blockedResponse(url: String): WebResourceResponse {
+    val mime = when {
+        url.contains(".js", true) -> "application/javascript"
+        url.contains(".css", true) -> "text/css"
+        url.contains(".png", true) || url.contains(".jpg", true) || url.contains(".jpeg", true) ||
+            url.contains(".gif", true) || url.contains(".webp", true) ||
+            url.contains(".svg", true) || url.contains(".ico", true) -> "image/png"
+        url.contains(".html", true) -> "text/html"
+        url.contains(".json", true) -> "application/json"
+        else -> "text/plain"
+    }
+    val body = object : java.io.InputStream() {
+        override fun read(): Int = throw java.io.IOException("Blocked by Swift Shields")
+        override fun read(b: ByteArray, off: Int, len: Int): Int =
+            throw java.io.IOException("Blocked by Swift Shields")
+        override fun available(): Int = 0
+    }
+    return WebResourceResponse(
+        mime, "utf-8", 403, "Blocked",
+        mapOf("X-Swift-Blocked" to "1", "Cache-Control" to "no-store"),
+        body
+    )
+}
+
 // Per-tab favicons and page thumbnails (shown in tab cards and the group bar).
 private val FaviconStore = mutableStateMapOf<Long, Bitmap>()
 // Favicons by site, for the quick-access tiles under the address bar.
@@ -1493,8 +1521,19 @@ private fun SwiftBrowserApp() {
     val shieldHandlers = remember { HashMap<Long, androidx.webkit.ScriptHandler>() }
     val shieldsAtStart = androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)
     fun installShields(wv: WebView, id: Long) {
-        if (!shieldsAtStart || shieldHandlers.containsKey(id)) return
-        runCatching { shieldHandlers[id] = androidx.webkit.WebViewCompat.addDocumentStartJavaScript(wv, SHIELDS_JS, setOf("*")) }
+        if (shieldHandlers.containsKey(id)) return
+        if (!shieldsAtStart) {
+            // Older WebViews can't run a script before the page; the onPageStarted
+            // fallback below injects it as early as possible instead.
+            return
+        }
+        try {
+            shieldHandlers[id] = androidx.webkit.WebViewCompat.addDocumentStartJavaScript(wv, SHIELDS_JS, setOf("*"))
+        } catch (e: Exception) {
+            // Never swallow silently again: if this fails, the onPageStarted fallback is
+            // the only thing keeping shields alive on the page.
+            android.util.Log.w("SwiftShields", "addDocumentStartJavaScript failed for tab $id", e)
+        }
     }
     fun removeShields(id: Long) { shieldHandlers.remove(id)?.let { runCatching { it.remove() } } }
     LaunchedEffect(blockingEnabled) {
@@ -1649,6 +1688,18 @@ private fun SwiftBrowserApp() {
                         loadProgress = newProgress
                     }
                 }
+
+                // Without this, JS errors from SHIELDS_JS (and any other injected script)
+                // are invisible in Logcat. Watch "adb logcat | grep SwiftWeb" while testing.
+                override fun onConsoleMessage(msg: android.webkit.ConsoleMessage?): Boolean {
+                    if (msg != null) {
+                        android.util.Log.d(
+                            "SwiftWeb",
+                            "[${msg.messageLevel()}] ${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})"
+                        )
+                    }
+                    return false
+                }
             }
 
             webViewClient = object : WebViewClient() {
@@ -1700,12 +1751,18 @@ private fun SwiftBrowserApp() {
                         (h == "www.gstatic.com" && url.contains("/translate/"))
                     ) return null
 
+                    // Keep firstParty in sync for the very first subresources of a new page:
+                    // they can arrive before onPageStarted runs, so without this the previous
+                    // page's host would be used.
+                    if (req.isForMainFrame) firstParty[tabId] = url
+
                     if (currentBlockingEnabled && blocker.shouldBlock(url, firstParty[tabId] ?: "", req.isForMainFrame)) {
                         countBlocked(tabId)
-                        // A response with no data stream makes WebView fail the request (net::ERR_FAILED),
-                        // like Brave cancelling it. The old empty "204 OK" looked like a successful load,
-                        // so pages and ad-block tests counted the ad as NOT blocked.
-                        return WebResourceResponse("text/plain", "utf-8", null)
+                        // A response with a throwing body makes the request fail
+                        // (net::ERR_FAILED), which is what a real blocker looks like to
+                        // the page and to ad-block testers. An empty 200 response would
+                        // resolve successfully and count as "loaded".
+                        return blockedResponse(url)
                     }
                     return null
                 }
@@ -1747,8 +1804,10 @@ private fun SwiftBrowserApp() {
                     favicon: android.graphics.Bitmap?
                 ) {
                     if (url == null || url.startsWith("about:")) return
-                    // Older WebViews can't run a script before the page: inject as early as we can.
-                    if (currentBlockingEnabled && !shieldsAtStart) view?.evaluateJavascript(SHIELDS_JS, null)
+                    // Always inject too (belt and braces): SHIELDS_JS guards against double
+                    // injection with window.__swiftShields. If addDocumentStartJavaScript
+                    // threw during install, this is the only path keeping shields alive.
+                    if (currentBlockingEnabled) view?.evaluateJavascript(SHIELDS_JS, null)
                     if (translateOffer?.first == tabId) translateOffer = null
                     if (translateDone?.first == tabId) translateDone = null
                     if (translateBusy?.first == tabId) translateBusy = null
