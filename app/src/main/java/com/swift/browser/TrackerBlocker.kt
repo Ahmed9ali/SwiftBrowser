@@ -28,6 +28,12 @@ class TrackerBlocker(context: Context) {
         "/vast.xml", "/vast?", "adtag", "/ad.php?", "/click.php?", "/clickunder"
     )
 
+    // Well-known ad / bait script names: blocked even when a site serves them from its own domain.
+    private val alwaysBlockParts = listOf(
+        "/pagead.js", "/adsbygoogle.js", "/pagead/js/adsbygoogle", "/pagead/js/", "/pagead/viewthroughconversion",
+        "/doubleclick/", "/googleadservices/", "/ads/pagead"
+    )
+
     // Ad endpoints that live on the site's own domain (checked even for first-party requests).
     private val youtubeAdParts = listOf(
         "/api/stats/ads", "/pagead/", "/ptracking", "/get_midroll_info", "/api/stats/atr", "adformat=", "&ad_type="
@@ -88,6 +94,7 @@ class TrackerBlocker(context: Context) {
             if (youtubeAdParts.any { lower.contains(it) } && !lower.contains("/youtubei/v1/player")) return true
         }
 
+        if (!isMainFrame && alwaysBlockParts.any { lower.contains(it) }) return true
         if (firstParty || isMainFrame) return false
         return adPathParts.any { lower.contains(it) }
     }

@@ -1702,14 +1702,10 @@ private fun SwiftBrowserApp() {
 
                     if (currentBlockingEnabled && blocker.shouldBlock(url, firstParty[tabId] ?: "", req.isForMainFrame)) {
                         countBlocked(tabId)
-                        return WebResourceResponse(
-                            "text/plain",
-                            "utf-8",
-                            204,
-                            "Blocked",
-                            emptyMap(),
-                            ByteArrayInputStream(ByteArray(0))
-                        )
+                        // A response with no data stream makes WebView fail the request (net::ERR_FAILED),
+                        // like Brave cancelling it. The old empty "204 OK" looked like a successful load,
+                        // so pages and ad-block tests counted the ad as NOT blocked.
+                        return WebResourceResponse("text/plain", "utf-8", null)
                     }
                     return null
                 }
