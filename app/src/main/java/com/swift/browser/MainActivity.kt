@@ -634,6 +634,8 @@ private fun SwiftBrowserApp() {
     var swipeCur by remember { mutableStateOf<Bitmap?>(null) }
     var swipeTarget by remember { mutableStateOf<BrowserTab?>(null) } // frozen once the swipe is committed
     val swipeGen = remember { IntArray(1) }
+    // Page each tab was on when the user went back to the home page: Forward returns to it.
+    val homeForward = remember { mutableStateMapOf<Long, String>() }
     var pendingLogin by remember { mutableStateOf<PendingLogin?>(null) }
     val passwordStore = remember { PasswordStore(context) }
     var settingsEntry by remember { mutableStateOf("main") }
@@ -947,6 +949,7 @@ private fun SwiftBrowserApp() {
         }
 
         if (value.startsWith("swift://")) {
+            if (value == "swift://home" && pageUrl.startsWith("http")) homeForward[activeId] = pageUrl
             pageUrl = value
             address = ""
             pageTitle = if (value == "swift://home") "New tab" else "Swift Browser"
@@ -964,6 +967,7 @@ private fun SwiftBrowserApp() {
             return
         }
 
+        homeForward.remove(activeId) // a new page was opened: nothing to go forward to any more
         val url = httpsFirst(normalize(value))
         if (url == appSettings.searchUrl(value) && tabs.firstOrNull { it.id == activeId }?.isPrivate != true) {
             store.addQuery(value) // typed searches feed the suggestions
@@ -3257,10 +3261,15 @@ private fun SwiftBrowserApp() {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        val homeFwd = isHome && homeForward[activeId] != null
                         MenuCircleButton(
                             Icons.Default.ArrowForward, "Forward",
-                            enabled = onPage && activeWebView()?.canGoForward() == true
-                        ) { showMenu = false; activeWebView()?.goForward() }
+                            enabled = homeFwd || (onPage && activeWebView()?.canGoForward() == true)
+                        ) {
+                            showMenu = false
+                            if (homeFwd) homeForward[activeId]?.let { load(it) }
+                            else activeWebView()?.goForward()
+                        }
                         MenuCircleButton(Icons.Default.Share, "Share", enabled = onPage) {
                             showMenu = false
                             sharePage(context, pageUrl)
@@ -4780,7 +4789,8 @@ private fun GroupPopupOverlay(
                 after = tabsNow.indexOfFirst { it.id == hit.id } > from
             } else if (firstT != null && firstT.id != me && firstR != null && finger.y < firstR.top) {
                 target = firstT.id; after = false          // above the first row -> first slot
-            } else if (lastT != null && lastT.id != me && lastR != null && finger.y > lastR.bottom) {
+            } else if (lastT != null && lastT.id != me && lastR != null &&
+                (finger.y > lastR.bottom || (finger.y >= lastR.top && finger.x > lastR.right))) {
                 target = lastT.id; after = true            // below the last row -> last slot
             }
 
@@ -4944,22 +4954,31 @@ private fun GroupPopupOverlay(
                 }
             }
         }
-        // The held tab: drawn on top of everything, follows the finger no matter how far the list scrolls.
+        // The held tab follows the finger no matter how far the list scrolls, but is clipped
+        // to the list, so pulling it up slides it UNDER the group header instead of over it.
         heldTab?.let { ht ->
-            val wDp = with(androidx.compose.ui.platform.LocalDensity.current) { heldSize.width.toDp() }
-            val hDp = with(androidx.compose.ui.platform.LocalDensity.current) { heldSize.height.toDp() }
+            val dens = androidx.compose.ui.platform.LocalDensity.current
+            val gb = gridBounds
             Box(
-                Modifier.align(Alignment.TopStart).size(wDp, hDp).zIndex(10f)
-                    .graphicsLayer {
-                        translationX = finger.x - grab.x - popupOrigin.x
-                        translationY = finger.y - grab.y - popupOrigin.y
-                        scaleX = 1.04f; scaleY = 1.04f
-                    }
+                Modifier.align(Alignment.TopStart)
+                    .offset { androidx.compose.ui.unit.IntOffset(
+                        (gb.left - popupOrigin.x).roundToInt(), (gb.top - popupOrigin.y).roundToInt()) }
+                    .size(with(dens) { gb.width.toDp() }, with(dens) { gb.height.toDp() })
+                    .clipToBounds().zIndex(10f)
             ) {
-                SingleTabCard(
-                    tab = ht, isActive = ht.id == activeId, hovered = false, ringColor = color,
-                    onSelect = {}, onClose = {}, onRemoveFromGroup = {}, showActiveLabel = false
-                )
+                Box(
+                    Modifier.size(with(dens) { heldSize.width.toDp() }, with(dens) { heldSize.height.toDp() })
+                        .graphicsLayer {
+                            translationX = finger.x - grab.x - gb.left
+                            translationY = finger.y - grab.y - gb.top
+                            scaleX = 1.04f; scaleY = 1.04f
+                        }
+                ) {
+                    SingleTabCard(
+                        tab = ht, isActive = ht.id == activeId, hovered = false, ringColor = color,
+                        onSelect = {}, onClose = {}, onRemoveFromGroup = {}, showActiveLabel = false
+                    )
+                }
             }
         }
     }
