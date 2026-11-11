@@ -39,7 +39,9 @@ class TrackerBlocker(context: Context) {
         // The leading slash guarantees "/uploads.js" or "/threads.js" are never matched.
         "/ads.js", "/ad.js", "/advertisement.js", "/advert.js", "/adsense.js",
         "/analytics.js", "/tracker.js", "/tracking.js", "/track.js",
-        "/pixel.js", "/beacon.js", "/gpt.js", "/prebid.js"
+        "/pixel.js", "/beacon.js", "/gpt.js", "/prebid.js",
+        // Anti-adblock detection scripts
+        "blockadblock", "fuckadblock", "adblock-detect", "detectadblock", "adblockcheck"
     )
 
     // Ad endpoints that live on the site's own domain (checked even for first-party requests).
@@ -100,22 +102,18 @@ class TrackerBlocker(context: Context) {
      * the main frame to a spam domain when the real video link is clicked.
      */
     fun isMaliciousMainFrameRedirect(url: String, currentPageUrl: String?, hasGesture: Boolean): Boolean {
-        // Allow explicit user gestures (real link clicks) and first-party subpages
         if (hasGesture || currentPageUrl == null) return false
         val targetHost = hostOf(url) ?: return false
         val currentHost = hostOf(currentPageUrl) ?: return false
         
-        // Allow same-site navigation
         if (sameSite(targetHost, currentHost)) return false
         
-        // Allow common authentication / payment / CDN domains
         val allowedDomains = listOf(
             "google.com", "cloudflare.com", "hcaptcha.com", 
             "recaptcha.net", "stripe.com", "paypal.com"
         )
         if (allowedDomains.any { targetHost.endsWith(it) || currentHost.endsWith(it) }) return false
 
-        // Block entirely unrelated domains
         return true
     }
 
@@ -123,8 +121,11 @@ class TrackerBlocker(context: Context) {
         val requestHost = hostOf(requestUrl) ?: return false
         val pageHost = hostOf(pageUrl)
 
+        // Whitelist essential CDNs so sites don't break
+        if (requestHost.endsWith("jsdelivr.net") || requestHost.endsWith("cloudflare.com") || 
+            requestHost.endsWith("googleapis.com") || requestHost.endsWith("gstatic.com")) return false
+
         if (isAdHost(requestHost)) {
-            // The user typed / opened an ad host on purpose: not our call (only redirects are cancelled).
             if (isMainFrame && pageHost == null) return false
             return !(pageHost != null && sameSite(requestHost, pageHost))
         }
