@@ -7,7 +7,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONArray
 
 /**
@@ -34,21 +38,30 @@ class WebAppInterface(
             var failed = 0
             var firstError: Exception? = null
 
-            for (i in 0 until texts.length()) {
-                val original = texts.optString(i)
-                val result = try {
-                    TranslateEngine.translate(src, tgt, original)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    failed++
-                    if (firstError == null) firstError = e
-                    original // keep the original text for this piece
-                }
-                out.put(result)
+            // Translate the distinct strings of the batch in parallel (the old loop did them one by one).
+            val originals = (0 until texts.length()).map { texts.optString(it) }
+            val distinct = originals.distinct()
+            val gate = Semaphore(8)
+            val done = coroutineScope {
+                distinct.map { original ->
+                    original to async {
+                        gate.withPermit {
+                            try {
+                                TranslateEngine.translate(src, tgt, original)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                failed++
+                                if (firstError == null) firstError = e
+                                original // keep the original text for this piece
+                            }
+                        }
+                    }
+                }.associate { (k, v) -> k to v.await() }
             }
+            originals.forEach { out.put(done[it] ?: it) }
 
-            if (texts.length() > 0 && failed == texts.length()) {
+            if (distinct.isNotEmpty() && failed >= distinct.size) {
                 val now = System.currentTimeMillis()
                 if (now - lastErrorAt > 5000) {
                     lastErrorAt = now

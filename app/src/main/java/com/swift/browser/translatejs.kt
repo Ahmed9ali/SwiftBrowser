@@ -150,7 +150,7 @@ const val TRANSLATE_JS = """
         collect(r, out);
       }
       if (active && out.length) send(out);
-    }, 350);
+    }, 120);
   }
 
   function startObserver() {

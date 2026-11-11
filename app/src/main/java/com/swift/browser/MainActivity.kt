@@ -121,6 +121,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -374,6 +375,14 @@ private fun canAutoOpenMime(m: String?): Boolean {
 
 // Per-tab favicons and page thumbnails (shown in tab cards and the group bar).
 private val FaviconStore = mutableStateMapOf<Long, Bitmap>()
+// Favicons by site, for the quick-access tiles under the address bar.
+private val HostFavicons = mutableStateMapOf<String, Bitmap>()
+
+private fun fetchFavicon(host: String): Bitmap? = runCatching {
+    val c = java.net.URL("https://www.google.com/s2/favicons?sz=64&domain=$host").openConnection() as java.net.HttpURLConnection
+    c.connectTimeout = 4000; c.readTimeout = 4000
+    c.inputStream.use { BitmapFactory.decodeStream(it) }
+}.getOrNull()
 private val ThumbStore = mutableStateMapOf<Long, Bitmap>()
 
 // Tab groups (Brave-style drag-to-group). Group ids live far above tab ids.
@@ -623,6 +632,7 @@ private fun SwiftBrowserApp() {
     var swipeActive by remember { mutableStateOf(false) }
     var swipeP by remember { mutableFloatStateOf(0f) } // -1..1, negative = dragging left (next tab)
     var swipeCur by remember { mutableStateOf<Bitmap?>(null) }
+    var swipeTarget by remember { mutableStateOf<BrowserTab?>(null) } // frozen once the swipe is committed
     val swipeGen = remember { IntArray(1) }
     var pendingLogin by remember { mutableStateOf<PendingLogin?>(null) }
     val passwordStore = remember { PasswordStore(context) }
@@ -1201,6 +1211,9 @@ private fun SwiftBrowserApp() {
             return
         }
         uiScope.launch {
+            // Freeze the revealed tab: selectTab() changes the active tab, which would otherwise
+            // make the overlay show the NEXT neighbour (the 'blink') until it is removed.
+            swipeTarget = if (commit) nb else null
             animate(p, if (commit) (if (p < 0) -1f else 1f) else 0f, animationSpec = tween(if (commit) 200 else 170)) { v, _ -> swipeP = v }
             if (commit && nb != null) {
                 selectTab(nb)
@@ -1209,6 +1222,7 @@ private fun SwiftBrowserApp() {
             swipeActive = false
             swipeP = 0f
             swipeCur = null
+            swipeTarget = null
         }
     }
 
@@ -1567,7 +1581,10 @@ private fun SwiftBrowserApp() {
                 }
 
                 override fun onReceivedIcon(view: WebView?, icon: Bitmap?) {
-                    if (icon != null) FaviconStore[tabId] = icon
+                    if (icon != null) {
+                        FaviconStore[tabId] = icon
+                        view?.url?.let { u -> HostFavicons[hostOf(u).removePrefix("www.")] = icon }
+                    }
                 }
 
                 override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -2131,8 +2148,9 @@ private fun SwiftBrowserApp() {
             }
 
             // Small protection strip opens the detailed shield dashboard.
-            // Hidden in the tabs overview, like Brave.
-            if (!showTabs && address != "swift://settings" && address != "swift://downloads") {
+            // Hidden in the tabs overview, like Brave, and while the address card is open.
+            if (!showTabs && address != "swift://settings" && address != "swift://downloads" &&
+                !(addressFocused && address.isBlank() && pageUrl.startsWith("http"))) {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 1.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -2262,7 +2280,7 @@ private fun SwiftBrowserApp() {
                 // The address bar itself never moves.
                 if (swipeActive) {
                     val p = swipeP
-                    val nb = neighborFor(if (p < 0) 1 else -1)
+                    val nb = swipeTarget ?: neighborFor(if (p < 0) 1 else -1)
                     Box(Modifier.fillMaxSize().clipToBounds().background(Bg)) {
                         Box(Modifier.fillMaxSize().graphicsLayer {
                             // p<0: next tab arrives from the right; p>0: previous tab from the left.
@@ -2312,7 +2330,7 @@ private fun SwiftBrowserApp() {
                         (bookmarksNow() + store.history()).distinctBy { hostOf(it.second).removePrefix("www.") }
                             .filter { it.second.startsWith("http") }.take(10)
                     }
-                    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+                    Column(Modifier.fillMaxSize().background(Bg).padding(horizontal = 12.dp, vertical = 6.dp)) {
                         Row(
                             Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(Surface2)
                                 .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 6.dp),
@@ -2356,7 +2374,7 @@ private fun SwiftBrowserApp() {
                             ) {
                                 quick.forEach { (title, url) ->
                                     Column(
-                                        Modifier.width(76.dp).clip(RoundedCornerShape(12.dp))
+                                        Modifier.width(84.dp).clip(RoundedCornerShape(12.dp))
                                             .clickable {
                                                 keyboardController?.hide()
                                                 focusManager.clearFocus()
@@ -2365,11 +2383,16 @@ private fun SwiftBrowserApp() {
                                             .padding(vertical = 4.dp),
                                         horizontalAlignment = Alignment.CenterHorizontally
                                     ) {
-                                        Box(Modifier.size(50.dp).clip(CircleShape).background(Surface2), contentAlignment = Alignment.Center) {
-                                            Text(
-                                                hostOf(url).removePrefix("www.").take(1).uppercase(),
-                                                color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Medium
-                                            )
+                                        val h = hostOf(url).removePrefix("www.")
+                                        LaunchedEffect(h) {
+                                            if (HostFavicons[h] == null) {
+                                                withContext(Dispatchers.IO) { fetchFavicon(h) }?.let { HostFavicons[h] = it }
+                                            }
+                                        }
+                                        Box(Modifier.size(56.dp).clip(CircleShape).background(Surface2), contentAlignment = Alignment.Center) {
+                                            val ic = HostFavicons[h]
+                                            if (ic != null) Image(bitmap = ic.asImageBitmap(), contentDescription = null, modifier = Modifier.size(30.dp))
+                                            else Text(h.take(1).uppercase(), color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Medium)
                                         }
                                         Spacer(Modifier.height(6.dp))
                                         Text(
@@ -4702,6 +4725,9 @@ private fun GroupPopupOverlay(
     // Long-press a tab and drag it onto another one to swap places inside the group.
     var dragId by remember { mutableStateOf<Long?>(null) }
     var finger by remember { mutableStateOf(Offset.Zero) }   // finger position in root coordinates
+    var heldTab by remember { mutableStateOf<BrowserTab?>(null) }
+    var heldSize by remember { mutableStateOf(androidx.compose.ui.geometry.Size.Zero) }
+    var popupOrigin by remember { mutableStateOf(Offset.Zero) }
     var grab by remember { mutableStateOf(Offset.Zero) }     // finger offset inside the held card
     var lastSwap by remember { mutableLongStateOf(0L) }
     val popupBounds = remember { mutableStateMapOf<Long, Rect>() }
@@ -4774,6 +4800,7 @@ private fun GroupPopupOverlay(
     Box(
         Modifier.fillMaxSize()
             .background(Color(0xB3000000))
+            .onGloballyPositioned { popupOrigin = it.positionInRoot() }
             .pointerInput(Unit) { detectTapGestures(onTap = { onDismiss() }) }
     ) {
         androidx.compose.animation.AnimatedVisibility(
@@ -4846,7 +4873,48 @@ private fun GroupPopupOverlay(
                     columns = GridCells.Fixed(2),
                     state = gridState,
                     userScrollEnabled = dragId == null,
-                    modifier = Modifier.heightIn(max = 520.dp).onGloballyPositioned { gridBounds = it.boundsInRoot() },
+                    modifier = Modifier.heightIn(max = 520.dp)
+                        .onGloballyPositioned { gridBounds = it.boundsInRoot() }
+                        // Long-press + drag is handled here, not on a card: a card is thrown away by the
+                        // lazy grid once it scrolls far off screen, which used to cancel the drag halfway.
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                val origin = gridBounds.topLeft
+                                val startRoot = origin + down.position
+                                val slop = viewConfiguration.touchSlop
+                                // Wait for a long press without disturbing taps / scrolling.
+                                var pressed = true
+                                val lp = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                                    while (true) {
+                                        val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: run { pressed = false; return@withTimeoutOrNull }
+                                        if (!ch.pressed || (ch.position - down.position).getDistance() > slop) { pressed = false; return@withTimeoutOrNull }
+                                    }
+                                }
+                                if (lp != null || !pressed) return@awaitEachGesture
+                                val hit = liveEntry.tabs.firstOrNull { t -> popupBounds[t.id]?.contains(startRoot) == true }
+                                    ?: return@awaitEachGesture
+                                val r = popupBounds[hit.id] ?: return@awaitEachGesture
+                                heldTab = hit
+                                heldSize = r.size
+                                grab = startRoot - r.topLeft
+                                finger = startRoot
+                                dragId = hit.id
+                                try {
+                                    while (true) {
+                                        val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                                        if (!ch.pressed) { ch.consume(); break }
+                                        finger += ch.positionChange()
+                                        ch.consume()
+                                    }
+                                } finally {
+                                    dragId = null
+                                    heldTab = null
+                                }
+                            }
+                        },
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
@@ -4859,32 +4927,7 @@ private fun GroupPopupOverlay(
                                 .then(if (held) Modifier else Modifier.animateItem())
                                 .onGloballyPositioned { popupBounds[tab.id] = it.boundsInRoot() }
                                 .zIndex(if (held) 1f else 0f)
-                                .graphicsLayer {
-                                    if (held) {
-                                        // Follows the finger from wherever its slot currently is.
-                                        val slot = popupBounds[tab.id]?.topLeft ?: Offset.Zero
-                                        val want = finger - grab
-                                        translationX = want.x - slot.x
-                                        translationY = want.y - slot.y
-                                        scaleX = 1.04f; scaleY = 1.04f
-                                    }
-                                }
-                                .pointerInput(tab.id) {
-                                    detectDragGesturesAfterLongPress(
-                                        onDragStart = { offset ->
-                                            val r = popupBounds[tab.id] ?: return@detectDragGesturesAfterLongPress
-                                            dragId = tab.id
-                                            grab = offset
-                                            finger = r.topLeft + offset
-                                        },
-                                        onDrag = { change, amount ->
-                                            change.consume()
-                                            finger += amount // swapping + auto-scroll happen in the frame loop above
-                                        },
-                                        onDragEnd = { dragId = null },
-                                        onDragCancel = { dragId = null }
-                                    )
-                                }
+                                .alpha(if (held) 0f else 1f)
                         ) {
                             SingleTabCard(
                                 tab = tab,
@@ -4899,6 +4942,24 @@ private fun GroupPopupOverlay(
                         }
                     }
                 }
+            }
+        }
+        // The held tab: drawn on top of everything, follows the finger no matter how far the list scrolls.
+        heldTab?.let { ht ->
+            val wDp = with(androidx.compose.ui.platform.LocalDensity.current) { heldSize.width.toDp() }
+            val hDp = with(androidx.compose.ui.platform.LocalDensity.current) { heldSize.height.toDp() }
+            Box(
+                Modifier.align(Alignment.TopStart).size(wDp, hDp).zIndex(10f)
+                    .graphicsLayer {
+                        translationX = finger.x - grab.x - popupOrigin.x
+                        translationY = finger.y - grab.y - popupOrigin.y
+                        scaleX = 1.04f; scaleY = 1.04f
+                    }
+            ) {
+                SingleTabCard(
+                    tab = ht, isActive = ht.id == activeId, hovered = false, ringColor = color,
+                    onSelect = {}, onClose = {}, onRemoveFromGroup = {}, showActiveLabel = false
+                )
             }
         }
     }
