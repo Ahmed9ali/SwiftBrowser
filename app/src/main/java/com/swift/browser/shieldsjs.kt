@@ -23,7 +23,7 @@ const val SHIELDS_JS = """
     }
     return false;
   }
-  var AD_URL = /(popunder|popads|propeller|exoclick|adsterra|clickadu|hilltopads|onclickalgo|trafficjunky|juicyads|adcash|popcash|monetag|realsrv|mondiad|richads|\/pop\.js|clickunder|adsco\.re|go\.oclasrv|nudus|luckyday|brolackview)/i;
+  var AD_URL = /(popunder|popads|propeller|exoclick|adsterra|clickadu|hilltopads|onclickalgo|trafficjunky|juicyads|adcash|popcash|monetag|realsrv|mondiad|richads|\/pop\.js|clickunder|adsco\.re|go\.oclasrv|nudus|luckyday|brolackview|skillify|vpn-trusthub)/i;
   function stubWindow() {
     return { closed: false, focus: function () {}, blur: function () {}, close: function () {},
       postMessage: function () {}, location: { href: '' }, document: { write: function () {}, close: function () {} } };
@@ -37,25 +37,54 @@ const val SHIELDS_JS = """
     };
   } catch (e) {}
   
-  // Block programmatic clicks to spam URLs
-  try {
-    var realClick = HTMLAnchorElement.prototype.click;
-    HTMLAnchorElement.prototype.click = function () {
-      var legit = this.hasAttribute('download') || /^(blob|data):/i.test(this.href || '');
-      if (!this.isConnected && !legit) return;
-      if (AD_URL.test(this.href || '')) return;
-      return realClick.apply(this, arguments);
-    };
-  } catch (e) {}
+  // ---------- 2. Aggressive Ad Click Blocker ----------
+  // Stops clicks on images or links that point to known ad hosts
+  document.addEventListener('click', function(e) {
+      var el = e.target;
+      while (el) {
+          if (el.tagName === 'A' && el.href) {
+              if (AD_URL.test(el.href)) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  return false;
+              }
+          }
+          // Check if the image source contains ad keywords
+          if (el.tagName === 'IMG' && el.src) {
+              if (AD_URL.test(el.src)) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  return false;
+              }
+          }
+          el = el.parentElement;
+      }
+  }, true);
 
-  // ---------- 2. Anti-Adblock Bypass (Safe Method) ----------
+  // ---------- 3. Anti-Adblock Bypass ----------
   (function() {
     if (!window.adsbygoogle) window.adsbygoogle = { push: function(){}, loaded: true };
     if (!window.canRunAds) window.canRunAds = true;
     if (!window.adBlockDetected) window.adBlockDetected = false;
+    
+    // Watch for the anti-adblock modal and kill it
+    var observer = new MutationObserver(function(mutations) {
+      mutations.forEach(function(m) {
+        m.addedNodes.forEach(function(node) {
+          if (node.nodeType === 1) { // Element
+            var text = node.innerText || "";
+            if (text.includes("ADBLOCK") || text.includes("AdBlocker") || text.includes("VPN Required")) {
+              node.style.display = 'none';
+              node.remove();
+            }
+          }
+        });
+      });
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
   })();
 
-  // ---------- 3. cosmetic filters ----------
+  // ---------- 4. cosmetic filters ----------
   var COSMETIC = [
     'ins.adsbygoogle', '.adsbygoogle', '.google-ad', '.google-ads', '.google-ad-slot',
     '[id^="google_ads_"]', '[id^="div-gpt-ad"]', '[id^="aswift_"]',
@@ -84,7 +113,9 @@ const val SHIELDS_JS = """
     'img[src*="brolackview"]', 'a[href*="brolackview"]',
     // Anti-Adblock Modals
     '[class*="adblock"]', '[id*="adblock"]', '.adblock-modal', '#adblock-modal',
-    '[class*="ad-block"]', '[id*="ad-block"]', '.anti-adblock', '#anti-adblock'
+    '[class*="ad-block"]', '[id*="ad-block"]', '.anti-adblock', '#anti-adblock',
+    // VPN Prompt
+    '[class*="vpn"]', '[id*="vpn"]', '.vpn-popup', '#vpn-popup'
   ];
   if (IS_YT) {
     COSMETIC = COSMETIC.concat([
@@ -149,7 +180,7 @@ const val SHIELDS_JS = """
     mo.observe(document.documentElement || document, { childList: true, subtree: true });
   } catch (e) {}
 
-  // ---------- 4. YouTube ----------
+  // ---------- 5. YouTube ----------
   if (IS_YT) {
     if (location.pathname.indexOf('/shorts/') === -1) {
       var KEYS = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
@@ -177,7 +208,7 @@ const val SHIELDS_JS = """
     }
   }
 
-  // ---------- 5. fetch / XHR shim (Optimized for speed) ----------
+  // ---------- 6. fetch / XHR shim (Optimized for speed) ----------
   (function () {
     var hosts = null;
     try {
@@ -191,7 +222,6 @@ const val SHIELDS_JS = """
       if (u === undefined || u === null) return false;
       try {
         var s = String(u);
-        // Quick exit for common local/data URLs
         if (s.indexOf(':') === 0 || s.indexOf('//') === 0) return false;
         
         var host = '';

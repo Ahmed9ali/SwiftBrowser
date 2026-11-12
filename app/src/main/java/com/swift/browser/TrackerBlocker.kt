@@ -33,7 +33,8 @@ class TrackerBlocker(context: Context) {
 
     // Hardcoded known spam redirect hosts to immediately block the blank page issue
     private val hardcodedSpamHosts = setOf(
-        "brolackview.ink", "brolackview.com", "brolack.com", "nudus.com", "adsterra.com"
+        "brolackview.ink", "brolackview.com", "brolack.com", "nudus.com", "nudus.net", 
+        "adsterra.com", "werrefilledwit.org", "vpn-trusthub.com", "skillify.com"
     )
 
     private val redirectParts = listOf(

@@ -1674,6 +1674,13 @@ private fun SwiftBrowserApp() {
                     url: String?,
                     favicon: android.graphics.Bitmap?
                 ) {
+                    // Fix stuck blank pages: If the URL is about:blank or empty, go back
+                    if (url == "about:blank" || url.isNullOrEmpty()) {
+                        if (view != null && view.canGoBack()) {
+                            view.goBack()
+                            return
+                        }
+                    }
                     if (url == null || url.startsWith("about:")) return
                     if (currentBlockingEnabled) view?.evaluateJavascript(SHIELDS_JS, null)
                     if (translateOffer?.first == tabId) translateOffer = null
