@@ -5601,7 +5601,3 @@ private fun SwipeTabPreview(tab: BrowserTab?) {
         }
     }
 }
-
-
-
-
