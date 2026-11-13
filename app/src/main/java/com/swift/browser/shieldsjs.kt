@@ -10,6 +10,22 @@ const val SHIELDS_JS = """
   var H = (location.hostname || '').toLowerCase();
   var IS_YT = /(^|\.)youtube(-nocookie)?\.com${'$'}/.test(H);
   var NAV = window.SwiftNav;
+  var TOP = (window === window.top);
+  var HOSTS = null;
+  try { if (window.SwiftFilter && window.SwiftFilter.getBlockedHosts) HOSTS = JSON.parse(window.SwiftFilter.getBlockedHosts()); } catch (e) {}
+  function adHostUrl(u) {
+    if (!HOSTS) return false;
+    try {
+      var h = new URL(String(u), location.href).hostname.toLowerCase();
+      while (h) {
+        if (HOSTS[h]) return true;
+        var dot = h.indexOf('.');
+        if (dot < 0) return false;
+        h = h.substring(dot + 1);
+      }
+    } catch (e) {}
+    return false;
+  }
 
   // ---------- 1. tap reporter (feeds the native navigation guard) ----------
   var lastTrusted = 0;
@@ -149,11 +165,30 @@ const val SHIELDS_JS = """
       parent.appendChild(styleEl);
     } catch (e) {}
   }
+  // Selectors from the downloaded filter lists (per-site), applied rule by rule so one bad selector cannot void the rest.
+  var nativeSheet = null, nativeSels = '';
+  try { if (TOP && window.SwiftFilter && window.SwiftFilter.cosmeticSelectors) nativeSels = window.SwiftFilter.cosmeticSelectors(H) || ''; } catch (e) {}
+  function installNative() {
+    if (!nativeSels) return;
+    try {
+      if (nativeSheet && document.adoptedStyleSheets.indexOf(nativeSheet) >= 0) return;
+      if (!nativeSheet) {
+        nativeSheet = new CSSStyleSheet();
+        var list = nativeSels.split('\n');
+        for (var i = 0; i < list.length; i++) {
+          if (!list[i]) continue;
+          try { nativeSheet.insertRule(list[i] + '{display:none !important}', nativeSheet.cssRules.length); } catch (e) {}
+        }
+      }
+      document.adoptedStyleSheets = document.adoptedStyleSheets.concat([nativeSheet]);
+    } catch (e) {}
+  }
+  installNative();
   installStyle();
-  try { document.addEventListener('readystatechange', installStyle); } catch (e) {}
+  try { document.addEventListener('readystatechange', function () { installStyle(); installNative(); }); } catch (e) {}
   try { document.addEventListener('DOMContentLoaded', installStyle); } catch (e) {}
   // Re-check occasionally in case a page wipes <head>; a single boolean read, no DOM scan.
-  try { setInterval(installStyle, 2000); } catch (e) {}
+  try { setInterval(function () { installStyle(); installNative(); }, 2000); } catch (e) {}
 
   // ---------- 6. YouTube ad data ----------
   if (IS_YT && location.pathname.indexOf('/shorts/') === -1) {
@@ -181,12 +216,79 @@ const val SHIELDS_JS = """
     } catch (e) {}
   }
 
+  // ---------- 6b. late-added ads: ad-host frames/links/images and click-stealing overlays ----------
+  // Looks only at nodes that were just added (never rescans the page), in small time-boxed batches.
+  (function () {
+    if (!TOP && !HOSTS) return;
+    var queue = [], scheduled = false;
+    function hide(e) { try { e.style.setProperty('display', 'none', 'important'); } catch (x) {} }
+    function checkEl(e) {
+      var u = e.src || e.href;
+      if (u && adHostUrl(u)) hide(e);
+    }
+    var STRONG = /(clickadu|disclosure of advertising|close ad\b|advertisement\s*$)/i;
+    function overlayCheck(n) {
+      if (!TOP || n.nodeType !== 1 || !document.body) return;
+      var cs = getComputedStyle(n);
+      if (cs.position !== 'fixed' && cs.position !== 'absolute') return;
+      var r = n.getBoundingClientRect();
+      if (r.width < innerWidth * 0.6 || r.height < innerHeight * 0.5) return;
+      if (n.querySelector('input,textarea,select,video')) return;
+      var txt = '';
+      try { txt = (n.innerText || '') + ' ' + (n.shadowRoot ? n.shadowRoot.textContent : ''); } catch (x) {}
+      txt = txt.slice(0, 1500);
+      var frames = n.querySelectorAll('iframe');
+      var adFrame = false;
+      for (var i = 0; i < frames.length; i++) { if (frames[i].src && adHostUrl(frames[i].src)) adFrame = true; }
+      if (!(STRONG.test(txt) || adFrame)) return;
+      try { n.remove(); } catch (x) { hide(n); }
+      try {
+        var b = document.body, d = document.documentElement;
+        if (b && b.style.overflow === 'hidden') b.style.removeProperty('overflow');
+        if (d && d.style.overflow === 'hidden') d.style.removeProperty('overflow');
+      } catch (x) {}
+    }
+    function sweep(n) {
+      if (n.nodeType !== 1) return;
+      var t = n.tagName;
+      if (t === 'IFRAME' || t === 'IMG' || t === 'A') checkEl(n);
+      if (n.querySelectorAll) {
+        var l = n.querySelectorAll('iframe[src],a[href],img[src]');
+        for (var i = 0; i < l.length && i < 80; i++) checkEl(l[i]);
+      }
+      if (n.parentNode === document.body || n.parentNode === document.documentElement) overlayCheck(n);
+      else if (n.firstElementChild && n.parentNode && (n.parentNode.parentNode === document.body)) overlayCheck(n);
+    }
+    function run() {
+      scheduled = false;
+      var t0 = Date.now();
+      while (queue.length && Date.now() - t0 < 8) { try { sweep(queue.shift()); } catch (e) {} }
+      if (queue.length) schedule();
+    }
+    function schedule() {
+      if (scheduled) return;
+      scheduled = true;
+      try { (window.requestAnimationFrame || window.setTimeout)(run, 50); } catch (e) { setTimeout(run, 50); }
+    }
+    function start() {
+      try {
+        var root = document.documentElement;
+        if (!root) { setTimeout(start, 20); return; }
+        new MutationObserver(function (ms) {
+          for (var i = 0; i < ms.length; i++) {
+            var a = ms[i].addedNodes;
+            for (var j = 0; j < a.length; j++) if (queue.length < 400) queue.push(a[j]);
+          }
+          schedule();
+        }).observe(root, { childList: true, subtree: true });
+      } catch (e) {}
+    }
+    start();
+  })();
+
   // ---------- 7. fetch / XHR shim for known ad hosts ----------
   (function () {
-    var hosts = null;
-    try {
-      if (window.SwiftFilter && window.SwiftFilter.getBlockedHosts) hosts = JSON.parse(window.SwiftFilter.getBlockedHosts());
-    } catch (e) {}
+    var hosts = HOSTS;
     if (!hosts) return;
     var SAFE = /(^|\.)(cloudflare\.com|hcaptcha\.com|google\.com|gstatic\.com|jsdelivr\.net)${'$'}/;
     function isAdUrl(u) {

@@ -570,8 +570,10 @@ private fun SwiftBrowserApp() {
     val appSettings = remember { AppSettings(context) }
     val uiScope = rememberCoroutineScope()
     val blocker = remember { TrackerBlocker(context) }
+    remember { FilterListManager(context) { eng -> blocker.engine = eng }.also { it.start() } }
     val navGuard = remember {
-        NavigationGuard({ System.currentTimeMillis() }, { h -> blocker.isAdHost(h) }, { u -> blocker.hasAdParams(u) })
+        NavigationGuard({ System.currentTimeMillis() }, { h -> blocker.isAdHost(h) },
+            { u, p -> blocker.hasAdParams(u) || blocker.engineBlocksNavigation(u, p) })
     }
     // Last thing the guard stopped: (tabId, url, wasPopup). Shown as an "Allow" chip.
     var blockedNav by remember { mutableStateOf<Triple<Long, String, Boolean>?>(null) }
@@ -1480,6 +1482,10 @@ private fun SwiftBrowserApp() {
                 @android.webkit.JavascriptInterface
                 fun getBlockedHosts(): String =
                     try { blocker.blockedHostsJson() } catch (e: Exception) { "{}" }
+
+                @android.webkit.JavascriptInterface
+                fun cosmeticSelectors(host: String?): String =
+                    try { blocker.cosmeticSelectors(host ?: "") } catch (e: Exception) { "" }
             }, "SwiftFilter")
             addJavascriptInterface(object {
                 @android.webkit.JavascriptInterface
@@ -1712,7 +1718,8 @@ private fun SwiftBrowserApp() {
                     // Main-frame navigations are judged by NavigationGuard (shouldOverrideUrlLoading), not here.
                     if (req.isForMainFrame) return null
 
-                    if (currentBlockingEnabled && blocker.shouldBlock(url, firstParty[tabId] ?: "", req.isForMainFrame)) {
+                    if (currentBlockingEnabled && (blocker.shouldBlock(url, firstParty[tabId] ?: "", false) ||
+                            blocker.engineBlocks(url, firstParty[tabId], req.requestHeaders?.get("Accept")))) {
                         countBlocked(tabId)
                         return blockedResponse(url)
                     }

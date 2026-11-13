@@ -5,6 +5,9 @@ import android.net.Uri
 import java.util.Locale
 
 class TrackerBlocker(context: Context) {
+    /** Filter-list engine (EasyList etc.), set by FilterListManager once lists are loaded. */
+    @Volatile var engine: FilterEngine? = null
+
     private val blockedHosts: Set<String> = context.assets.open("trackers.txt")
         .bufferedReader()
         .useLines { lines ->
@@ -116,5 +119,33 @@ class TrackerBlocker(context: Context) {
         if (!isMainFrame && alwaysBlockParts.any { lower.contains(it) }) return true
         if (firstParty || isMainFrame) return false
         return adPathParts.any { lower.contains(it) }
+    }
+
+    private fun engineWhitelisted(host: String, url: String): Boolean =
+        (host.endsWith("google.com") && url.contains("recaptcha")) || host == "challenges.cloudflare.com" ||
+            host.endsWith("hcaptcha.com") || host.endsWith("jsdelivr.net") || host.endsWith("googleapis.com") ||
+            host.endsWith("gstatic.com") ||
+            ((host.endsWith("youtube.com") || host.endsWith("googlevideo.com")) &&
+                (url.contains("/youtubei/v1/player") || url.contains("/youtubei/v1/next")))
+
+    /** Sub-resource check against the downloaded filter lists. */
+    fun engineBlocks(url: String, pageUrl: String?, accept: String?): Boolean {
+        val e = engine ?: return false
+        val host = hostOf(url) ?: return false
+        if (engineWhitelisted(host, url)) return false
+        return e.blocks(url, pageUrl, FilterEngine.inferType(url, accept, false))
+    }
+
+    /** Navigation / popup destination check against popup rules and plain ad-host rules. */
+    fun engineBlocksNavigation(url: String, pageUrl: String?): Boolean {
+        val e = engine ?: return false
+        val host = hostOf(url) ?: return false
+        if (engineWhitelisted(host, url)) return false
+        return e.blocksNavigation(url, pageUrl)
+    }
+
+    fun cosmeticSelectors(host: String): String {
+        val e = engine ?: return ""
+        return e.cosmeticFor(host).joinToString("\n")
     }
 }

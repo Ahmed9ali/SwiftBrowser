@@ -14,7 +14,7 @@ import java.util.Locale
 class NavigationGuard(
     private val now: () -> Long,
     private val isAdHost: (String) -> Boolean,
-    private val hasAdParams: (String) -> Boolean
+    private val hasAdParams: (String, String?) -> Boolean
 ) {
     enum class Kind { ALLOW, BLOCK }
     data class Verdict(val kind: Kind, val reason: String) {
@@ -87,7 +87,7 @@ class NavigationGuard(
         val pageHost = pageUrl?.let { host(it) }
         if (pageHost != null && sameSite(h, pageHost)) return Verdict(Kind.ALLOW, "same site")
 
-        val adLike = isAdHost(h) || hasAdParams(url)
+        val adLike = isAdHost(h) || hasAdParams(url, pageUrl)
         val tapFresh = t0 - t.tapAt in 0..TAP_WINDOW_MS
         val tapMatches = tapFresh && t.tapHref != null && sameDestination(t.tapHref!!, url)
 
@@ -150,7 +150,7 @@ class NavigationGuard(
         if (t.tapHref != null && tapFresh && sameDestination(t.tapHref!!, url)) {
             return Verdict(Kind.ALLOW, "popup from tapped link")
         }
-        if (isAdHost(h) || hasAdParams(url)) return Verdict(Kind.BLOCK, "ad popup")
+        if (isAdHost(h) || hasAdParams(url, pageUrl)) return Verdict(Kind.BLOCK, "ad popup")
         if (isVisited(h)) return Verdict(Kind.ALLOW, "popup to visited site")
         return Verdict(Kind.BLOCK, "popup to unknown site")
     }
@@ -209,5 +209,3 @@ class NavigationGuard(
         fun sameSite(a: String, b: String) = registrable(a) == registrable(b)
     }
 }
-
-
