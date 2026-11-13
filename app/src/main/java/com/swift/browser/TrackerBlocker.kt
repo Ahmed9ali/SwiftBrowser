@@ -57,6 +57,11 @@ class TrackerBlocker(context: Context) {
         }
     }
 
+    fun hasAdParams(url: String): Boolean {
+        val lower = url.lowercase(Locale.ROOT)
+        return redirectParts.any { lower.contains(it) }
+    }
+
     fun blockedHostsJson(): String {
         val obj = org.json.JSONObject()
         blockedHosts.forEach { obj.put(it, true) }

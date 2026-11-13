@@ -570,6 +570,13 @@ private fun SwiftBrowserApp() {
     val appSettings = remember { AppSettings(context) }
     val uiScope = rememberCoroutineScope()
     val blocker = remember { TrackerBlocker(context) }
+    val navGuard = remember {
+        NavigationGuard({ System.currentTimeMillis() }, { h -> blocker.isAdHost(h) }, { u -> blocker.hasAdParams(u) })
+    }
+    // Last thing the guard stopped: (tabId, url, wasPopup). Shown as an "Allow" chip.
+    var blockedNav by remember { mutableStateOf<Triple<Long, String, Boolean>?>(null) }
+    val adoptedViews = remember { HashMap<Long, WebView>() }
+    val popupTabs = remember { HashSet<Long>() }
     val session = remember { loadSession(context) }
     val startTab = session?.let { sess -> sess.tabs.firstOrNull { it.id == sess.activeId } }
     val idCounter = remember { AtomicLong(session?.nextId ?: 2L) }
@@ -1426,13 +1433,13 @@ private fun SwiftBrowserApp() {
     }
 
     fun createWebView(ctx: Context, tabId: Long): WebView {
-        return WebView(ctx).apply {
+        return (adoptedViews.remove(tabId) ?: WebView(ctx)).apply {
             setBackgroundColor(android.graphics.Color.rgb(16, 17, 20))
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.loadsImagesAutomatically = true
-            settings.javaScriptCanOpenWindowsAutomatically = false
-            settings.setSupportMultipleWindows(false)
+            settings.javaScriptCanOpenWindowsAutomatically = true
+            settings.setSupportMultipleWindows(true)
             settings.userAgentString = android.webkit.WebSettings.getDefaultUserAgent(ctx)
             if (desktopSites[tabId] == true) {
                 settings.userAgentString = desktopUserAgent(ctx)
@@ -1474,6 +1481,10 @@ private fun SwiftBrowserApp() {
                 fun getBlockedHosts(): String =
                     try { blocker.blockedHostsJson() } catch (e: Exception) { "{}" }
             }, "SwiftFilter")
+            addJavascriptInterface(object {
+                @android.webkit.JavascriptInterface
+                fun tap(href: String?) { navGuard.recordTap(tabId, href) }
+            }, "SwiftNav")
 
             appSettings.applyTo(this)
             if (tabs.firstOrNull { it.id == tabId }?.isPrivate == true) {
@@ -1523,6 +1534,70 @@ private fun SwiftBrowserApp() {
             }
 
             webChromeClient = object : WebChromeClient() {
+                override fun onCreateWindow(
+                    view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?
+                ): Boolean {
+                    val msg = resultMsg ?: return false
+                    val transport = msg.obj as? WebView.WebViewTransport ?: return false
+                    val sourceUrl = view?.url ?: firstParty[tabId]
+                    if (currentBlockingEnabled &&
+                        !navGuard.decidePopup(tabId, null, sourceUrl, isUserGesture).allowed) {
+                        countBlocked(tabId)
+                        return false
+                    }
+                    // Throwaway view: we only learn the destination after it starts loading.
+                    val child = WebView(ctx)
+                    child.settings.javaScriptEnabled = true
+                    child.settings.domStorageEnabled = true
+                    val sourcePrivate = tabs.firstOrNull { it.id == tabId }?.isPrivate == true
+                    var decided = false
+                    var decidedAllowed = true
+                    fun decide(url: String?): Boolean {
+                        if (decided) return decidedAllowed
+                        if (url.isNullOrBlank() || url.startsWith("about:")) return true
+                        decided = true
+                        val v = if (currentBlockingEnabled) navGuard.decidePopup(tabId, url, sourceUrl, true) else null
+                        decidedAllowed = v == null || v.allowed
+                        Handler(Looper.getMainLooper()).post {
+                            if (decidedAllowed) {
+                                newTab(sourcePrivate)
+                                val nid = activeId
+                                adoptedViews[nid] = child
+                                popupTabs.add(nid)
+                                updateTabById(nid, url = url)
+                                pageUrl = url
+                                address = url
+                            } else {
+                                android.util.Log.d("SwiftNav", "popup blocked $url : ${v?.reason}")
+                                countBlocked(tabId)
+                                if (tabId == activeId) blockedNav = Triple(tabId, url, true)
+                                child.stopLoading()
+                                child.destroy()
+                            }
+                        }
+                        return decidedAllowed
+                    }
+                    child.webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?): Boolean =
+                            !decide(r?.url?.toString())
+                        override fun shouldInterceptRequest(v: WebView?, r: WebResourceRequest?): WebResourceResponse? {
+                            if (r?.isForMainFrame == true && !decide(r.url.toString())) return blockedResponse(r.url.toString())
+                            return null
+                        }
+                        override fun onPageStarted(v: WebView?, url: String?, f: android.graphics.Bitmap?) { decide(url) }
+                    }
+                    transport.webView = child
+                    msg.sendToTarget()
+                    return true
+                }
+
+                override fun onCloseWindow(window: WebView?) {
+                    if (tabId in popupTabs) Handler(Looper.getMainLooper()).post {
+                        popupTabs.remove(tabId)
+                        tabs.firstOrNull { it.id == tabId }?.let { closeTab(it, false) }
+                    }
+                }
+
                 override fun onShowCustomView(view: android.view.View?, callback: WebChromeClient.CustomViewCallback?) {
                     val act = ctx as? android.app.Activity ?: (context as? android.app.Activity)
                     if (view == null || act == null) { callback?.onCustomViewHidden(); return }
@@ -1584,9 +1659,19 @@ private fun SwiftBrowserApp() {
                     val uri = request?.url ?: return false
                     
                     if (currentBlockingEnabled && request.isForMainFrame &&
-                        (blocker.isAdHost(uri.host) || blocker.isSpamRedirect(uri.toString(), firstParty[tabId], request.hasGesture()))) {
-                        countBlocked(tabId)
-                        return true
+                        (uri.scheme == "http" || uri.scheme == "https")) {
+                        val v = navGuard.decideNavigation(
+                            tabId, uri.toString(), view?.url ?: firstParty[tabId],
+                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && request.isRedirect
+                        )
+                        if (!v.allowed) {
+                            android.util.Log.d("SwiftNav", "blocked ${uri} : ${v.reason}")
+                            countBlocked(tabId)
+                            Handler(Looper.getMainLooper()).post {
+                                if (tabId == activeId) blockedNav = Triple(tabId, uri.toString(), false)
+                            }
+                            return true
+                        }
                     }
                     if (uri.scheme == "http" && request.isForMainFrame && view != null) {
                         val up = httpsFirst(uri.toString())
@@ -1624,7 +1709,8 @@ private fun SwiftBrowserApp() {
                         (h == "www.gstatic.com" && url.contains("/translate/"))
                     ) return null
 
-                    if (req.isForMainFrame) firstParty[tabId] = url
+                    // Main-frame navigations are judged by NavigationGuard (shouldOverrideUrlLoading), not here.
+                    if (req.isForMainFrame) return null
 
                     if (currentBlockingEnabled && blocker.shouldBlock(url, firstParty[tabId] ?: "", req.isForMainFrame)) {
                         countBlocked(tabId)
@@ -1674,15 +1760,9 @@ private fun SwiftBrowserApp() {
                     url: String?,
                     favicon: android.graphics.Bitmap?
                 ) {
-                    // Fix stuck blank pages: If the URL is about:blank or empty, go back
-                    if (url == "about:blank" || url.isNullOrEmpty()) {
-                        if (view != null && view.canGoBack()) {
-                            view.goBack()
-                            return
-                        }
-                    }
                     if (url == null || url.startsWith("about:")) return
-                    if (currentBlockingEnabled) view?.evaluateJavascript(SHIELDS_JS, null)
+                    if (currentBlockingEnabled && !shieldsAtStart) view?.evaluateJavascript(SHIELDS_JS, null)
+                    navGuard.onCommit(tabId, url)
                     if (translateOffer?.first == tabId) translateOffer = null
                     if (translateDone?.first == tabId) translateDone = null
                     if (translateBusy?.first == tabId) translateBusy = null
@@ -2251,6 +2331,41 @@ private fun SwiftBrowserApp() {
                                 modifier = Modifier.fillMaxSize().graphicsLayer { translationX = p * size.width }
                             )
                         }
+                    }
+                }
+
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = blockedNav != null && blockedNav?.first == activeId && !showTabs && !showSuggestions,
+                    enter = fadeIn(tween(150)),
+                    exit = fadeOut(tween(120)),
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 90.dp)
+                ) {
+                    val bn = blockedNav
+                    LaunchedEffect(bn) { if (bn != null) { delay(6000); if (blockedNav == bn) blockedNav = null } }
+                    Row(
+                        Modifier.clip(RoundedCornerShape(22.dp)).background(Color(0xE61E2024))
+                            .padding(start = 16.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        androidx.compose.material3.Text(
+                            if (bn?.third == true) "Popup blocked" else "Redirect blocked",
+                            color = Color.White, fontSize = 13.sp
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        androidx.compose.material3.Text(
+                            "Allow",
+                            color = Color(0xFF8AB4F8), fontSize = 13.sp,
+                            modifier = Modifier.clip(RoundedCornerShape(16.dp))
+                                .clickable {
+                                    val b = blockedNav
+                                    blockedNav = null
+                                    if (b != null) {
+                                        navGuard.allowOnce(b.first, b.second)
+                                        if (b.third) openUrlInNewTab(b.second) else activeWebView()?.loadUrl(b.second)
+                                    }
+                                }
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
                     }
                 }
 

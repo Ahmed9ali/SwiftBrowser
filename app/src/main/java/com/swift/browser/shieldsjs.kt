@@ -1,121 +1,129 @@
 package com.swift.browser
 
+// Page-side shields. Kept deliberately light: one stylesheet for cosmetic hiding (no DOM rescans),
+// tap reporting for the navigation guard, popup/dialog/history abuse limits, and the fetch/XHR shim.
+// NOTE: Kotlin raw string — never write a bare dollar sign in here, use ${'$'}.
 const val SHIELDS_JS = """
 (function () {
   if (window.__swiftShields) return;
   window.__swiftShields = true;
   var H = (location.hostname || '').toLowerCase();
   var IS_YT = /(^|\.)youtube(-nocookie)?\.com${'$'}/.test(H);
+  var NAV = window.SwiftNav;
 
-  // ---------- 1. pop-up / pop-under guard ----------
-  var lastGesture = 0, lastTarget = null;
-  function note(e) { lastGesture = Date.now(); lastTarget = e.target; }
-  ['pointerdown', 'mousedown', 'touchstart', 'click', 'keydown'].forEach(function (t) {
-    try { window.addEventListener(t, note, true); } catch (e) {}
-  });
-  function onRealControl() {
-    var el = lastTarget;
+  // ---------- 1. tap reporter (feeds the native navigation guard) ----------
+  var lastTrusted = 0;
+  function anchorOf(el) {
     while (el && el.nodeType === 1) {
-      var tn = el.tagName, role = el.getAttribute && el.getAttribute('role');
-      if (tn === 'A' || tn === 'BUTTON' || tn === 'INPUT' || tn === 'SUMMARY' || tn === 'LABEL' ||
-          role === 'button' || role === 'link') return true;
+      if (el.tagName === 'A' && el.href) return el;
       el = el.parentElement;
     }
-    return false;
+    return null;
   }
-  var AD_URL = /(popunder|popads|propeller|exoclick|adsterra|clickadu|hilltopads|onclickalgo|trafficjunky|juicyads|adcash|popcash|monetag|realsrv|mondiad|richads|\/pop\.js|clickunder|adsco\.re|go\.oclasrv|nudus|luckyday|brolackview|skillify|vpn-trusthub)/i;
+  function reportTap(e) {
+    if (!e.isTrusted) return;
+    lastTrusted = Date.now();
+    var href = '';
+    try {
+      var a = anchorOf(e.target);
+      if (a) {
+        var h = String(a.href);
+        if (/^https?:/i.test(h) && h.split('#')[0] !== location.href.split('#')[0]) href = h;
+      }
+      if (NAV && NAV.tap) NAV.tap(href);
+    } catch (err) {}
+  }
+  ['pointerdown', 'touchstart', 'click'].forEach(function (t) {
+    try { window.addEventListener(t, reportTap, true); } catch (e) {}
+  });
+
+  // ---------- 2. invisible click-catcher overlays ----------
+  // A transparent layer covering most of the screen that exists only to steal the first tap.
+  function looksLikeCatcher(el) {
+    if (!el || el === document.body || el === document.documentElement) return false;
+    var cs = getComputedStyle(el);
+    if (cs.position !== 'fixed' && cs.position !== 'absolute') return false;
+    var r = el.getBoundingClientRect();
+    if (r.width < innerWidth * 0.7 || r.height < innerHeight * 0.7) return false;
+    if (el.querySelector('video,canvas,img,input,textarea,select,button')) return false;
+    var invisible = parseFloat(cs.opacity) < 0.1 ||
+      ((cs.backgroundColor === 'rgba(0, 0, 0, 0)' || cs.backgroundColor === 'transparent') &&
+       cs.backgroundImage === 'none' && (el.textContent || '').trim() === '');
+    return invisible;
+  }
+  function killCatcher(e) {
+    if (!e.isTrusted) return;
+    try {
+      var x, y;
+      if (e.touches && e.touches[0]) { x = e.touches[0].clientX; y = e.touches[0].clientY; }
+      else { x = e.clientX; y = e.clientY; }
+      var el = document.elementFromPoint(x, y);
+      if (looksLikeCatcher(el)) {
+        e.preventDefault(); e.stopPropagation();
+        el.style.setProperty('display', 'none', 'important');
+      }
+    } catch (err) {}
+  }
+  try { window.addEventListener('touchstart', killCatcher, { capture: true, passive: false }); } catch (e) {}
+
+  // ---------- 3. popup / dialog / history abuse limits ----------
   function stubWindow() {
     return { closed: false, focus: function () {}, blur: function () {}, close: function () {},
       postMessage: function () {}, location: { href: '' }, document: { write: function () {}, close: function () {} } };
   }
   try {
     var realOpen = window.open;
-    window.open = function (u) {
-      var fresh = Date.now() - lastGesture < 1200;
-      if (!fresh || !onRealControl() || (u && AD_URL.test(String(u)))) return stubWindow();
+    window.open = function () {
+      if (Date.now() - lastTrusted > 1500) return stubWindow();
       return realOpen.apply(window, arguments);
     };
   } catch (e) {}
-  
-  // ---------- 2. Aggressive Ad Click Blocker ----------
-  // Stops clicks on images or links that point to known ad hosts
-  document.addEventListener('click', function(e) {
-      var el = e.target;
-      while (el) {
-          if (el.tagName === 'A' && el.href) {
-              if (AD_URL.test(el.href)) {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  return false;
-              }
-          }
-          // Check if the image source contains ad keywords
-          if (el.tagName === 'IMG' && el.src) {
-              if (AD_URL.test(el.src)) {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  return false;
-              }
-          }
-          el = el.parentElement;
-      }
-  }, true);
 
-  // ---------- 3. Anti-Adblock Bypass ----------
-  (function() {
-    if (!window.adsbygoogle) window.adsbygoogle = { push: function(){}, loaded: true };
-    if (!window.canRunAds) window.canRunAds = true;
-    if (!window.adBlockDetected) window.adBlockDetected = false;
-    
-    // Watch for the anti-adblock modal and kill it
-    var observer = new MutationObserver(function(mutations) {
-      mutations.forEach(function(m) {
-        m.addedNodes.forEach(function(node) {
-          if (node.nodeType === 1) { // Element
-            var text = node.innerText || "";
-            if (text.includes("ADBLOCK") || text.includes("AdBlocker") || text.includes("VPN Required")) {
-              node.style.display = 'none';
-              node.remove();
-            }
-          }
-        });
-      });
+  ['alert', 'confirm', 'prompt'].forEach(function (n) {
+    try {
+      var real = window[n], count = 0;
+      window[n] = function () {
+        var fresh = Date.now() - lastTrusted < 1500;
+        if (!fresh && ++count > 1) return n === 'confirm' ? false : (n === 'prompt' ? null : undefined);
+        return real.apply(window, arguments);
+      };
+    } catch (e) {}
+  });
+
+  try {
+    var winStart = Date.now(), calls = 0;
+    ['pushState', 'replaceState'].forEach(function (n) {
+      var real = history[n];
+      history[n] = function () {
+        if (Date.now() - winStart > 10000) { winStart = Date.now(); calls = 0; }
+        if (++calls > 20) return;
+        return real.apply(this, arguments);
+      };
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-  })();
+  } catch (e) {}
 
-  // ---------- 4. cosmetic filters ----------
+  // ---------- 4. anti-adblock stubs ----------
+  try {
+    if (!window.adsbygoogle) window.adsbygoogle = { push: function () {}, loaded: true };
+    if (!window.canRunAds) window.canRunAds = true;
+  } catch (e) {}
+
+  // ---------- 5. cosmetic filters: ONE stylesheet, no rescans ----------
   var COSMETIC = [
     'ins.adsbygoogle', '.adsbygoogle', '.google-ad', '.google-ads', '.google-ad-slot',
-    '[id^="google_ads_"]', '[id^="div-gpt-ad"]', '[id^="aswift_"]',
+    '[id^="google_ads_"]', '[id^="div-gpt-ad"]', '[id^="aswift_"]', 'iframe[id^="google_ads_iframe"]',
     'iframe[src*="googlesyndication.com"]', 'iframe[src*="doubleclick.net"]',
-    'iframe[id^="google_ads_iframe"]',
     'iframe[src*="adsterra"]', 'iframe[src*="exoclick"]', 'iframe[src*="propellerads"]',
+    'iframe[src*="a-ads.com"]', 'iframe[src*="coinzilla"]', 'iframe[src*="mgid.com"]', 'iframe[src*="popads"]',
     'iframe[src*="nudus"]', 'iframe[src*="luckyday"]',
-    '.ad-slot', '.ad-container', '.ad-banner', '.ad-wrapper', '.ad-unit',
-    '.adbox', '.adsbox', '.ads-container', '.advertisement', '.advert-banner',
-    '#ad-container', '#ad_banner', '#ad-banner', '#adbox', '.popup-ad',
-    '[data-ad-slot]', '[data-google-query-id]', 'amp-ad',
-    '.taboola', '[id^="taboola-"]', '.OUTBRAIN',
-    '[class*="sponsored-content"]', '.sponsored-post',
-    '[id^="mgid_"]', '[class^="mgbox"]',
-    '.google-auto-placed', 'ins[data-ad-client]', '.adsbygoogle-noablate',
-    '.ad-placement', '.ads-banner', '.banner-ad', '.sticky-ad', '#sticky-ad',
-    '.adcontainer', '[data-testid="ad"]', '.mgid', '.tbl-feed-container', '.rc-widget',
-    'iframe[src*="a-ads.com"]', 'iframe[src*="coinzilla"]',
-    'iframe[src*="mgid.com"]', 'iframe[src*="popads"]',
-    '[id^="bsa-zone"]', '#carbonads', '.carbon-wrap',
-    '[id^="ad-slot-"]', '[id*="-ad-slot"]', '[id*="-ad-container"]',
-    'div[class^="ad-"]', 'div[class^="ads-"]', 'div[id^="ad-"]',
-    '.ad-placeholder', '.ad-label', '.ads-label', '.ad-overlay',
-    // Specific native banners (NUDUS, etc.)
-    'a[href*="skillify"]', 'img[src*="nudus"]', 'a[href*="nudus"]', 'img[src*="banner"]',
-    'img[src*="brolackview"]', 'a[href*="brolackview"]',
-    // Anti-Adblock Modals
-    '[class*="adblock"]', '[id*="adblock"]', '.adblock-modal', '#adblock-modal',
-    '[class*="ad-block"]', '[id*="ad-block"]', '.anti-adblock', '#anti-adblock',
-    // VPN Prompt
-    '[class*="vpn"]', '[id*="vpn"]', '.vpn-popup', '#vpn-popup'
+    '.ad-slot', '.ad-container', '.ad-banner', '.ad-wrapper', '.ad-unit', '.adbox', '.adsbox',
+    '.ads-container', '.advertisement', '.advert-banner', '#ad-container', '#ad_banner', '#ad-banner',
+    '#adbox', '.popup-ad', '.banner-ad', '.sticky-ad', '#sticky-ad', '.ad-placement', '.ads-banner',
+    '[data-ad-slot]', '[data-google-query-id]', 'amp-ad', 'ins[data-ad-client]', '.google-auto-placed',
+    '.adsbygoogle-noablate', '.taboola', '[id^="taboola-"]', '.OUTBRAIN', '.sponsored-post',
+    '[id^="mgid_"]', '[class^="mgbox"]', '[id^="bsa-zone"]', '#carbonads', '.carbon-wrap',
+    '.anti-adblock', '#anti-adblock', '.adblock-modal', '#adblock-modal',
+    'a[href*="skillify"]', 'a[href*="nudus"]', 'img[src*="nudus"]', 'a[href*="brolackview"]', 'img[src*="brolackview"]'
   ];
   if (IS_YT) {
     COSMETIC = COSMETIC.concat([
@@ -129,108 +137,63 @@ const val SHIELDS_JS = """
       'ytm-mealbar-promo-renderer', 'ytm-paid-content-overlay-renderer', 'ad-slot-renderer'
     ]);
   }
-  var COSMETIC_ATTR = 'data-swift-cosmetic';
-
-  function addStyle() {
+  var styleEl = null;
+  function installStyle() {
     try {
-      var old = document.querySelectorAll('style[' + COSMETIC_ATTR + ']');
-      for (var k = 0; k < old.length; k++) { if (old[k].parentNode) old[k].parentNode.removeChild(old[k]); }
-      var cssText = '';
-      for (var i = 0; i < COSMETIC.length; i++) {
-        cssText += COSMETIC[i] + '{display:none !important; visibility:hidden !important;}\n';
-      }
-      var st = document.createElement('style');
-      st.setAttribute(COSMETIC_ATTR, '1');
-      st.textContent = cssText;
-      (document.head || document.documentElement).appendChild(st);
+      if (styleEl && styleEl.isConnected) return;
+      var parent = document.head || document.documentElement;
+      if (!parent) return;
+      styleEl = document.createElement('style');
+      styleEl.setAttribute('data-swift-cosmetic', '1');
+      styleEl.textContent = COSMETIC.join(',\n') + '{display:none !important;}';
+      parent.appendChild(styleEl);
+    } catch (e) {}
+  }
+  installStyle();
+  try { document.addEventListener('readystatechange', installStyle); } catch (e) {}
+  try { document.addEventListener('DOMContentLoaded', installStyle); } catch (e) {}
+  // Re-check occasionally in case a page wipes <head>; a single boolean read, no DOM scan.
+  try { setInterval(installStyle, 2000); } catch (e) {}
+
+  // ---------- 6. YouTube ad data ----------
+  if (IS_YT && location.pathname.indexOf('/shorts/') === -1) {
+    var KEYS = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
+    var strip = function (o) {
+      if (!o || typeof o !== 'object') return o;
+      try {
+        for (var i = 0; i < KEYS.length; i++) if (KEYS[i] in o) delete o[KEYS[i]];
+        if (o.playerResponse) strip(o.playerResponse);
+        if (o.response && o.response.playerResponse) strip(o.response.playerResponse);
+      } catch (e) {}
+      return o;
+    };
+    try {
+      var jp = JSON.parse;
+      JSON.parse = function () {
+        var r = jp.apply(this, arguments);
+        if (r && typeof r === 'object' && (r.adPlacements || r.playerAds || r.playerResponse)) strip(r);
+        return r;
+      };
+    } catch (e) {}
+    try {
+      var rj = Response.prototype.json;
+      Response.prototype.json = function () { return rj.apply(this, arguments).then(strip); };
     } catch (e) {}
   }
 
-  function hideEl(el) {
-    try { el.style.setProperty('display', 'none', 'important'); } catch (e) {}
-  }
-
-  function enforce() {
-    for (var i = 0; i < COSMETIC.length; i++) {
-      var list;
-      try { list = document.querySelectorAll(COSMETIC[i]); } catch (e) { continue; }
-      for (var j = 0; j < list.length; j++) hideEl(list[j]);
-    }
-  }
-
-  function applyCosmetic() { addStyle(); enforce(); }
-
-  if (document.documentElement) applyCosmetic();
-  try { document.addEventListener('DOMContentLoaded', applyCosmetic); } catch (e) {}
-  try { window.addEventListener('load', applyCosmetic); } catch (e) {}
-
-  try {
-    var pending = false;
-    var mo = new MutationObserver(function () {
-      if (pending) return;
-      pending = true;
-      var run = function () {
-        pending = false;
-        try { if (!document.querySelector('style[' + COSMETIC_ATTR + ']')) addStyle(); } catch (e) {}
-        enforce();
-      };
-      try { (window.requestAnimationFrame || window.setTimeout)(run, 16); }
-      catch (e) { run(); }
-    });
-    mo.observe(document.documentElement || document, { childList: true, subtree: true });
-  } catch (e) {}
-
-  // ---------- 5. YouTube ----------
-  if (IS_YT) {
-    if (location.pathname.indexOf('/shorts/') === -1) {
-      var KEYS = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
-      function strip(o) {
-        if (!o || typeof o !== 'object') return o;
-        try {
-          for (var i = 0; i < KEYS.length; i++) if (KEYS[i] in o) delete o[KEYS[i]];
-          if (o.playerResponse) strip(o.playerResponse);
-          if (o.response && o.response.playerResponse) strip(o.response.playerResponse);
-        } catch (e) {}
-        return o;
-      }
-      try {
-        var jp = JSON.parse;
-        JSON.parse = function () {
-          var r = jp.apply(this, arguments);
-          if (r && typeof r === 'object' && (r.adPlacements || r.playerAds || r.playerResponse || r.streamingData)) strip(r);
-          return r;
-        };
-      } catch (e) {}
-      try {
-        var rj = Response.prototype.json;
-        Response.prototype.json = function () { return rj.apply(this, arguments).then(strip); };
-      } catch (e) {}
-    }
-  }
-
-  // ---------- 6. fetch / XHR shim (Optimized for speed) ----------
+  // ---------- 7. fetch / XHR shim for known ad hosts ----------
   (function () {
     var hosts = null;
     try {
-      if (window.SwiftFilter && window.SwiftFilter.getBlockedHosts) {
-        hosts = JSON.parse(window.SwiftFilter.getBlockedHosts());
-      }
+      if (window.SwiftFilter && window.SwiftFilter.getBlockedHosts) hosts = JSON.parse(window.SwiftFilter.getBlockedHosts());
     } catch (e) {}
     if (!hosts) return;
-
+    var SAFE = /(^|\.)(cloudflare\.com|hcaptcha\.com|google\.com|gstatic\.com|jsdelivr\.net)${'$'}/;
     function isAdUrl(u) {
-      if (u === undefined || u === null) return false;
       try {
         var s = String(u);
-        if (s.indexOf(':') === 0 || s.indexOf('//') === 0) return false;
-        
-        var host = '';
-        try { host = new URL(s, location.href).hostname.toLowerCase(); } catch (e) { return false; }
-        if (!host) return false;
-        
-        if (host.endsWith('cloudflare.com') || host.endsWith('hcaptcha.com') || 
-            host.endsWith('google.com') || host.endsWith('gstatic.com') || host.endsWith('jsdelivr.net')) return false;
-        
+        var host = new URL(s, location.href).hostname.toLowerCase();
+        if (!host || SAFE.test(host)) return false;
         var h = host;
         while (h) {
           if (hosts[h]) return true;
@@ -241,7 +204,6 @@ const val SHIELDS_JS = """
       } catch (e) {}
       return false;
     }
-
     try {
       var realFetch = window.fetch;
       window.fetch = function (input) {
@@ -250,30 +212,28 @@ const val SHIELDS_JS = """
         return realFetch.apply(this, arguments);
       };
     } catch (e) {}
-
     try {
       var XHR = window.XMLHttpRequest;
-      var realOpen = XHR.prototype.open;
-      var realSend = XHR.prototype.send;
-      XHR.prototype.open = function (method, url) {
-        try { this.__swiftBlocked = isAdUrl(String(url)); } catch (e) { this.__swiftBlocked = false; }
-        return realOpen.apply(this, arguments);
+      var xOpen = XHR.prototype.open, xSend = XHR.prototype.send;
+      XHR.prototype.open = function (m, url) {
+        try { this.__swiftBlocked = isAdUrl(url); } catch (e) { this.__swiftBlocked = false; }
+        return xOpen.apply(this, arguments);
       };
       XHR.prototype.send = function () {
         if (this.__swiftBlocked) {
-          var xhr = this;
+          var x = this;
           setTimeout(function () {
             try {
-              Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
-              Object.defineProperty(xhr, 'status', { value: 0, configurable: true });
-              Object.defineProperty(xhr, 'statusText', { value: '', configurable: true });
-              if (typeof xhr.onerror === 'function') xhr.onerror(new Event('error'));
-              if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange(new Event('readystatechange'));
+              Object.defineProperty(x, 'readyState', { value: 4, configurable: true });
+              Object.defineProperty(x, 'status', { value: 0, configurable: true });
+              x.dispatchEvent(new Event('readystatechange'));
+              x.dispatchEvent(new ProgressEvent('error'));
+              x.dispatchEvent(new ProgressEvent('loadend'));
             } catch (e) {}
           }, 0);
           return;
         }
-        return realSend.apply(this, arguments);
+        return xSend.apply(this, arguments);
       };
     } catch (e) {}
   })();
