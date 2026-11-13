@@ -209,3 +209,5 @@ class NavigationGuard(
         fun sameSite(a: String, b: String) = registrable(a) == registrable(b)
     }
 }
+
+
