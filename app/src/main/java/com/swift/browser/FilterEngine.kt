@@ -13,7 +13,7 @@ import java.util.Locale
 class FilterEngine private constructor(
     private val block: Index,
     private val allow: Index,
-    private val genericCss: List<CosmeticRule>,
+    genericCss: List<CosmeticRule>,
     private val specificCss: Map<String, List<CosmeticRule>>,
     private val cssExceptions: Map<String, List<String>>, // selector -> domains (empty list = everywhere)
     private val documentOff: Set<String>,
@@ -22,7 +22,58 @@ class FilterEngine private constructor(
     val networkRuleCount: Int,
     val cosmeticRuleCount: Int
 ) {
+    // Generic hide rules are indexed by their leading .class / #id so a page only receives the ones it can match.
+    private val genericByKey = HashMap<String, ArrayList<CosmeticRule>>()
+    private val genericAlways = ArrayList<CosmeticRule>()
+    private val genericAll = genericCss
+
+    init {
+        for (r in genericCss) {
+            val key = keyOf(r.selector)
+            if (key == null) genericAlways.add(r) else genericByKey.getOrPut(key) { ArrayList(1) }.add(r)
+        }
+    }
+
     // ---- public API -----------------------------------------------------------------------
+
+    /** Rules needed at document start: site-specific ones plus the few generic ones that cannot be indexed. */
+    fun cosmeticStartup(host: String): List<String> {
+        val h = host.lowercase(Locale.ROOT)
+        if (hostInSet(h, documentOff) || hostInSet(h, elemhideOff)) return emptyList()
+        val out = LinkedHashSet<String>()
+        collectSpecific(h, out)
+        if (!hostInSet(h, genericHideOff)) {
+            var n = 0
+            for (r in genericAlways) {
+                if (n >= MAX_ALWAYS) break
+                if (r.excluded(h) || excepted(r.selector, h)) continue
+                out.add(r.selector); n++
+            }
+        }
+        return out.toList()
+    }
+
+    /** Generic rules for the classes / ids ([tokens] look like ".foo" or "#bar") that exist on the page. */
+    fun cosmeticForTokens(host: String, tokens: List<String>): List<String> {
+        val h = host.lowercase(Locale.ROOT)
+        if (hostInSet(h, documentOff) || hostInSet(h, elemhideOff) || hostInSet(h, genericHideOff)) return emptyList()
+        val out = LinkedHashSet<String>()
+        for (t in tokens) {
+            genericByKey[t]?.forEach { r -> if (!r.excluded(h) && !excepted(r.selector, h)) out.add(r.selector) }
+        }
+        return out.toList()
+    }
+
+    private fun collectSpecific(h: String, out: MutableSet<String>) {
+        var d: String? = h
+        while (d != null) {
+            specificCss[d]?.forEach { r ->
+                if (!r.excluded(h) && !excepted(r.selector, h)) out.add(r.selector)
+            }
+            val dot = d.indexOf('.')
+            d = if (dot < 0) null else d.substring(dot + 1)
+        }
+    }
 
     /** Should this sub-resource request be blocked? [typeMask] is a combination of T_* flags. */
     fun blocks(url: String, pageUrl: String?, typeMask: Int): Boolean {
@@ -43,7 +94,7 @@ class FilterEngine private constructor(
         if (hostInSet(h, documentOff) || hostInSet(h, elemhideOff)) return emptyList()
         val out = LinkedHashSet<String>()
         if (!hostInSet(h, genericHideOff)) {
-            for (r in genericCss) {
+            for (r in genericAll) {
                 if (r.excluded(h)) continue
                 if (excepted(r.selector, h)) continue
                 out.add(r.selector)
@@ -69,6 +120,16 @@ class FilterEngine private constructor(
     // ---- types ----------------------------------------------------------------------------
 
     companion object {
+        const val MAX_ALWAYS = 1500
+        private val KEY_RE = Regex("^([.#])([A-Za-z0-9_-]+)")
+
+        /** '.foo ...' -> '.foo' ; null when the selector has a top-level comma or does not start with a class/id. */
+        fun keyOf(sel: String): String? {
+            if (sel.contains(',')) return null
+            val m = KEY_RE.find(sel) ?: return null
+            return m.value
+        }
+
         const val T_SCRIPT = 1
         const val T_IMAGE = 2
         const val T_CSS = 4

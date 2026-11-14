@@ -12,7 +12,9 @@ const val SHIELDS_JS = """
   var NAV = window.SwiftNav;
   var TOP = (window === window.top);
   var HOSTS = null;
-  try { if (window.SwiftFilter && window.SwiftFilter.getBlockedHosts) HOSTS = JSON.parse(window.SwiftFilter.getBlockedHosts()); } catch (e) {}
+  var EXEMPT = false;
+  try { EXEMPT = !!(window.SwiftFilter && window.SwiftFilter.exempt && window.SwiftFilter.exempt(H)); } catch (e) {}
+  try { if (!EXEMPT && window.SwiftFilter && window.SwiftFilter.getBlockedHosts) HOSTS = JSON.parse(window.SwiftFilter.getBlockedHosts()); } catch (e) {}
   function adHostUrl(u) {
     if (!HOSTS) return false;
     try {
@@ -153,9 +155,11 @@ const val SHIELDS_JS = """
       'ytm-mealbar-promo-renderer', 'ytm-paid-content-overlay-renderer', 'ad-slot-renderer'
     ]);
   }
+  if (EXEMPT) COSMETIC = [];
   var styleEl = null;
   function installStyle() {
     try {
+      if (!COSMETIC.length) return;
       if (styleEl && styleEl.isConnected) return;
       var parent = document.head || document.documentElement;
       if (!parent) return;
@@ -167,28 +171,99 @@ const val SHIELDS_JS = """
   }
   // Selectors from the downloaded filter lists (per-site), applied rule by rule so one bad selector cannot void the rest.
   var nativeSheet = null, nativeSels = '';
-  try { if (TOP && window.SwiftFilter && window.SwiftFilter.cosmeticSelectors) nativeSels = window.SwiftFilter.cosmeticSelectors(H) || ''; } catch (e) {}
+  try { if (TOP && !EXEMPT && window.SwiftFilter && window.SwiftFilter.cosmeticStartup) nativeSels = window.SwiftFilter.cosmeticStartup(H) || ''; } catch (e) {}
   function installNative() {
     if (!nativeSels) return;
     try {
       if (nativeSheet && document.adoptedStyleSheets.indexOf(nativeSheet) >= 0) return;
       if (!nativeSheet) {
         nativeSheet = new CSSStyleSheet();
-        var list = nativeSels.split('\n');
-        for (var i = 0; i < list.length; i++) {
-          if (!list[i]) continue;
-          try { nativeSheet.insertRule(list[i] + '{display:none !important}', nativeSheet.cssRules.length); } catch (e) {}
-        }
+        // The CSS parser drops an invalid rule on its own, so one parse handles the whole list.
+        nativeSheet.replaceSync(nativeSels.split('\n').join('{display:none !important}\n') + '{display:none !important}');
       }
       document.adoptedStyleSheets = document.adoptedStyleSheets.concat([nativeSheet]);
     } catch (e) {}
+  }
+  // Generic list rules are sent per page, only for the classes/ids that exist on it (keeps the stylesheet small and fast).
+  var tokSheet = null, tokSels = [], seenTok = {};
+  function sendTokens() {
+    if (!TOP || EXEMPT || !window.SwiftFilter || !window.SwiftFilter.cosmeticFor) return;
+    try {
+      var toks = [], els = document.querySelectorAll('[class],[id]');
+      for (var i = 0; i < els.length && toks.length < 4000; i++) {
+        var e = els[i];
+        if (e.id && typeof e.id === 'string') { var k = '#' + e.id; if (!seenTok[k]) { seenTok[k] = 1; toks.push(k); } }
+        var cl = e.classList;
+        if (cl) for (var j = 0; j < cl.length; j++) { var c = '.' + cl[j]; if (!seenTok[c]) { seenTok[c] = 1; toks.push(c); } }
+      }
+      if (!toks.length) return;
+      var res = window.SwiftFilter.cosmeticFor(H, JSON.stringify(toks)) || '';
+      if (!res) return;
+      var add = res.split('\n');
+      tokSels = tokSels.concat(add);
+      if (!tokSheet) { tokSheet = new CSSStyleSheet(); document.adoptedStyleSheets = document.adoptedStyleSheets.concat([tokSheet]); }
+      tokSheet.replaceSync(tokSels.join('{display:none !important}\n') + '{display:none !important}');
+    } catch (e) {}
+  }
+  if (TOP) {
+    try { document.addEventListener('DOMContentLoaded', sendTokens); } catch (e) {}
+    try { window.addEventListener('load', function () { setTimeout(sendTokens, 700); setTimeout(sendTokens, 3500); }); } catch (e) {}
   }
   installNative();
   installStyle();
   try { document.addEventListener('readystatechange', function () { installStyle(); installNative(); }); } catch (e) {}
   try { document.addEventListener('DOMContentLoaded', installStyle); } catch (e) {}
   // Re-check occasionally in case a page wipes <head>; a single boolean read, no DOM scan.
-  try { setInterval(function () { installStyle(); installNative(); }, 2000); } catch (e) {}
+  if (TOP) { try { setInterval(function () { installStyle(); installNative(); }, 2500); } catch (e) {} }
+
+  // ---------- 5b. collapse the empty space left by hidden/blocked ads ----------
+  function adHidden(e) { try { return getComputedStyle(e).display === 'none'; } catch (x) { return false; } }
+  function hasVisibleContent(p) {
+    try {
+      if ((p.innerText || '').trim().length > 0) return true;
+      var m = p.querySelectorAll('img,video,canvas,svg,input,button,select,textarea,picture,audio,iframe');
+      for (var i = 0; i < m.length; i++) {
+        if (m[i].offsetHeight > 2 && m[i].offsetWidth > 2 && !adHidden(m[i])) return true;
+      }
+    } catch (x) { return true; }
+    return false;
+  }
+  function collapseAround(el) {
+    var p = el.parentElement, n = 0;
+    while (p && p !== document.body && p !== document.documentElement && n < 3) {
+      if (hasVisibleContent(p)) break;
+      try { p.style.setProperty('display', 'none', 'important'); } catch (x) {}
+      p = p.parentElement; n++;
+    }
+  }
+  var collapsePasses = 0;
+  // One bad selector makes querySelectorAll throw for the whole group, so split and retry on failure.
+  function queryGroup(sels, out) {
+    if (!sels.length) return;
+    try {
+      var els = document.querySelectorAll(sels.join(','));
+      for (var j = 0; j < els.length && out.length < 120; j++) out.push(els[j]);
+    } catch (x) {
+      if (sels.length === 1) return;
+      var mid = sels.length >> 1;
+      queryGroup(sels.slice(0, mid), out);
+      queryGroup(sels.slice(mid), out);
+    }
+  }
+  function collapsePass() {
+    if (!TOP || EXEMPT || collapsePasses++ > 3) return;
+    try {
+      var sels = COSMETIC.slice();
+      if (nativeSels) sels = sels.concat(nativeSels.split('\n').slice(0, 800));
+      if (tokSels.length) sels = sels.concat(tokSels.slice(0, 1200));
+      var found = [];
+      for (var i = 0; i < sels.length; i += 150) queryGroup(sels.slice(i, i + 150), found);
+      for (var k = 0; k < found.length; k++) collapseAround(found[k]);
+    } catch (x) {}
+  }
+  if (TOP) {
+    try { window.addEventListener('load', function () { setTimeout(collapsePass, 800); setTimeout(collapsePass, 3500); }); } catch (e) {}
+  }
 
   // ---------- 6. YouTube ad data ----------
   if (IS_YT && location.pathname.indexOf('/shorts/') === -1) {
@@ -219,12 +294,12 @@ const val SHIELDS_JS = """
   // ---------- 6b. late-added ads: ad-host frames/links/images and click-stealing overlays ----------
   // Looks only at nodes that were just added (never rescans the page), in small time-boxed batches.
   (function () {
-    if (!TOP && !HOSTS) return;
+    if (!HOSTS) return;
     var queue = [], scheduled = false;
     function hide(e) { try { e.style.setProperty('display', 'none', 'important'); } catch (x) {} }
     function checkEl(e) {
       var u = e.src || e.href;
-      if (u && adHostUrl(u)) hide(e);
+      if (u && adHostUrl(u)) { hide(e); collapseAround(e); }
     }
     var STRONG = /(clickadu|disclosure of advertising|close ad\b|advertisement\s*$)/i;
     function overlayCheck(n) {
@@ -281,6 +356,8 @@ const val SHIELDS_JS = """
           }
           schedule();
         }).observe(root, { childList: true, subtree: true });
+        // The observer may start after the first nodes were parsed: look at what is already there once.
+        queue.push(root); schedule();
       } catch (e) {}
     }
     start();

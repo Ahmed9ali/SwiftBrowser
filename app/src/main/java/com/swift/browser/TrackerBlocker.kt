@@ -89,6 +89,7 @@ class TrackerBlocker(context: Context) {
     fun shouldBlock(requestUrl: String, pageUrl: String?, isMainFrame: Boolean = false): Boolean {
         val requestHost = hostOf(requestUrl) ?: return false
         val pageHost = hostOf(pageUrl)
+        if (isExemptPage(pageHost) || isExemptPage(requestHost)) return false
 
         // 1. CRITICAL WHITELIST: Never block these or the web breaks.
         if (requestHost.endsWith("google.com") && requestUrl.contains("recaptcha")) return false
@@ -124,15 +125,51 @@ class TrackerBlocker(context: Context) {
     private fun engineWhitelisted(host: String, url: String): Boolean =
         (host.endsWith("google.com") && url.contains("recaptcha")) || host == "challenges.cloudflare.com" ||
             host.endsWith("hcaptcha.com") || host.endsWith("jsdelivr.net") || host.endsWith("googleapis.com") ||
-            host.endsWith("gstatic.com") ||
-            ((host.endsWith("youtube.com") || host.endsWith("googlevideo.com")) &&
-                (url.contains("/youtubei/v1/player") || url.contains("/youtubei/v1/next")))
+            host.endsWith("gstatic.com") || host.endsWith("ytimg.com") || host.endsWith("ggpht.com") ||
+            host.endsWith("googleusercontent.com")
 
-    /** Sub-resource check against the downloaded filter lists. */
+    /** Pages where shields must stay out of the way (speed tests measure real network traffic). */
+    private val exemptPages = setOf(
+        "speedtest.net", "ookla.com", "ooklaserver.net", "fast.com", "speedof.me", "nperf.com",
+        "testmy.net", "speed.cloudflare.com", "fiber.google.com", "librespeed.org", "meter.net"
+    )
+
+    fun isExemptPage(host: String?): Boolean {
+        val h = host?.lowercase(Locale.ROOT) ?: return false
+        val reg = NavigationGuard.registrable(h)
+        return reg in exemptPages || h in exemptPages
+    }
+
+    fun isExemptHost(host: String?): Boolean = isExemptPage(host)
+
+    private val entities = listOf(
+        setOf("youtube.com", "ytimg.com", "ggpht.com", "googlevideo.com", "gstatic.com", "googleapis.com",
+            "google.com", "googleusercontent.com", "youtu.be", "youtube-nocookie.com"),
+        setOf("facebook.com", "fbcdn.net", "instagram.com", "cdninstagram.com", "fb.com"),
+        setOf("twitter.com", "x.com", "twimg.com"),
+        setOf("microsoft.com", "live.com", "msftauth.net", "bing.com", "office.com", "msn.com", "microsoftonline.com"),
+        setOf("amazon.com", "media-amazon.com", "ssl-images-amazon.com", "amazonaws.com", "cloudfront.net")
+    )
+
+    private fun sameOwner(a: String, b: String): Boolean {
+        val ra = NavigationGuard.registrable(a)
+        val rb = NavigationGuard.registrable(b)
+        if (ra == rb) return true
+        return entities.any { ra in it && rb in it }
+    }
+
+    /**
+     * Sub-resource check against the downloaded filter lists. Deliberately conservative to protect real content:
+     * only third-party requests, never on exempt pages, and never on YouTube (handled by the YouTube rules above).
+     */
     fun engineBlocks(url: String, pageUrl: String?, accept: String?): Boolean {
         val e = engine ?: return false
         val host = hostOf(url) ?: return false
+        val pageHost = hostOf(pageUrl) ?: return false
+        if (isExemptPage(pageHost) || isExemptPage(host)) return false
         if (engineWhitelisted(host, url)) return false
+        if (NavigationGuard.registrable(pageHost) == "youtube.com") return false
+        if (sameOwner(host, pageHost)) return false
         return e.blocks(url, pageUrl, FilterEngine.inferType(url, accept, false))
     }
 
@@ -140,12 +177,50 @@ class TrackerBlocker(context: Context) {
     fun engineBlocksNavigation(url: String, pageUrl: String?): Boolean {
         val e = engine ?: return false
         val host = hostOf(url) ?: return false
-        if (engineWhitelisted(host, url)) return false
+        if (engineWhitelisted(host, url) || isExemptPage(host)) return false
         return e.blocksNavigation(url, pageUrl)
     }
 
-    fun cosmeticSelectors(host: String): String {
+    private fun cosmeticAllowed(host: String): Boolean =
+        engine != null && !isExemptPage(host) &&
+            NavigationGuard.registrable(host.lowercase(Locale.ROOT)) != "youtube.com"
+
+    private fun safeSelectors(list: List<String>): String =
+        list.filter { !it.contains('{') && !it.contains('}') && !it.contains('\n') && it.length < 300 && balanced(it) }
+            .joinToString("\n")
+
+    /** Site-specific rules + the few generic rules that cannot be indexed; sent once at document start. */
+    fun cosmeticStartup(host: String): String {
         val e = engine ?: return ""
-        return e.cosmeticFor(host).joinToString("\n")
+        if (!cosmeticAllowed(host)) return ""
+        return safeSelectors(e.cosmeticStartup(host))
+    }
+
+    /** Generic rules for the classes/ids actually present on the page (tokensJson = [".foo","#bar"]). */
+    fun cosmeticForTokens(host: String, tokensJson: String): String {
+        val e = engine ?: return ""
+        if (!cosmeticAllowed(host)) return ""
+        val arr = org.json.JSONArray(tokensJson)
+        val toks = ArrayList<String>(arr.length())
+        for (i in 0 until arr.length()) toks.add(arr.getString(i))
+        return safeSelectors(e.cosmeticForTokens(host, toks))
+    }
+
+    /** An unbalanced bracket or quote would swallow the CSS rules after it, so drop such selectors. */
+    private fun balanced(s: String): Boolean {
+        var paren = 0; var square = 0; var dq = false; var sq = false
+        for (c in s) {
+            when {
+                c == '"' && !sq -> dq = !dq
+                c == '\'' && !dq -> sq = !sq
+                dq || sq -> {}
+                c == '(' -> paren++
+                c == ')' -> paren--
+                c == '[' -> square++
+                c == ']' -> square--
+            }
+            if (paren < 0 || square < 0) return false
+        }
+        return paren == 0 && square == 0 && !dq && !sq
     }
 }

@@ -1422,16 +1422,26 @@ private fun SwiftBrowserApp() {
     LaunchedEffect(blockingEnabled) {
         webViews.forEach { (id, wv) -> if (blockingEnabled) installShields(wv, id) else removeShields(id) }
     }
+    // Counts arrive from IO threads, sometimes dozens per page: batch them into one UI update.
+    val pendingBlocked = remember { java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.atomic.AtomicInteger>() }
+    val blockedFlushQueued = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     fun countBlocked(tabId: Long) {
-        Handler(Looper.getMainLooper()).post {
-            totalBlocked++
-            val i = tabs.indexOfFirst { it.id == tabId }
-            if (i >= 0) {
-                val c = tabs[i].blockedCount + 1
-                tabs[i] = tabs[i].copy(blockedCount = c)
-                if (tabId == activeId) blockedCount = c
+        pendingBlocked.getOrPut(tabId) { java.util.concurrent.atomic.AtomicInteger() }.incrementAndGet()
+        if (!blockedFlushQueued.compareAndSet(false, true)) return
+        Handler(Looper.getMainLooper()).postDelayed({
+            blockedFlushQueued.set(false)
+            for (id in pendingBlocked.keys.toList()) {
+                val n = pendingBlocked.remove(id)?.get() ?: continue
+                if (n <= 0) continue
+                totalBlocked += n
+                val i = tabs.indexOfFirst { it.id == id }
+                if (i >= 0) {
+                    val c = tabs[i].blockedCount + n
+                    tabs[i] = tabs[i].copy(blockedCount = c)
+                    if (id == activeId) blockedCount = c
+                }
             }
-        }
+        }, 300)
     }
 
     fun createWebView(ctx: Context, tabId: Long): WebView {
@@ -1484,8 +1494,15 @@ private fun SwiftBrowserApp() {
                     try { blocker.blockedHostsJson() } catch (e: Exception) { "{}" }
 
                 @android.webkit.JavascriptInterface
-                fun cosmeticSelectors(host: String?): String =
-                    try { blocker.cosmeticSelectors(host ?: "") } catch (e: Exception) { "" }
+                fun exempt(host: String?): Boolean = blocker.isExemptPage(host)
+
+                @android.webkit.JavascriptInterface
+                fun cosmeticStartup(host: String?): String =
+                    try { blocker.cosmeticStartup(host ?: "") } catch (e: Exception) { "" }
+
+                @android.webkit.JavascriptInterface
+                fun cosmeticFor(host: String?, tokensJson: String?): String =
+                    try { blocker.cosmeticForTokens(host ?: "", tokensJson ?: "[]") } catch (e: Exception) { "" }
             }, "SwiftFilter")
             addJavascriptInterface(object {
                 @android.webkit.JavascriptInterface
