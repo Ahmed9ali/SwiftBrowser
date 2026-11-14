@@ -13,10 +13,14 @@ const val SHIELDS_JS = """
   var TOP = (window === window.top);
   var HOSTS = null;
   var EXEMPT = false;
+  var SENS = /(^|[\/._?&=-])(checkout|payments?|pay|order|orders|cart|basket|billing|bank|netbanking|wallet|upi|login|signin|sign-in|auth|oauth|account|secure|3ds|otp|verify|transaction|invoice|subscribe)(${'$'}|[\/._?&=-])/i;
+  function sensitive() { try { return SENS.test(location.pathname + location.search) || SENS.test(location.hostname.split('.')[0] + '/'); } catch (e) { return false; } }
   try { EXEMPT = !!(window.SwiftFilter && window.SwiftFilter.exempt && window.SwiftFilter.exempt(H)); } catch (e) {}
+  // Checkout / payment pages: no page-side blocking at all (orders must not fail because of a blocked script).
+  try { if (/(^|[\/?&=_.-])(checkout|payment|payments|pay|billing|cart|order|orders|upi|transaction|wallet|purchase)([\/?&=_.#-]|${'$'})/i.test(location.pathname + '?' + location.search)) EXEMPT = true; } catch (e) {}
   try { if (!EXEMPT && window.SwiftFilter && window.SwiftFilter.getBlockedHosts) HOSTS = JSON.parse(window.SwiftFilter.getBlockedHosts()); } catch (e) {}
   function adHostUrl(u) {
-    if (!HOSTS) return false;
+    if (!HOSTS || sensitive()) return false;
     try {
       var h = new URL(String(u), location.href).hostname.toLowerCase();
       while (h) {
@@ -54,6 +58,27 @@ const val SHIELDS_JS = """
   ['pointerdown', 'touchstart', 'click'].forEach(function (t) {
     try { window.addEventListener(t, reportTap, true); } catch (e) {}
   });
+
+  // Tell the native pull-to-refresh whether the finger is inside an inner scroller that is not at its top
+  // (modal, side panel): scrolling back up there must not trigger a page refresh.
+  function innerScrolledUp(el) {
+    var n = 0;
+    while (el && el.nodeType === 1 && el !== document.body && el !== document.documentElement && n++ < 25) {
+      try {
+        if (el.scrollTop > 0 && el.scrollHeight > el.clientHeight + 1) {
+          var oy = getComputedStyle(el).overflowY;
+          if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') return true;
+        }
+      } catch (e) {}
+      el = el.parentElement;
+    }
+    return false;
+  }
+  try {
+    window.addEventListener('touchstart', function (e) {
+      try { if (NAV && NAV.scrollState) NAV.scrollState(innerScrolledUp(e.target)); } catch (x) {}
+    }, { capture: true, passive: true });
+  } catch (e) {}
 
   // ---------- 2. invisible click-catcher overlays ----------
   // A transparent layer covering most of the screen that exists only to steal the first tap.
@@ -114,6 +139,7 @@ const val SHIELDS_JS = """
     } catch (e) {}
   });
 
+  function reportRoute() { try { if (TOP && NAV && NAV.route) NAV.route(location.href); } catch (e) {} }
   try {
     var winStart = Date.now(), calls = 0;
     ['pushState', 'replaceState'].forEach(function (n) {
@@ -121,9 +147,13 @@ const val SHIELDS_JS = """
       history[n] = function () {
         if (Date.now() - winStart > 10000) { winStart = Date.now(); calls = 0; }
         if (++calls > 20) return;
-        return real.apply(this, arguments);
+        var r = real.apply(this, arguments);
+        reportRoute();
+        return r;
       };
     });
+    window.addEventListener('popstate', reportRoute);
+    window.addEventListener('hashchange', reportRoute);
   } catch (e) {}
 
   // ---------- 4. anti-adblock stubs ----------
@@ -379,7 +409,7 @@ const val SHIELDS_JS = """
       try {
         var s = String(u);
         var host = new URL(s, location.href).hostname.toLowerCase();
-        if (!host || SAFE.test(host)) return false;
+        if (!host || SAFE.test(host) || sensitive()) return false;
         var h = host;
         while (h) {
           if (hosts[h]) return true;
