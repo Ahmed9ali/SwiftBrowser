@@ -215,7 +215,11 @@ class TrackerBlocker(context: Context) {
         if (isSensitivePage(pageUrl)) return false
         if (NavigationGuard.registrable(pageHost) == "youtube.com") return false
         if (sameOwner(host, pageHost)) return false
-        return e.blocks(url, pageUrl, FilterEngine.inferType(url, accept, false))
+        val t0 = System.nanoTime()
+        val r = e.blocks(url, pageUrl, FilterEngine.inferType(url, accept, false))
+        val ms = (System.nanoTime() - t0) / 1_000_000
+        if (ms >= 8) android.util.Log.w("SwiftFilters", "slow filter check ${ms} ms: ${url.take(120)}")
+        return r
     }
 
     /** Navigation / popup destination check against popup rules and plain ad-host rules. */

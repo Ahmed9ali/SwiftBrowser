@@ -256,6 +256,7 @@ object DownloadEngine {
             val canSkipProbe = !ranged && total > 0 && part.exists() && part.length() > 0
             if ((!ranged || total <= 0) && !canSkipProbe) {
                 val probe = open(first, first.url, "bytes=0-0")
+                var probeRanged = false
                 try {
                     val code = probe.responseCode
                     url = probe.url.toString()
@@ -263,11 +264,15 @@ object DownloadEngine {
                     if (code == 206) {
                         total = probe.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: -1L
                         ranged = total > 0
+                        probeRanged = true
                     } else if (code in 200..299) {
                         total = probe.contentLengthLong
                         ranged = false
                     } else throw java.io.IOException("Server returned $code")
-                } finally { runCatching { probe.disconnect() } }
+                } finally {
+                    // A 206 body is 1 byte: closing the stream lets the keep-alive connection be reused by the segments.
+                    if (probeRanged) runCatching { probe.inputStream.close() } else runCatching { probe.disconnect() }
+                }
             }
 
             val wanted = connections

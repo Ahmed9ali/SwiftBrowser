@@ -223,7 +223,7 @@ const val SHIELDS_JS = """
   // Generic list rules are sent per page, only for the classes/ids that exist on it (keeps the stylesheet small and fast).
   var tokSheet = null, tokSels = [], seenTok = {};
   function sendTokens() {
-    if (!TOP || EXEMPT || !window.SwiftFilter || !window.SwiftFilter.cosmeticFor) return;
+    if (!TOP || EXEMPT || IS_YT || !window.SwiftFilter || !window.SwiftFilter.cosmeticFor) return;
     try {
       var toks = [], els = document.querySelectorAll('[class],[id]');
       for (var i = 0; i < els.length && toks.length < 4000; i++) {
@@ -382,6 +382,7 @@ const val SHIELDS_JS = """
       try { (window.requestAnimationFrame || window.setTimeout)(run, 50); } catch (e) { setTimeout(run, 50); }
     }
     function start() {
+      if (IS_YT) return; // YouTube mutates its DOM constantly and is covered by its own rules
       try {
         var root = document.documentElement;
         if (!root) { setTimeout(start, 20); return; }

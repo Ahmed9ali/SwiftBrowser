@@ -76,8 +76,20 @@ class FilterEngine private constructor(
     }
 
     /** Should this sub-resource request be blocked? [typeMask] is a combination of T_* flags. */
+    private val cache = object : LinkedHashMap<String, Boolean>(2048, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?): Boolean = size > 4000
+    }
+
     fun blocks(url: String, pageUrl: String?, typeMask: Int): Boolean {
         val pageHost = pageUrl?.let { hostOf(it) }
+        val key = url + "\u0001" + (pageHost ?: "") + "\u0001" + typeMask
+        synchronized(cache) { cache[key] }?.let { return it }
+        val r = blocksUncached(url, pageHost, typeMask)
+        synchronized(cache) { cache[key] = r }
+        return r
+    }
+
+    private fun blocksUncached(url: String, pageHost: String?, typeMask: Int): Boolean {
         if (pageHost != null && hostInSet(pageHost, documentOff)) return false
         val ctx = Ctx(url.lowercase(Locale.ROOT), hostOf(url) ?: return false, pageHost, typeMask)
         val hit = block.firstMatch(ctx) ?: return false
@@ -281,6 +293,7 @@ class FilterEngine private constructor(
         private val ehOff = HashSet<String>()
         private val ghOff = HashSet<String>()
         private val seenGeneric = HashSet<String>()
+        private val tokenFreq = HashMap<String, Int>()
         private var cosmetic = 0
 
         fun addLines(lines: Sequence<String>): Builder {
@@ -401,7 +414,11 @@ class FilterEngine private constructor(
             when {
                 hostInfo != null -> idx.add(rule, hostInfo.first, null)
                 isRegexRule -> idx.add(rule, null, null)
-                else -> idx.add(rule, null, tokenOf(pat))
+                else -> {
+                    val tok = tokensOf(pat).minWithOrNull(compareBy<String>({ tokenFreq[it] ?: 0 }, { -it.length }))
+                    if (tok != null) tokenFreq[tok] = (tokenFreq[tok] ?: 0) + 1
+                    idx.add(rule, null, tok)
+                }
             }
         }
 
@@ -456,9 +473,9 @@ class FilterEngine private constructor(
                 return if (hp.second == "" || hp.second == "^") hp.first else null
             }
 
-            /** Longest alnum run bounded on both sides by a non-wildcard char (or an anchor). */
-            fun tokenOf(p: String): String? {
-                var best: String? = null
+            /** All alnum runs (>= 3 chars) bounded on both sides by a non-wildcard char or an anchor. */
+            fun tokensOf(p: String): List<String> {
+                val out = ArrayList<String>(4)
                 var i = 0
                 while (i < p.length) {
                     if (!isAlnum(p[i])) { i++; continue }
@@ -467,14 +484,9 @@ class FilterEngine private constructor(
                     val e = i
                     val leftOk = if (s == 0) p.startsWith("|") else p[s - 1] != '*'
                     val rightOk = if (e == p.length) p.endsWith("|") else p[e] != '*'
-                    // A run at the very start of an unanchored pattern may be the tail of a longer URL token.
-                    val leftBounded = if (s == 0) p.startsWith("|") else true
-                    val rightBounded = if (e == p.length) p.endsWith("|") else true
-                    if (leftOk && rightOk && leftBounded && rightBounded && e - s >= 3) {
-                        if (best == null || e - s > best.length) best = p.substring(s, e)
-                    }
+                    if (leftOk && rightOk && e - s >= 3) out.add(p.substring(s, e))
                 }
-                return best
+                return out
             }
         }
     }

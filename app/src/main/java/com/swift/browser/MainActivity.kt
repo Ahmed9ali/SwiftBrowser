@@ -547,6 +547,22 @@ class MainActivity : ComponentActivity() {
     private fun handleIntent(i: Intent?) {
         val u = i?.dataString
         if (i?.action == Intent.ACTION_VIEW && u != null && u.startsWith("http")) pendingUrl = u
+        if (i?.action == Intent.ACTION_WEB_SEARCH) {
+            val q = i.getStringExtra(android.app.SearchManager.QUERY)?.trim().orEmpty()
+            if (q.isNotEmpty()) pendingUrl = if (q.startsWith("http")) q else AppSettings(this).searchUrl(q)
+        }
+    }
+
+    override fun startActivity(intent: Intent?, options: Bundle?) {
+        // The text-selection toolbar's "Web search" would show an app chooser; search in this browser instead.
+        if (intent?.action == Intent.ACTION_WEB_SEARCH) {
+            val q = intent.getStringExtra(android.app.SearchManager.QUERY)?.trim().orEmpty()
+            if (q.isNotEmpty()) {
+                pendingUrl = if (q.startsWith("http://") || q.startsWith("https://")) q else AppSettings(this).searchUrl(q)
+                return
+            }
+        }
+        super.startActivity(intent, options)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -639,6 +655,8 @@ private fun SwiftBrowserApp() {
     var translateDone by remember { mutableStateOf<Pair<Long, String>?>(null) }
     var translateDl by remember { mutableStateOf<Pair<String, Float>?>(null) }
     var translateBusy by remember { mutableStateOf<Pair<Long, String>?>(null) }
+    // tabId -> source language of a page that is currently translated (so the menu can offer Undo again)
+    val translatedTabs = remember { HashMap<Long, String>() }
     var translateMenu by remember { mutableStateOf(false) }
     var defaultCheck by remember { mutableIntStateOf(0) }
     DisposableEffect(Unit) {
@@ -1432,6 +1450,7 @@ private fun SwiftBrowserApp() {
     fun undoTranslate() {
         val wv = activeWebView() ?: return
         translateDone = null
+        translatedTabs.remove(activeId)
         wv.evaluateJavascript("window.__swiftTr&&window.__swiftTr.restore();", null)
     }
 
@@ -1530,6 +1549,7 @@ private fun SwiftBrowserApp() {
                 getTarget = { appSettings.translateTarget },
                 onFirstApplied = { sourceLang ->
                     if (translateBusy?.first == tabId) translateBusy = null
+                    translatedTabs[tabId] = sourceLang
                     if (tabId == activeId && translateDismissedUrl != pageUrl) translateDone = activeId to sourceLang
                 },
                 onError = { error ->
@@ -1639,8 +1659,18 @@ private fun SwiftBrowserApp() {
                         decided = true
                         val v = if (currentBlockingEnabled) navGuard.decidePopup(tabId, url, sourceUrl, true) else null
                         decidedAllowed = v == null || v.allowed
+                        val openerHost = sourceUrl?.let { NavigationGuard.host(it) }
+                        val targetHost = NavigationGuard.host(url)
+                        val sameSiteOpen = !isDialog && openerHost != null && targetHost != null &&
+                            NavigationGuard.sameSite(openerHost, targetHost)
                         Handler(Looper.getMainLooper()).post {
-                            if (decidedAllowed) {
+                            if (decidedAllowed && sameSiteOpen && view != null) {
+                                // Same-site "new window" (checkout confirmations etc.): stay in this tab so
+                                // the flow and the back/forward history stay in one place.
+                                child.stopLoading()
+                                child.destroy()
+                                view.loadUrl(url)
+                            } else if (decidedAllowed) {
                                 newTab(sourcePrivate)
                                 val nid = activeId
                                 adoptedViews[nid] = child
@@ -1847,6 +1877,7 @@ private fun SwiftBrowserApp() {
                     navGuard.onCommit(tabId, url)
                     if (translateOffer?.first == tabId) translateOffer = null
                     if (translateDone?.first == tabId) translateDone = null
+                    translatedTabs.remove(tabId)
                     if (translateBusy?.first == tabId) translateBusy = null
                     if (tabId == activeId) translateDismissedUrl = null
                     applyDesktopJs(view, tabId)
@@ -1858,6 +1889,19 @@ private fun SwiftBrowserApp() {
                         pageUrl = url
                         address = url
                         showSuggestions = false
+                    }
+                }
+
+                override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                    // Single-page sites change the URL without a page load: keep the address bar and
+                    // the back/forward state in step with the real history.
+                    if (url != null && url.startsWith("http") && webViews[tabId] === view) {
+                        firstParty[tabId] = url
+                        if (tabId == activeId) {
+                            if (!addressFocused) { pageUrl = url; address = url }
+                            updateTabById(tabId, url = url)
+                            refreshNavigation()
+                        }
                     }
                 }
 
@@ -1936,6 +1980,25 @@ private fun SwiftBrowserApp() {
         return !(prev.url ?: "").startsWith("about:")
     }
 
+    // When the keyboard is closed with the phone's Back button, also drop the address-bar focus and its grey overlay.
+    val rootView = androidx.compose.ui.platform.LocalView.current
+    DisposableEffect(rootView) {
+        var wasOpen = false
+        val l = android.view.ViewTreeObserver.OnGlobalLayoutListener {
+            val r = android.graphics.Rect()
+            rootView.getWindowVisibleDisplayFrame(r)
+            val h = rootView.rootView.height
+            val open = h > 0 && (h - r.bottom) > h * 0.15f
+            if (wasOpen && !open && addressFocused) {
+                focusManager.clearFocus()
+                showSuggestions = false
+            }
+            wasOpen = open
+        }
+        rootView.viewTreeObserver.addOnGlobalLayoutListener(l)
+        onDispose { rootView.viewTreeObserver.removeOnGlobalLayoutListener(l) }
+    }
+
     BackHandler(enabled = true) {
         when {
             fullscreenView != null -> exitFullscreen()
@@ -1947,7 +2010,11 @@ private fun SwiftBrowserApp() {
             showGroupSheet -> showGroupSheet = false
             showShield -> showShield = false
             showTabs -> showTabs = false
-            showSuggestions -> showSuggestions = false
+            addressFocused || showSuggestions -> {
+                showSuggestions = false
+                focusManager.clearFocus()
+                keyboardController?.hide()
+            }
             address == "swift://bookmarks" || address == "swift://history" || address == "swift://downloads" ||
                 address == "swift://settings" ->
                 address = if (isHome) "" else pageUrl
@@ -3399,7 +3466,13 @@ private fun SwiftBrowserApp() {
                             }
                             MenuRow(Icons.Default.Translate, "Translate\u2026") {
                                 showMenu = false
-                                translatePageInPlace()
+                                val doneLang = translatedTabs[activeId]
+                                if (doneLang != null) {
+                                    // Already translated: bring the popup back so it can be undone.
+                                    translateDismissedUrl = null
+                                    translateOffer = null
+                                    translateDone = activeId to doneLang
+                                } else translatePageInPlace()
                             }
                             MenuRow(Icons.Default.AddToHomeScreen, "Install and create shortcut") {
                                 showMenu = false
