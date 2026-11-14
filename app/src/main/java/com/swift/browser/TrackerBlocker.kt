@@ -90,6 +90,8 @@ class TrackerBlocker(context: Context) {
         val requestHost = hostOf(requestUrl) ?: return false
         val pageHost = hostOf(pageUrl)
         if (isExemptPage(pageHost) || isExemptPage(requestHost)) return false
+        if (isPaymentHost(requestHost) || isPaymentHost(pageHost)) return false
+        if (isCheckoutPage(pageUrl) && !isAdHost(requestHost)) return false
 
         // 1. CRITICAL WHITELIST: Never block these or the web breaks.
         if (requestHost.endsWith("google.com") && requestUrl.contains("recaptcha")) return false
@@ -142,6 +144,30 @@ class TrackerBlocker(context: Context) {
 
     fun isExemptHost(host: String?): Boolean = isExemptPage(host)
 
+    /** Payment, bank, fraud-check and bot-protection services: blocking these makes orders fail. */
+    private val paymentRegistrable = setOf(
+        "razorpay.com", "paytm.com", "paytmpayments.com", "phonepe.com", "payu.in", "payu.com", "payumoney.com",
+        "cashfree.com", "juspay.in", "juspay.io", "billdesk.com", "ccavenue.com", "stripe.com", "stripe.network",
+        "paypal.com", "paypalobjects.com", "braintreegateway.com", "adyen.com", "checkout.com", "cybersource.com",
+        "online-metrix.net", "threatmetrix.com", "forter.com", "riskified.com", "signifyd.com", "sift.com",
+        "sardine.ai", "kount.com", "perimeterx.net", "px-cloud.net", "px-cdn.net", "datadome.co", "npci.org.in",
+        "mastercard.com", "visa.com", "americanexpress.com", "hdfcbank.com", "icicibank.com", "axisbank.com",
+        "kotak.com", "sbi.co.in", "gokwik.co", "shiprocket.in", "simpl.money", "lazypay.in", "zestmoney.in"
+    )
+    private val checkoutRe = Regex("(^|[/?&=_.-])(checkout|payment|payments|pay|billing|cart|order|orders|upi|transaction|wallet|buy|purchase)([/?&=_.#-]|$)", RegexOption.IGNORE_CASE)
+
+    fun isPaymentHost(host: String?): Boolean =
+        host != null && NavigationGuard.registrable(host.lowercase(Locale.ROOT)) in paymentRegistrable
+
+    /** Checkout-looking pages: only known ad networks are blocked, never "trackers" or path guesses. */
+    fun isCheckoutPage(pageUrl: String?): Boolean {
+        if (pageUrl.isNullOrEmpty()) return false
+        return try {
+            val u = Uri.parse(pageUrl)
+            checkoutRe.containsMatchIn((u.path ?: "") + "?" + (u.query ?: ""))
+        } catch (e: Exception) { false }
+    }
+
     private val entities = listOf(
         setOf("youtube.com", "ytimg.com", "ggpht.com", "googlevideo.com", "gstatic.com", "googleapis.com",
             "google.com", "googleusercontent.com", "youtu.be", "youtube-nocookie.com"),
@@ -167,6 +193,7 @@ class TrackerBlocker(context: Context) {
         val host = hostOf(url) ?: return false
         val pageHost = hostOf(pageUrl) ?: return false
         if (isExemptPage(pageHost) || isExemptPage(host)) return false
+        if (isPaymentHost(host) || isPaymentHost(pageHost) || isCheckoutPage(pageUrl)) return false
         if (engineWhitelisted(host, url)) return false
         if (NavigationGuard.registrable(pageHost) == "youtube.com") return false
         if (sameOwner(host, pageHost)) return false

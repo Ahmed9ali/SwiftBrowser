@@ -14,6 +14,8 @@ const val SHIELDS_JS = """
   var HOSTS = null;
   var EXEMPT = false;
   try { EXEMPT = !!(window.SwiftFilter && window.SwiftFilter.exempt && window.SwiftFilter.exempt(H)); } catch (e) {}
+  // Checkout / payment pages: no page-side blocking at all (orders must not fail because of a blocked script).
+  try { if (/(^|[\/?&=_.-])(checkout|payment|payments|pay|billing|cart|order|orders|upi|transaction|wallet|purchase)([\/?&=_.#-]|${'$'})/i.test(location.pathname + '?' + location.search)) EXEMPT = true; } catch (e) {}
   try { if (!EXEMPT && window.SwiftFilter && window.SwiftFilter.getBlockedHosts) HOSTS = JSON.parse(window.SwiftFilter.getBlockedHosts()); } catch (e) {}
   function adHostUrl(u) {
     if (!HOSTS) return false;
@@ -54,6 +56,27 @@ const val SHIELDS_JS = """
   ['pointerdown', 'touchstart', 'click'].forEach(function (t) {
     try { window.addEventListener(t, reportTap, true); } catch (e) {}
   });
+
+  // Tell the native pull-to-refresh whether the finger is inside an inner scroller that is not at its top
+  // (modal, side panel): scrolling back up there must not trigger a page refresh.
+  function innerScrolledUp(el) {
+    var n = 0;
+    while (el && el.nodeType === 1 && el !== document.body && el !== document.documentElement && n++ < 25) {
+      try {
+        if (el.scrollTop > 0 && el.scrollHeight > el.clientHeight + 1) {
+          var oy = getComputedStyle(el).overflowY;
+          if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') return true;
+        }
+      } catch (e) {}
+      el = el.parentElement;
+    }
+    return false;
+  }
+  try {
+    window.addEventListener('touchstart', function (e) {
+      try { if (NAV && NAV.scrollState) NAV.scrollState(innerScrolledUp(e.target)); } catch (x) {}
+    }, { capture: true, passive: true });
+  } catch (e) {}
 
   // ---------- 2. invisible click-catcher overlays ----------
   // A transparent layer covering most of the screen that exists only to steal the first tap.

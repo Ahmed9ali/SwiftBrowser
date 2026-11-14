@@ -263,6 +263,20 @@ private const val LANG_JS = """
 })()
 """
 
+private const val TEXT_PROBE_JS = """
+(function(x,y){try{
+ var s=window.getSelection&&String(window.getSelection());
+ if(s&&s.trim())return '';
+ var el=document.elementFromPoint(x,y);
+ for(var i=0;i<5&&el&&el!==document.body&&el!==document.documentElement;i++){
+  var t=(el.innerText||el.textContent||'').trim();
+  if(t.length>0&&t.length<=3000)return t;
+  el=el.parentElement;
+ }
+ return '';
+}catch(e){return '';}})(__X__,__Y__)
+"""
+
 private const val VIDEO_PROBE_JS = """
 (function(x,y){
  var all=[];
@@ -273,6 +287,8 @@ private const val VIDEO_PROBE_JS = """
  all.forEach(function(e){var r=e.getBoundingClientRect();
   if(x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom&&r.width*r.height<area){v=e;area=r.width*r.height;}});
  if(!v) return '';
+ var top=document.elementFromPoint(x,y);
+ if(top&&top!==v&&!top.contains(v)&&!v.contains(top)&&(top.innerText||'').trim().length>0) return '';
  window.__swiftLpVideo=v;
  var src=v.currentSrc||v.src||'';
  if(!src||src.indexOf('blob:')===0||/\.m3u8|\.mpd/i.test(src)){
@@ -406,6 +422,8 @@ private data class TabEntry(val key: Long, val isGroup: Boolean, val tabs: List<
 
 private class PullRefreshLayout(context: Context) : android.widget.FrameLayout(context) {
     var onRefresh: (() -> Unit)? = null
+    /** True when the touch started inside an inner scroller (modal, panel) that is not at its top. */
+    var innerScrolled: (() -> Boolean)? = null
     private val density = context.resources.displayMetrics.density
     private val slop = android.view.ViewConfiguration.get(context).scaledTouchSlop
     private val threshold = 72f * density
@@ -430,7 +448,7 @@ private class PullRefreshLayout(context: Context) : android.widget.FrameLayout(c
 
     init { setWillNotDraw(false) }
 
-    private fun canChildScrollUp(): Boolean = getChildAt(0)?.canScrollVertically(-1) == true
+    private fun canChildScrollUp(): Boolean = getChildAt(0)?.canScrollVertically(-1) == true || innerScrolled?.invoke() == true
 
     override fun onInterceptTouchEvent(ev: android.view.MotionEvent): Boolean {
         when (ev.actionMasked) {
@@ -578,6 +596,7 @@ private fun SwiftBrowserApp() {
     // Last thing the guard stopped: (tabId, url, wasPopup). Shown as an "Allow" chip.
     var blockedNav by remember { mutableStateOf<Triple<Long, String, Boolean>?>(null) }
     val adoptedViews = remember { HashMap<Long, WebView>() }
+    val innerScroll = remember { java.util.concurrent.ConcurrentHashMap<Long, Boolean>() }
     val popupTabs = remember { HashSet<Long>() }
     val session = remember { loadSession(context) }
     val startTab = session?.let { sess -> sess.tabs.firstOrNull { it.id == sess.activeId } }
@@ -648,6 +667,7 @@ private fun SwiftBrowserApp() {
     var downloadNoticeAt by remember { mutableLongStateOf(0L) }
     var downloadNoticeVisible by remember { mutableStateOf(false) }
     var pendingDownload by remember { mutableStateOf<PendingDownload?>(null) }
+    var textCopy by remember { mutableStateOf<String?>(null) }
     var selecting by remember { mutableStateOf(false) }
     val selectedTabs = remember { mutableStateListOf<Long>() }
     var showClearData by remember { mutableStateOf(false) }
@@ -1118,8 +1138,16 @@ private fun SwiftBrowserApp() {
     fun neighborFor(dir: Int): BrowserTab? {
         val cur = tabs.firstOrNull { it.id == activeId } ?: return null
         val pool = tabs.filter { it.isPrivate == cur.isPrivate }
-        val i = pool.indexOfFirst { it.id == activeId }
-        return pool.getOrNull(i + dir)
+        // Group members sit together (at the group's first position), like the tab strip shows them.
+        val ordered = ArrayList<BrowserTab>(pool.size)
+        val emitted = HashSet<Long>()
+        for (t in pool) {
+            val g = tabGroups[t.id]
+            if (g == null) ordered.add(t)
+            else if (emitted.add(g)) pool.filter { tabGroups[it.id] == g }.forEach { ordered.add(it) }
+        }
+        val i = ordered.indexOfFirst { it.id == activeId }
+        return ordered.getOrNull(i + dir)
     }
 
     fun beginSwipe() {
@@ -1190,6 +1218,20 @@ private fun SwiftBrowserApp() {
                 wv.evaluateJavascript("(function(){var s=window.getSelection&&window.getSelection();if(s)s.removeAllRanges();})()", null)
             }
         }
+    }
+
+    /** Long-press on plain text: the browser's own selection bar often does not show, so offer "Copy text". */
+    fun probeTextAt(wv: WebView, px: Float, py: Float) {
+        @Suppress("DEPRECATION")
+        val sc = wv.scale.takeIf { it > 0f } ?: context.resources.displayMetrics.density
+        val js = TEXT_PROBE_JS.replace("__X__", (px / sc).toString()).replace("__Y__", (py / sc).toString())
+        wv.postDelayed({
+            if (videoTarget != null || contextMenu != null) return@postDelayed
+            wv.evaluateJavascript(js) { raw ->
+                val str = runCatching { org.json.JSONTokener(raw).nextValue() as? String }.getOrNull().orEmpty()
+                if (str.isNotBlank() && videoTarget == null && contextMenu == null) textCopy = str
+            }
+        }, 450)
     }
 
     fun captureVideoFrame(onBitmap: (Bitmap?) -> Unit) {
@@ -1507,6 +1549,9 @@ private fun SwiftBrowserApp() {
             addJavascriptInterface(object {
                 @android.webkit.JavascriptInterface
                 fun tap(href: String?) { navGuard.recordTap(tabId, href) }
+
+                @android.webkit.JavascriptInterface
+                fun scrollState(innerNotAtTop: Boolean) { innerScroll[tabId] = innerNotAtTop }
             }, "SwiftNav")
 
             appSettings.applyTo(this)
@@ -1540,7 +1585,10 @@ private fun SwiftBrowserApp() {
                 val isImage = type == WebView.HitTestResult.IMAGE_TYPE ||
                     type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
                 if ((!isLink && !isImage) || extra == null || extra.startsWith("javascript:")) {
-                    if (!isLink && !isImage) probeVideoAt(wv, tabId, lastTouch[0], lastTouch[1])
+                    if (!isLink && !isImage) {
+                        probeVideoAt(wv, tabId, lastTouch[0], lastTouch[1])
+                        probeTextAt(wv, lastTouch[0], lastTouch[1])
+                    }
                     return@setOnLongClickListener false
                 }
                 wv.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
@@ -2279,6 +2327,7 @@ private fun SwiftBrowserApp() {
                             factory = { ctx ->
                                 val wv = createWebView(ctx, tab.id)
                                 PullRefreshLayout(ctx).apply {
+                                    innerScrolled = { innerScroll[tab.id] == true }
                                     addView(
                                         wv,
                                         android.widget.FrameLayout.LayoutParams(
@@ -2615,6 +2664,31 @@ private fun SwiftBrowserApp() {
                     )
                 }
 
+                textCopy?.let { t ->
+                    AlertDialog(
+                        onDismissRequest = { textCopy = null },
+                        containerColor = Surface,
+                        title = { Text("Copy text", color = TextMain) },
+                        text = {
+                            Text(
+                                t, color = TextMuted, fontSize = 13.sp, maxLines = 8,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                            )
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                val cm = context.getSystemService(android.content.ClipboardManager::class.java)
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("text", t))
+                                Toast.makeText(context, "Text copied", Toast.LENGTH_SHORT).show()
+                                textCopy = null
+                            }) { Text("Copy", color = Accent) }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { textCopy = null }) { Text("Cancel", color = TextMain) }
+                        }
+                    )
+                }
+
                 pendingDownload?.let { d ->
                     AlertDialog(
                         onDismissRequest = { pendingDownload = null },
@@ -2808,10 +2882,6 @@ private fun SwiftBrowserApp() {
                                     val set = (sp.getStringSet("never", emptySet()) ?: emptySet()).toMutableSet()
                                     set.add(hostOf(pageUrl))
                                     sp.edit().putStringSet("never", set).apply()
-                                }
-                                BrowserMenuItem("Dismiss", Icons.Default.Close) {
-                                    translateMenu = false
-                                    dismissBanner()
                                 }
                             }
                         }

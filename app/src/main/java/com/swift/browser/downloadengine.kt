@@ -68,6 +68,14 @@ object DownloadEngine {
     /** 0 = run, 1 = pause, 2 = cancel */
     private val flags = ConcurrentHashMap<Long, AtomicInteger>()
 
+    /** Open connections per download, so pause/cancel can cut a blocked read immediately. */
+    private val conns = ConcurrentHashMap<Long, MutableSet<HttpURLConnection>>()
+    private val workers = ConcurrentHashMap<Long, Thread>()
+
+    private fun dropConnections(id: Long) {
+        conns[id]?.let { set -> for (c in set.toList()) runCatching { c.disconnect() }; set.clear() }
+    }
+
     var notificationsEnabled = true
     var onCompleted: ((DownloadItem) -> Unit)? = null
     var onTick: (() -> Unit)? = null
@@ -124,7 +132,13 @@ object DownloadEngine {
         if (i < 0) return
         val d = items[i]
         when (d.state) {
-            DlState.RUNNING -> flags[id]?.set(1) // worker posts PAUSED when it stops
+            DlState.RUNNING -> {
+                flags[id]?.set(1)
+                items[i] = d.copy(state = DlState.PAUSED, speed = 0) // show it at once; the worker unwinds in the background
+                dropConnections(id)
+                save()
+                pump()
+            }
             DlState.QUEUED -> {
                 items[i] = d.copy(state = DlState.PAUSED)
                 save()
@@ -156,6 +170,7 @@ object DownloadEngine {
     /** Cancels an unfinished download and removes its partial file. */
     fun cancel(id: Long) {
         flags[id]?.set(2)
+        dropConnections(id)
         partFile(id).delete()
         removeItem(id)
     }
@@ -191,7 +206,14 @@ object DownloadEngine {
                 flags[d.id] = AtomicInteger(0)
                 running++
                 val started = items[i]
-                Thread({ work(started) }, "swift-dl-${d.id}").start()
+                val previous = workers[d.id]
+                val t = Thread({
+                    // A just-paused worker may still be flushing; never run two writers on one file.
+                    if (previous != null && previous.isAlive) runCatching { previous.join(4000) }
+                    work(started)
+                }, "swift-dl-${d.id}")
+                workers[d.id] = t
+                t.start()
             }
             i--
         }
@@ -219,7 +241,7 @@ object DownloadEngine {
             item.referer?.takeIf { it.startsWith("http") }?.let { setRequestProperty("Referer", it) }
             item.cookie?.takeIf { it.isNotBlank() }?.let { setRequestProperty("Cookie", it) }
             if (range != null) setRequestProperty("Range", range)
-        }
+        }.also { c -> conns.getOrPut(item.id) { java.util.concurrent.ConcurrentHashMap.newKeySet() }.add(c) }
 
     private fun work(first: DownloadItem) {
         val id = first.id
@@ -231,7 +253,8 @@ object DownloadEngine {
             var total = first.total
             var ranged = first.segs.isNotEmpty()
             var serverMime: String? = null
-            if (!ranged || total <= 0) {
+            val canSkipProbe = !ranged && total > 0 && part.exists() && part.length() > 0
+            if ((!ranged || total <= 0) && !canSkipProbe) {
                 val probe = open(first, first.url, "bytes=0-0")
                 try {
                     val code = probe.responseCode
@@ -361,8 +384,9 @@ object DownloadEngine {
         var lastTime = System.currentTimeMillis()
         var speed = 0L
         while (threads.any { it.isAlive }) {
-            try { Thread.sleep(350) } catch (_: InterruptedException) {}
+            try { Thread.sleep(120) } catch (_: InterruptedException) {}
             val now = System.currentTimeMillis()
+            if (now - lastTime < 350) continue
             val done = (0 until n).sumOf { got.get(it) }
             val inst = (done - lastBytes) * 1000L / (now - lastTime).coerceAtLeast(1)
             speed = if (speed == 0L) inst else (speed * 6 + inst * 4) / 10 // light smoothing

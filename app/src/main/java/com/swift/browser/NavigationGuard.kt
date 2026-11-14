@@ -112,13 +112,10 @@ class NavigationGuard(
 
         // Cross-site, not an ad, no matching tap.
         val sinceCommit = if (t.commitAt == 0L) Long.MAX_VALUE else t0 - t.commitAt
-        if (tapFresh && t.tapHref != null) {
-            // The finger was on a link, but the page sent us somewhere else: click hijack.
-            return Verdict(Kind.BLOCK, "tapped link did not match destination")
-        }
-        if (tapFresh) {
-            // Tap on a button / JS link that then navigates (shortlink "continue", "open site"): the user asked.
-            return Verdict(Kind.ALLOW, "tap led to navigation")
+        if (t.tapAt > 0L && t.tapAt >= t.commitAt) {
+            // The user has interacted with this page (tap on a link, button, search result, "Pay" ...) and the
+            // destination does not look like an ad: real sites redirect through gateways, SSO and trackers.
+            return Verdict(Kind.ALLOW, "user interacted with the page")
         }
         if (sinceCommit < AUTO_REDIRECT_MS) {
             // Fast automatic jump right after load, no tap: classic ad bounce unless the site is known.
@@ -179,7 +176,13 @@ class NavigationGuard(
             "facebook.com", "github.com", "paypal.com", "stripe.com", "checkout.stripe.com",
             "razorpay.com", "paytm.com", "phonepe.com", "okta.com", "auth0.com", "recaptcha.net",
             "hcaptcha.com", "challenges.cloudflare.com", "twitter.com", "x.com", "discord.com",
-            "linkedin.com", "yahoo.com", "amazon.com", "line.me", "naver.com", "kakao.com"
+            "linkedin.com", "yahoo.com", "amazon.com", "line.me", "naver.com", "kakao.com",
+            "razorpay.com", "paytm.com", "paytmpayments.com", "payu.in", "payu.com", "payumoney.com", "cashfree.com",
+            "juspay.in", "juspay.io", "billdesk.com", "ccavenue.com", "braintreegateway.com", "adyen.com",
+            "checkout.com", "cybersource.com", "npci.org.in", "bhimupi.org.in", "google.com", "gstatic.com",
+            "apple.com", "icloud.com", "microsoft.com", "live.com", "bing.com", "duckduckgo.com", "yandex.com",
+            "mastercard.com", "visa.com", "americanexpress.com", "hdfcbank.com", "icicibank.com", "sbi.co.in",
+            "axisbank.com", "kotak.com", "gpay.app.goo.gl", "pay.google.com", "phonepe.com"
         )
 
         // Common two-level public suffixes (approximation of the public suffix list).
