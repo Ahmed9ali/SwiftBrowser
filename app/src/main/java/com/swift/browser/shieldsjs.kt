@@ -58,7 +58,13 @@ const val SHIELDS_JS = """
   // ---------- 2. invisible click-catcher overlays ----------
   // A transparent layer covering most of the screen that exists only to steal the first tap.
   function looksLikeCatcher(el) {
-    if (!el || el === document.body || el === document.documentElement) return false;
+    if (!el || el === document.body || el === document.documentElement || IS_YT) return false;
+    // Only empty div/a/span layers or ad-host iframes can be click-catchers. Never images/media: lazy-loaded
+    // thumbnails are also absolute-positioned and fully transparent until they fade in.
+    var tn = el.tagName;
+    if (tn === 'IFRAME') { if (!adHostUrl(el.src)) return false; }
+    else if (tn !== 'DIV' && tn !== 'A' && tn !== 'SPAN') return false;
+    else if (el.childElementCount > 0) return false;
     var cs = getComputedStyle(el);
     if (cs.position !== 'fixed' && cs.position !== 'absolute') return false;
     var r = el.getBoundingClientRect();
@@ -295,7 +301,7 @@ const val SHIELDS_JS = """
   // Looks only at nodes that were just added (never rescans the page), in small time-boxed batches.
   (function () {
     if (!HOSTS) return;
-    var queue = [], scheduled = false;
+    var queue = [], scheduled = false, tokRuns = 0, tokTimer = 0;
     function hide(e) { try { e.style.setProperty('display', 'none', 'important'); } catch (x) {} }
     function checkEl(e) {
       var u = e.src || e.href;
@@ -355,6 +361,7 @@ const val SHIELDS_JS = """
             for (var j = 0; j < a.length; j++) if (queue.length < 400) queue.push(a[j]);
           }
           schedule();
+          if (TOP && tokRuns < 12 && !tokTimer) { tokTimer = setTimeout(function () { tokTimer = 0; tokRuns++; sendTokens(); }, 1500); }
         }).observe(root, { childList: true, subtree: true });
         // The observer may start after the first nodes were parsed: look at what is already there once.
         queue.push(root); schedule();
