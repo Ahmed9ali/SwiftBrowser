@@ -658,6 +658,7 @@ private fun SwiftBrowserApp() {
     var showMenu by remember { mutableStateOf(false) }
     var tabSection by remember { mutableIntStateOf(0) }
     var showShield by remember { mutableStateOf(false) }
+    val siteShields = remember { SiteShields(context) }
     var showTabs by remember { mutableStateOf(false) }
     var showSuggestions by remember { mutableStateOf(false) }
     var addressFocused by remember { mutableStateOf(false) }
@@ -774,6 +775,14 @@ private fun SwiftBrowserApp() {
     var canGoBack by remember { mutableStateOf(false) }
     var canGoForward by remember { mutableStateOf(false) }
     val currentBlockingEnabled by rememberUpdatedState(blockingEnabled)
+    /** Shields are on globally and not switched off for the site this tab is showing. */
+    fun blockingFor(tabId: Long): Boolean = currentBlockingEnabled && !siteShields.isOff(firstParty[tabId])
+    /** "Block scripts" is a per-site choice; JavaScript is switched before the page loads. */
+    fun applyScriptPolicy(wv: WebView?, url: String?) {
+        if (wv == null || url == null || !url.startsWith("http")) return
+        val want = appSettings.javascript && !siteShields.scriptsBlocked(url)
+        if (wv.settings.javaScriptEnabled != want) wv.settings.javaScriptEnabled = want
+    }
     val currentPrivateMode by rememberUpdatedState(privateMode)
     val isHome = pageUrl == "swift://home"
     var bookmarkRefresh by remember { mutableIntStateOf(0) }
@@ -1015,6 +1024,7 @@ private fun SwiftBrowserApp() {
         updateActiveTab(url, pageTitle, 0)
         unloaded.remove(activeId)
         loadProgress = 5
+        applyScriptPolicy(activeWebView(), url)
         activeWebView()?.loadUrl(url)
         showSuggestions = false
         showTabs = false
@@ -1615,7 +1625,7 @@ private fun SwiftBrowserApp() {
                     try { blocker.blockedHostsJson() } catch (e: Exception) { "{}" }
 
                 @android.webkit.JavascriptInterface
-                fun exempt(host: String?): Boolean = blocker.isExemptPage(host)
+                fun exempt(host: String?): Boolean = blocker.isExemptPage(host) || siteShields.isOff(host)
 
                 @android.webkit.JavascriptInterface
                 fun cosmeticStartup(host: String?): String =
@@ -1698,7 +1708,7 @@ private fun SwiftBrowserApp() {
                     val msg = resultMsg ?: return false
                     val transport = msg.obj as? WebView.WebViewTransport ?: return false
                     val sourceUrl = view?.url ?: firstParty[tabId]
-                    if (currentBlockingEnabled &&
+                    if (blockingFor(tabId) &&
                         !navGuard.decidePopup(tabId, null, sourceUrl, isUserGesture).allowed) {
                         countBlocked(tabId)
                         return false
@@ -1714,7 +1724,7 @@ private fun SwiftBrowserApp() {
                         if (decided) return decidedAllowed
                         if (url.isNullOrBlank() || url.startsWith("about:")) return true
                         decided = true
-                        val v = if (currentBlockingEnabled) navGuard.decidePopup(tabId, url, sourceUrl, true) else null
+                        val v = if (blockingFor(tabId)) navGuard.decidePopup(tabId, url, sourceUrl, true) else null
                         decidedAllowed = v == null || v.allowed
                         val openerHost = sourceUrl?.let { NavigationGuard.host(it) }
                         val targetHost = NavigationGuard.host(url)
@@ -1825,8 +1835,8 @@ private fun SwiftBrowserApp() {
                     request: WebResourceRequest?
                 ): Boolean {
                     val uri = request?.url ?: return false
-                    
-                    if (currentBlockingEnabled && request.isForMainFrame &&
+                    if (request.isForMainFrame) applyScriptPolicy(view, uri.toString())
+                    if (blockingFor(tabId) && request.isForMainFrame &&
                         (uri.scheme == "http" || uri.scheme == "https")) {
                         val v = navGuard.decideNavigation(
                             tabId, uri.toString(), view?.url ?: firstParty[tabId],
@@ -1880,7 +1890,7 @@ private fun SwiftBrowserApp() {
                     // Main-frame navigations are judged by NavigationGuard (shouldOverrideUrlLoading), not here.
                     if (req.isForMainFrame) return null
 
-                    if (currentBlockingEnabled && (blocker.shouldBlock(url, firstParty[tabId] ?: "", false) ||
+                    if (blockingFor(tabId) && (blocker.shouldBlock(url, firstParty[tabId] ?: "", false) ||
                             blocker.engineBlocks(url, firstParty[tabId], req.requestHeaders?.get("Accept")))) {
                         countBlocked(tabId)
                         return blockedResponse(url)
@@ -2212,13 +2222,15 @@ private fun SwiftBrowserApp() {
     }
 
     val activeIsPrivateTab = tabs.firstOrNull { it.id == activeId }?.isPrivate == true
+    // The indigo look belongs to the private tab's homepage only, never to the tab switcher or other pages.
+    val privHome = activeIsPrivateTab && isHome && !showTabs
     SideEffect {
-        // Private tabs always look dark; everything else follows the Theme setting.
-        val d = activeIsPrivateTab || appSettings.isDark(systemDark)
-        if (SwiftPalette.priv != activeIsPrivateTab) SwiftPalette.priv = activeIsPrivateTab
+        // Private pages are dark; everything else follows the Theme setting.
+        val d = (activeIsPrivateTab && !showTabs) || appSettings.isDark(systemDark)
+        if (SwiftPalette.priv != privHome) SwiftPalette.priv = privHome
         if (SwiftPalette.dark != d) SwiftPalette.dark = d
         (context as? android.app.Activity)?.window?.let { w ->
-            val bar = if (activeIsPrivateTab) android.graphics.Color.rgb(26, 20, 66)
+            val bar = if (privHome) android.graphics.Color.rgb(26, 20, 66)
                 else if (d) android.graphics.Color.rgb(16, 17, 20) else android.graphics.Color.rgb(244, 245, 248)
             w.statusBarColor = bar
             w.navigationBarColor = bar
@@ -2269,7 +2281,7 @@ private fun SwiftBrowserApp() {
                 ) {
                 Row(
                     Modifier.fillMaxSize()
-                        .padding(start = 8.dp, end = 14.dp),
+                        .padding(start = 8.dp, end = if (!addressFocused && pageUrl.startsWith("http")) 46.dp else 14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Box(
@@ -2365,6 +2377,16 @@ private fun SwiftBrowserApp() {
                         }
                     )
                 }
+                if (!addressFocused && pageUrl.startsWith("http")) {
+                    val shieldOn = blockingEnabled && siteShields.rev >= 0 && !siteShields.isOff(pageUrl)
+                    Box(
+                        Modifier.align(Alignment.CenterEnd).padding(end = 4.dp).size(40.dp)
+                            .clip(CircleShape).clickable { showShield = true },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        MedievalShield(shieldOn, Modifier.size(22.dp))
+                    }
+                }
                 }
             }
             }
@@ -2421,34 +2443,6 @@ private fun SwiftBrowserApp() {
                         Icon(Icons.Default.Close, "Close", tint = TextMain)
                     }
                 }
-            }
-
-            if (!showTabs && address != "swift://settings" && address != "swift://downloads" &&
-                !(addressFocused && address.isBlank() && pageUrl.startsWith("http"))) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 1.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(
-                    Modifier.weight(1f).clip(RoundedCornerShape(10.dp))
-                        .clickable { showShield = true }.padding(horizontal = 5.dp, vertical = 5.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        Icons.Default.Shield, null,
-                        tint = if (blockingEnabled) Accent else TextMuted,
-                        modifier = Modifier.size(15.dp)
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        if (blockingEnabled) "$blockedCount blocked on this page" else "Shields paused",
-                        color = TextMuted, fontSize = 11.sp
-                    )
-                    Spacer(Modifier.weight(1f))
-                    Text("SHIELDS", color = Accent, fontSize = 9.sp, fontWeight = FontWeight.Medium)
-                    Icon(Icons.Default.ChevronRight, null, tint = TextMuted, modifier = Modifier.size(15.dp))
-                }
-            }
             }
 
             if (!showTabs && !isHome && loadProgress in 1..99) {
@@ -3220,24 +3214,40 @@ private fun SwiftBrowserApp() {
 
                 androidx.compose.animation.AnimatedVisibility(
                     visible = showShield,
-                    enter = fadeIn(tween(130)) + slideInVertically(initialOffsetY = { it / 3 }),
-                    exit = fadeOut(tween(100)) + slideOutVertically(targetOffsetY = { it / 3 }),
-                    modifier = Modifier.align(Alignment.BottomCenter)
+                    enter = fadeIn(tween(130)) + slideInVertically(initialOffsetY = { -it / 6 }),
+                    exit = fadeOut(tween(100)) + slideOutVertically(targetOffsetY = { -it / 6 }),
+                    modifier = Modifier.fillMaxSize()
                 ) {
-                    ShieldDashboard(
-                        enabled = blockingEnabled,
-                        blockedCount = blockedCount,
-                        privateMode = privateMode,
-                        onEnabledChange = { blockingEnabled = it; appSettings.putBlockTrackers(it) },
-                        onPrivateChange = {
-                            privateMode = it
-                            if (it) {
-                                CookieManager.getInstance().removeAllCookies(null)
-                                CookieManager.getInstance().flush()
-                            }
-                        },
-                        onClose = { showShield = false }
-                    )
+                    val siteHost = hostOf(pageUrl)
+                    Box(
+                        Modifier.fillMaxSize().background(Color(0x66000000))
+                            .pointerInput(Unit) { detectTapGestures(onTap = { showShield = false }) }
+                    ) {
+                        ShieldsPanel(
+                            host = siteHost.removePrefix("www."),
+                            siteOn = blockingEnabled && !siteShields.isOff(pageUrl) && siteShields.rev >= 0,
+                            globalOn = blockingEnabled,
+                            blockedCount = blockedCount,
+                            scriptsBlocked = siteShields.scriptsBlocked(pageUrl) && siteShields.rev >= 0,
+                            thirdPartyCookies = appSettings.blockThirdPartyCookies,
+                            onSiteToggle = { on ->
+                                if (on && !blockingEnabled) { blockingEnabled = true; appSettings.putBlockTrackers(true) }
+                                siteShields.setOff(pageUrl, !on)
+                                activeWebView()?.reload()
+                            },
+                            onScripts = { b ->
+                                siteShields.setScriptsBlocked(pageUrl, b)
+                                activeWebView()?.let { applyScriptPolicy(it, pageUrl); it.reload() }
+                            },
+                            onCookies = { b ->
+                                appSettings.putBlockThirdPartyCookies(b)
+                                webViews.values.forEach { appSettings.applyTo(it); applyScriptPolicy(it, it.url) }
+                            },
+                            onGlobal = { showShield = false; load("swift://settings") },
+                            onClose = { showShield = false },
+                            modifier = Modifier.align(Alignment.TopCenter)
+                        )
+                    }
                 }
             }
 
@@ -4196,72 +4206,127 @@ private fun HomeLinkRow(title: String, url: String, icon: ImageVector, onOpen: (
     }
 }
 
+/** A heraldic heater shield with a cross: filled when Shields are up, an outline with a slash when down. */
 @Composable
-private fun ShieldDashboard(
-    enabled: Boolean,
+private fun MedievalShield(on: Boolean, modifier: Modifier = Modifier) {
+    val ink = if (on) Accent else TextMuted
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val path = androidx.compose.ui.graphics.Path().apply {
+            moveTo(w * 0.08f, h * 0.10f)
+            lineTo(w * 0.92f, h * 0.10f)
+            lineTo(w * 0.92f, h * 0.46f)
+            cubicTo(w * 0.92f, h * 0.76f, w * 0.68f, h * 0.91f, w * 0.5f, h * 0.99f)
+            cubicTo(w * 0.32f, h * 0.91f, w * 0.08f, h * 0.76f, w * 0.08f, h * 0.46f)
+            close()
+        }
+        if (on) {
+            drawPath(path, ink)
+            val cross = Color.White.copy(alpha = 0.9f)
+            val sw = w * 0.11f
+            drawLine(cross, Offset(w * 0.5f, h * 0.10f), Offset(w * 0.5f, h * 0.90f), strokeWidth = sw)
+            drawLine(cross, Offset(w * 0.08f, h * 0.37f), Offset(w * 0.92f, h * 0.37f), strokeWidth = sw)
+        } else {
+            drawPath(path, ink, style = androidx.compose.ui.graphics.drawscope.Stroke(width = w * 0.09f))
+            drawLine(ink, Offset(w * 0.14f, h * 0.14f), Offset(w * 0.86f, h * 0.86f), strokeWidth = w * 0.09f)
+        }
+    }
+}
+
+@Composable
+private fun ShieldsPanel(
+    host: String,
+    siteOn: Boolean,
+    globalOn: Boolean,
     blockedCount: Int,
-    privateMode: Boolean,
-    onEnabledChange: (Boolean) -> Unit,
-    onPrivateChange: (Boolean) -> Unit,
-    onClose: () -> Unit
+    scriptsBlocked: Boolean,
+    thirdPartyCookies: Boolean,
+    onSiteToggle: (Boolean) -> Unit,
+    onScripts: (Boolean) -> Unit,
+    onCookies: (Boolean) -> Unit,
+    onGlobal: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
+    var advanced by remember { mutableStateOf(true) }
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(topStart = 25.dp, topEnd = 25.dp))
-            .background(Surface).padding(horizontal = 20.dp).padding(top = 13.dp, bottom = 22.dp)
+        modifier
+            .statusBarsPadding().padding(top = 66.dp)
+            .padding(horizontal = 12.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(28.dp))
+            .background(Bg)
+            .pointerInput(Unit) { detectTapGestures(onTap = {}) }
+            .verticalScroll(rememberScrollState())
+            .padding(10.dp)
     ) {
-        Box(Modifier.width(38.dp).height(4.dp).clip(CircleShape).background(Surface3).align(Alignment.CenterHorizontally))
-        Spacer(Modifier.height(15.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(42.dp).clip(RoundedCornerShape(14.dp)).background(AccentSoft), contentAlignment = Alignment.Center) {
-                Icon(Icons.Default.Shield, null, tint = Accent, modifier = Modifier.size(24.dp))
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(Surface)) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(46.dp).clip(CircleShape).background(Surface2), contentAlignment = Alignment.Center) {
+                    MedievalShield(siteOn, Modifier.size(26.dp))
+                }
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(host.ifBlank { "This site" }, color = TextMain, fontSize = 22.sp, fontWeight = FontWeight.Medium, maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                    Text(
+                        if (siteOn) "Shields up for this site" else if (!globalOn) "Shields are off everywhere" else "Shields down for this site",
+                        color = TextMuted, fontSize = 14.sp
+                    )
+                }
+                Switch(
+                    checked = siteOn, onCheckedChange = onSiteToggle,
+                    colors = SwitchDefaults.colors(checkedTrackColor = Accent, checkedThumbColor = Color.White)
+                )
             }
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text("Privacy dashboard", color = TextMain, fontSize = 19.sp, fontWeight = FontWeight.Medium)
-                Text("Protection for this browsing session", color = TextMuted, fontSize = 11.sp)
+            HorizontalDivider(color = Surface3.copy(alpha = .7f))
+            Row(Modifier.fillMaxWidth().padding(vertical = 16.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                Text(if (siteOn) blockedCount.toString() else "0", color = TextMain, fontSize = 24.sp, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.width(10.dp))
+                Text("Trackers, ads and more blocked.", color = TextMuted, fontSize = 15.sp)
             }
-            IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Close", tint = TextMuted) }
         }
-        Spacer(Modifier.height(17.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            ShieldStat("TRACKERS BLOCKED", blockedCount.toString(), Modifier.weight(1f))
-            ShieldStat("PROTECTION", if (enabled) "On" else "Off", Modifier.weight(1f))
-            ShieldStat("PRIVATE MODE", if (privateMode) "On" else "Off", Modifier.weight(1f))
-        }
-        Spacer(Modifier.height(16.dp))
-        HorizontalDivider(color = Surface3.copy(alpha = .7f))
-        Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.Block, null, tint = Accent)
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text("Ad & tracker blocking", color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                Text("Blocks known tracking domains from the local list", color = TextMuted, fontSize = 10.sp)
+        Spacer(Modifier.height(10.dp))
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(Surface)) {
+            Row(
+                Modifier.fillMaxWidth().clickable { advanced = !advanced }.padding(horizontal = 18.dp, vertical = 16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Advanced controls", color = Accent, fontSize = 17.sp, modifier = Modifier.weight(1f))
+                Icon(if (advanced) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, null, tint = Accent)
             }
-            Switch(checked = enabled, onCheckedChange = onEnabledChange)
-        }
-        HorizontalDivider(color = Surface3.copy(alpha = .7f))
-        Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.VisibilityOff, null, tint = Accent)
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text("Private browsing", color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                Text("Avoids saving new history; clears cookies when enabled", color = TextMuted, fontSize = 10.sp)
+            if (advanced) {
+                HorizontalDivider(color = Surface3.copy(alpha = .7f))
+                ShieldsSwitchRow("Block scripts", scriptsBlocked, onScripts)
+                HorizontalDivider(color = Surface3.copy(alpha = .7f))
+                ShieldsSwitchRow("Block third-party cookies", thirdPartyCookies, onCookies)
+                HorizontalDivider(color = Surface3.copy(alpha = .7f))
+                Row(
+                    Modifier.fillMaxWidth().clickable(onClick = onGlobal).padding(horizontal = 18.dp, vertical = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Shields global settings", color = Accent, fontSize = 17.sp, modifier = Modifier.weight(1f))
+                    Icon(Icons.Default.OpenInNew, null, tint = Accent)
+                }
             }
-            Switch(checked = privateMode, onCheckedChange = onPrivateChange)
         }
-        Spacer(Modifier.height(6.dp))
         Text(
-            "Note: filtering is a lightweight host list, not full EasyList or uBlock-level protection.",
-            color = TextMuted, fontSize = 10.sp
+            "If this site appears broken, try Shields down. This is remembered for this site only.",
+            color = TextMuted, fontSize = 13.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 14.dp)
         )
     }
 }
 
 @Composable
-private fun ShieldStat(label: String, value: String, modifier: Modifier = Modifier) {
-    Column(modifier.clip(RoundedCornerShape(13.dp)).background(Surface2).padding(11.dp)) {
-        Text(value, color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Medium)
-        Text(label, color = TextMuted, fontSize = 8.sp, fontWeight = FontWeight.Medium)
+private fun ShieldsSwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = TextMain, fontSize = 17.sp, modifier = Modifier.weight(1f))
+        Switch(
+            checked = checked, onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(checkedTrackColor = Accent, checkedThumbColor = Color.White)
+        )
     }
 }
 
