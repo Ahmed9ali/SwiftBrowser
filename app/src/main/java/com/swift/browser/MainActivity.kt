@@ -218,6 +218,23 @@ private class BookmarkStore(context: Context, legacy: () -> List<Pair<String, St
 
     fun remove(url: String) = save(list().filterNot { key(it.second) == key(url) })
 
+    fun removeAll(urls: Set<String>) {
+        val keys = urls.map { key(it) }.toSet()
+        save(list().filterNot { key(it.second) in keys })
+    }
+
+    fun replace(oldUrl: String, title: String, url: String) =
+        save(list().map { if (key(it.second) == key(oldUrl)) title to url else it })
+
+    fun move(url: String, delta: Int) {
+        val l = list().toMutableList()
+        val i = l.indexOfFirst { key(it.second) == key(url) }
+        val j = i + delta
+        if (i < 0 || j < 0 || j >= l.size) return
+        val x = l.removeAt(i); l.add(j, x)
+        save(l)
+    }
+
     private fun save(items: List<Pair<String, String>>) {
         val arr = org.json.JSONArray()
         items.forEach { (t, u) -> arr.put(org.json.JSONObject().put("title", t).put("url", u)) }
@@ -1678,13 +1695,11 @@ private fun SwiftBrowserApp() {
                     type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
                 // A plain text link: select the text like anywhere else (the link menu is optional).
                 if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE && !appSettings.linkMenuOnLongPress) {
-                    probeTextAt(wv, lastTouch[0], lastTouch[1])
                     return@setOnLongClickListener false
                 }
                 if ((!isLink && !isImage) || extra == null || extra.startsWith("javascript:")) {
                     if (!isLink && !isImage) {
                         probeVideoAt(wv, tabId, lastTouch[0], lastTouch[1])
-                        probeTextAt(wv, lastTouch[0], lastTouch[1])
                     }
                     return@setOnLongClickListener false
                 }
@@ -2270,7 +2285,7 @@ private fun SwiftBrowserApp() {
                 .statusBarsPadding()
                 .navigationBarsPadding()
         ) {
-            if (!showTabs && address != "swift://settings" && address != "swift://downloads") {
+            if (!showTabs && address != "swift://settings" && address != "swift://downloads" && address != "swift://bookmarks") {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -2705,13 +2720,31 @@ private fun SwiftBrowserApp() {
                     modifier = Modifier.fillMaxSize()
                 ) {
                     val isBookmarks = address == "swift://bookmarks"
-                    LinkLibraryPanel(
-                        title = if (isBookmarks) "Bookmarks" else "History",
-                        entries = if (isBookmarks) bookmarksNow() else store.history(),
-                        icon = if (isBookmarks) Icons.Default.Bookmark else Icons.Default.History,
-                        onOpen = { load(it) },
-                        onClose = { address = if (isHome) "" else pageUrl }
-                    )
+                    if (isBookmarks) {
+                        BookmarksScreen(
+                            entries = bookmarksNow(),
+                            onOpen = { load(it) },
+                            onOpenNewTab = { openUrlInNewTab(it) },
+                            onOpenPrivate = { openUrlInPrivateTab(it) },
+                            onCopyLink = { link ->
+                                val cm = context.getSystemService(android.content.ClipboardManager::class.java)
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("Link", link))
+                                Toast.makeText(context, "Link copied", Toast.LENGTH_SHORT).show()
+                            },
+                            onDelete = { urls -> bookmarkStore.removeAll(urls); bookmarkRefresh++ },
+                            onEdit = { old, t, u -> bookmarkStore.replace(old, t, u); bookmarkRefresh++ },
+                            onMove = { u, d -> bookmarkStore.move(u, d); bookmarkRefresh++ },
+                            onClose = { address = if (isHome) "" else pageUrl }
+                        )
+                    } else {
+                        LinkLibraryPanel(
+                            title = "History",
+                            entries = store.history(),
+                            icon = Icons.Default.History,
+                            onOpen = { load(it) },
+                            onClose = { address = if (isHome) "" else pageUrl }
+                        )
+                    }
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
@@ -2897,7 +2930,9 @@ private fun SwiftBrowserApp() {
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = translateDl != null && !showTabs,
+                    visible = translateDl != null && !showTabs && translateBusy?.first == activeId &&
+                        address != "swift://settings" && address != "swift://downloads" &&
+                        address != "swift://bookmarks" && address != "swift://history",
                     enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { it }),
                     exit = fadeOut(tween(120)) + slideOutVertically(targetOffsetY = { it }),
                     modifier = Modifier.align(Alignment.BottomCenter)
@@ -3321,7 +3356,7 @@ private fun SwiftBrowserApp() {
                 }
             }
 
-            if (address == "swift://settings" || address == "swift://downloads") {
+            if (address == "swift://settings" || address == "swift://downloads" || address == "swift://bookmarks") {
             } else if (showTabs) {
                 Box(
                     Modifier

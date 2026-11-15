@@ -207,6 +207,21 @@ const val SHIELDS_JS = """
       'ytm-mealbar-promo-renderer', 'ytm-paid-content-overlay-renderer', 'ad-slot-renderer'
     ]);
   }
+  // Class names that only ever mean "this is an ad slot" (exact class tokens, so nothing else matches).
+  COSMETIC = COSMETIC.concat([
+    'ins.adsbygoogle', '.adsbygoogle', '[class~="ad-slot"]', '[class~="ad-unit"]', '[class~="adunit"]',
+    '[class~="ad-banner"]', '[class~="ad-container"]', '[class~="ad-wrapper"]', '[class~="ad-placement"]',
+    '[class~="advertisement"]', '[class~="sticky-ad"]', '[class~="ad-sticky"]', '[class~="anchor-ad"]',
+    '[class~="ad-anchor"]', '[class~="ad-preroll"]', '[class~="video-ad"]', '[class~="text-ad"]',
+    '[class~="textad"]', '[class~="google-ad"]', '[id^="google_ads_"]', '[id^="div-gpt-ad"]',
+    '[data-ad-slot]', '[data-ad-client]'
+  ]);
+  if (IS_YT) {
+    COSMETIC = COSMETIC.concat([
+      '.ytp-ad-player-overlay', '.ytp-ad-player-overlay-layout', '.ytp-ad-persistent-progress-bar-container',
+      'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-ads"]'
+    ]);
+  }
   if (EXEMPT) COSMETIC = [];
   var styleEl = null;
   function installStyle() {
@@ -341,6 +356,38 @@ const val SHIELDS_JS = """
       var rj = Response.prototype.json;
       Response.prototype.json = function () { return rj.apply(this, arguments).then(strip); };
     } catch (e) {}
+    // The watch page ships its first player data inline (not through JSON.parse), so strip it on assignment.
+    try {
+      var held;
+      Object.defineProperty(window, 'ytInitialPlayerResponse', {
+        configurable: true,
+        get: function () { return held; },
+        set: function (v) { held = strip(v); }
+      });
+    } catch (e) {}
+    // Whatever still gets through (ads stitched into the video itself): skip to the end and press Skip.
+    (function () {
+      var wasMuted = null;
+      function tick() {
+        try {
+          var p = document.querySelector('.html5-video-player');
+          if (!p) return;
+          var v = p.querySelector('video.html5-main-video') || p.querySelector('video');
+          var ad = p.classList.contains('ad-showing') || p.classList.contains('ad-interrupting');
+          if (ad && v) {
+            if (wasMuted === null) wasMuted = !!v.muted;
+            v.muted = true;
+            if (isFinite(v.duration) && v.duration > 0 && v.currentTime < v.duration - 0.2) v.currentTime = v.duration - 0.05;
+            var b = p.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button-slot button');
+            if (b) b.click();
+          } else if (wasMuted !== null && v) {
+            v.muted = wasMuted;
+            wasMuted = null;
+          }
+        } catch (e) {}
+      }
+      setInterval(tick, 350);
+    })();
   }
 
   // ---------- 6b. late-added ads: ad-host frames/links/images and click-stealing overlays ----------

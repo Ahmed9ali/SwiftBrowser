@@ -617,6 +617,10 @@ private fun LanguagesPage(
 
     fun toast(msg: String) = Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
 
+    /** A pack counts as downloading whichever way it was started (this screen or a page translation). */
+    fun stateOf(code: String): String? =
+        busy[code] ?: if (TranslateEngine.progress.containsKey(code)) "download" else null
+
     fun download(lang: String) {
         if (!TranslateEngine.isOnline(context)) { toast("No internet connection"); return }
         if (settings.wifiOnlyModels && !TranslateEngine.isOnWifi(context)) {
@@ -721,17 +725,17 @@ private fun LanguagesPage(
                 if (haveList.isNotEmpty()) {
                     item(key = "label-have") { SectionLabel("Downloaded") }
                     items(haveList, key = { "d-" + it.first }) { (code, name) ->
-                        LangRow(name, true, busy[code], TranslateEngine.progress[code], { download(code) }, { confirmDelete = code })
+                        LangRow(name, true, stateOf(code), TranslateEngine.progress[code], { download(code) }, { confirmDelete = code })
                     }
                 }
                 item(key = "label-all") { SectionLabel("Available") }
                 items(availableList, key = { "a-" + it.first }) { (code, name) ->
-                    LangRow(name, false, busy[code], TranslateEngine.progress[code], { download(code) }, { confirmDelete = code })
+                    LangRow(name, false, stateOf(code), TranslateEngine.progress[code], { download(code) }, { confirmDelete = code })
                 }
             } else {
                 item(key = "label-results") { SectionLabel("Results") }
                 items(matches, key = { "m-" + it.first }) { (code, name) ->
-                    LangRow(name, code in have, busy[code], TranslateEngine.progress[code], { download(code) }, { confirmDelete = code })
+                    LangRow(name, code in have, stateOf(code), TranslateEngine.progress[code], { download(code) }, { confirmDelete = code })
                 }
             }
         }

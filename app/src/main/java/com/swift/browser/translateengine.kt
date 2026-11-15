@@ -278,18 +278,27 @@ object TranslateEngine {
         }
         // All main models present and offline: this returns at once, or fails fast.
         val limit = if (missing.isEmpty() && !online) OFFLINE_CHECK_TIMEOUT_MS else DOWNLOAD_TIMEOUT_MS
+        // Show these packs as "downloading" in Settings > Languages too, not only in the page's snackbar.
+        missing.forEach { busy[it] = "download"; progress[it] = 0f }
         try {
             withTimeout(limit) {
                 val run: suspend () -> Unit = {
                     translatorFor(src, tgt).downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
                 }
-                if (missing.isNotEmpty()) tracking(context, listOf(src, tgt, "en"), onProgress) { run() } else run()
+                if (missing.isNotEmpty()) {
+                    tracking(context, listOf(src, tgt, "en"), { f -> onProgress(f); missing.forEach { progress[it] = f } }) { run() }
+                } else run()
             }
         } catch (e: TimeoutCancellationException) {
             throw TranslateException(
                 if (online) "Download timed out. Check your connection and try again."
                 else "A language pack is missing. Connect once and download it in Settings > Languages."
             )
+        } finally {
+            if (missing.isNotEmpty()) {
+                missing.forEach { busy.remove(it); progress.remove(it) }
+                doneTick++
+            }
         }
     }
 

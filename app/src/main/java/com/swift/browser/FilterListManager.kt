@@ -42,13 +42,39 @@ class FilterListManager(private val context: Context, private val onReady: (Filt
         }, "swift-filter-lists").apply { priority = Thread.MIN_PRIORITY }.start()
     }
 
+    private val BASELINE = """
+||facebook.com/tr^${'$'}third-party
+||connect.facebook.net/*/fbevents.js${'$'}third-party
+||google-analytics.com^${'$'}third-party
+||googleadservices.com^${'$'}third-party
+||googlesyndication.com^${'$'}third-party
+||doubleclick.net^${'$'}third-party
+||adnxs.com^${'$'}third-party
+||taboola.com^${'$'}third-party
+||outbrain.com^${'$'}third-party
+||criteo.net^${'$'}third-party
+||criteo.com^${'$'}third-party
+||amazon-adsystem.com^${'$'}third-party
+||scorecardresearch.com^${'$'}third-party
+||quantserve.com^${'$'}third-party
+||hotjar.com^${'$'}third-party
+||clarity.ms^${'$'}third-party
+||openfpcdn.io^
+||ads-twitter.com^${'$'}third-party
+||analytics.tiktok.com^${'$'}third-party
+||snap.licdn.com^${'$'}third-party
+||pinimg.com/ct/^${'$'}third-party
+||redditstatic.com/ads/^${'$'}third-party
+""".trimIndent()
+
     private fun file(l: ListDef) = File(dir, l.name + ".txt")
 
     private fun rebuild() {
         val files = lists.map { file(it) }.filter { it.exists() && it.length() > 0 }
-        if (files.isEmpty()) return
         val t0 = System.currentTimeMillis()
         val b = FilterEngine.Builder()
+        // Always-on basics, so blocking works even before the first list download finishes (or offline).
+        b.addLines(BASELINE.lineSequence())
         for (f in files) f.bufferedReader().use { r -> b.addLines(r.lineSequence()) }
         val e = b.build()
         Log.d(TAG, "engine ready: ${e.networkRuleCount} network, ${e.cosmeticRuleCount} cosmetic rules in ${System.currentTimeMillis() - t0} ms")
