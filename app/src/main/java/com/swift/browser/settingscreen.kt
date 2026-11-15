@@ -56,14 +56,14 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 // Same palette as the browser (file-private there, so repeated here).
-private val SBg = Color(0xFF101114)
-private val SRowBg = Color(0xFF23262B)
-private val SSurface = Color(0xFF1A1C20)
-private val SSurface3 = Color(0xFF30343B)
+private val SBg get() = themed(0xFF101114, 0xFFF4F5F8)
+private val SRowBg get() = themed(0xFF23262B, 0xFFFFFFFF)
+private val SSurface get() = themed(0xFF1A1C20, 0xFFFFFFFF)
+private val SSurface3 get() = themed(0xFF30343B, 0xFFDDE0E7)
 private val SAccent = Color(0xFFFF6B35)
-private val SText = Color(0xFFF4F4F5)
-private val SMuted = Color(0xFF9A9DA5)
-private val SIcon = Color(0xFFD7D9DE)
+private val SText get() = themed(0xFFF4F4F5, 0xFF16181C)
+private val SMuted get() = themed(0xFF9A9DA5, 0xFF666B76)
+private val SIcon get() = themed(0xFFD7D9DE, 0xFF4A4E57)
 
 // =====================================================================
 //  Saved settings. Every value is persisted and survives restarts.
@@ -110,6 +110,15 @@ class AppSettings(context: Context) {
         private set
     var downloadNotifications by mutableStateOf(sp.getBoolean("dlNotify", true))
         private set
+    /** "system", "light" or "dark". */
+    var themeMode by mutableStateOf(sp.getString("theme", "system") ?: "system")
+        private set
+    /** Long-press on a text link: false = select the text, true = show the link menu. */
+    var linkMenuOnLongPress by mutableStateOf(sp.getBoolean("linkMenu", false))
+        private set
+    /** Darken web pages too when the browser is dark. */
+    var darkWeb by mutableStateOf(sp.getBoolean("webDark", true))
+        private set
     var translateTarget by mutableStateOf(
         sp.getString("tTarget", null) ?: (TranslateEngine.normalize(Locale.getDefault().language) ?: "en")
     )
@@ -130,6 +139,10 @@ class AppSettings(context: Context) {
     fun putAutoOpenPdf(v: Boolean) { autoOpenPdf = v; sp.edit().putBoolean("dlPdf", v).apply() }
     fun putAutoOpenDownloads(v: Boolean) { autoOpenDownloads = v; sp.edit().putBoolean("dlOpen", v).apply() }
     fun putDownloadNotifications(v: Boolean) { downloadNotifications = v; sp.edit().putBoolean("dlNotify", v).apply() }
+    fun putLinkMenuOnLongPress(v: Boolean) { linkMenuOnLongPress = v; sp.edit().putBoolean("linkMenu", v).apply() }
+    fun putThemeMode(v: String) { themeMode = v; sp.edit().putString("theme", v).apply() }
+    fun putDarkWeb(v: Boolean) { darkWeb = v; sp.edit().putBoolean("webDark", v).apply() }
+    fun isDark(systemDark: Boolean): Boolean = when (themeMode) { "dark" -> true; "light" -> false; else -> systemDark }
     fun putTranslateTarget(v: String) { translateTarget = v; sp.edit().putString("tTarget", v).apply() }
 
     /** Search address for the chosen engine. */
@@ -153,6 +166,33 @@ class AppSettings(context: Context) {
         s.mediaPlaybackRequiresUserGesture = blockAutoplay
         if (Build.VERSION.SDK_INT >= 26) s.safeBrowsingEnabled = safeBrowsing
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, !blockThirdPartyCookies)
+        applyWebTheme(wv, SwiftPalette.dark && darkWeb)
+    }
+
+    /**
+     * Darkens (or not) the page itself. WebView's own darkening changes background, text,
+     * links and borders together and leaves photos and video alone; sites that ship their own
+     * dark style keep it.
+     */
+    @Suppress("DEPRECATION")
+    fun applyWebTheme(wv: WebView, dark: Boolean) {
+        try {
+            val f = androidx.webkit.WebViewFeature
+            if (f.isFeatureSupported(f.ALGORITHMIC_DARKENING)) {
+                androidx.webkit.WebSettingsCompat.setAlgorithmicDarkeningAllowed(wv.settings, dark)
+            } else if (f.isFeatureSupported(f.FORCE_DARK)) {
+                androidx.webkit.WebSettingsCompat.setForceDark(
+                    wv.settings,
+                    if (dark) androidx.webkit.WebSettingsCompat.FORCE_DARK_ON else androidx.webkit.WebSettingsCompat.FORCE_DARK_OFF
+                )
+                if (f.isFeatureSupported(f.FORCE_DARK_STRATEGY)) {
+                    androidx.webkit.WebSettingsCompat.setForceDarkStrategy(
+                        wv.settings, androidx.webkit.WebSettingsCompat.DARK_STRATEGY_PREFER_WEB_THEME_OVER_USER_AGENT_DARKENING
+                    )
+                }
+            }
+        } catch (_: Exception) {}
+        wv.setBackgroundColor(if (dark) 0xFF101114.toInt() else android.graphics.Color.WHITE)
     }
 }
 
@@ -170,6 +210,8 @@ private data class SettingHit(
 private fun settingIndex(): List<SettingHit> = listOf(
     SettingHit("Search engine", "Settings", "search engine brave google duckduckgo bing", "dialog:search", Icons.Default.Search),
     SettingHit("Block ads and trackers", "Privacy and security", "ads trackers block shields", "privacy", Icons.Default.Shield),
+    SettingHit("Theme", "Appearance", "theme dark light system night mode appearance", "dialog:theme", Icons.Default.Public),
+    SettingHit("Darken websites", "Appearance", "dark websites pages night mode force dark", "appearance", Icons.Default.Public),
     SettingHit("Private browsing", "Privacy and security", "private incognito history", "privacy", Icons.Default.VisibilityOff),
     SettingHit("Block third-party cookies", "Privacy and security", "cookies third party tracking", "privacy", Icons.Default.Lock),
     SettingHit("Safe Browsing", "Privacy and security", "safe browsing dangerous phishing malware", "privacy", Icons.Default.Shield),
@@ -241,6 +283,7 @@ fun SettingsScreen(
                 onWebSettingsChanged, onOpenPrivacyDashboard, { dialog = "clear" }, back
             )
             "site" -> SitePage(settings, onWebSettingsChanged, back)
+            "appearance" -> AppearancePage(settings, onWebSettingsChanged, { dialog = "theme" }, back)
             "access" -> AccessibilityPage(settings, onWebSettingsChanged, back)
             "languages" -> LanguagesPage(settings, { page = "never" }, { dialog = "target" }, back)
             "never" -> NeverTranslatePage(back)
@@ -262,6 +305,13 @@ fun SettingsScreen(
             options = AppSettings.ENGINES,
             selected = settings.searchEngine,
             onSelect = { settings.putSearchEngine(it); dialog = null },
+            onDismiss = { dialog = null }
+        )
+        "theme" -> ChoiceDialog(
+            title = "Theme",
+            options = listOf("system" to "System default", "light" to "Light", "dark" to "Dark"),
+            selected = settings.themeMode,
+            onSelect = { settings.putThemeMode(it); dialog = null },
             onDismiss = { dialog = null }
         )
         "target" -> ChoiceDialog(
@@ -362,6 +412,13 @@ private fun MainPage(
                             onClick = { onGo("dialog:search") }
                         ) { Chevron() }
                     }
+                    item {
+                        SRow(
+                            Icons.Default.Public, "Appearance",
+                            "Theme: " + when (settings.themeMode) { "dark" -> "Dark"; "light" -> "Light"; else -> "System default" },
+                            onClick = { onGo("appearance") }
+                        ) { Chevron() }
+                    }
                     item { SRow(Icons.Default.Shield, "Privacy and security", null, onClick = { onGo("privacy") }) { Chevron() } }
                     item { SRow(Icons.Default.Public, "Site settings", null, onClick = { onGo("site") }) { Chevron() } }
                     item { SRow(Icons.Default.Accessibility, "Accessibility", null, onClick = { onGo("access") }) { Chevron() } }
@@ -458,8 +515,38 @@ private fun SitePage(settings: AppSettings, onWebSettingsChanged: () -> Unit, on
                 }
             }
             item {
+                SRow(Icons.Default.Code, "Link menu on long-press", "Off: long-press on link text selects it. On: it opens the link menu.") {
+                    SSwitch(settings.linkMenuOnLongPress) { settings.putLinkMenuOnLongPress(it) }
+                }
+            }
+            item {
                 SRow(Icons.Default.PlayArrow, "Block autoplay", "Video and audio start only when you tap play") {
                     SSwitch(settings.blockAutoplay) { settings.putBlockAutoplay(it); onWebSettingsChanged() }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppearancePage(
+    settings: AppSettings,
+    onWebSettingsChanged: () -> Unit,
+    openTheme: () -> Unit,
+    onBack: () -> Unit
+) {
+    PageScaffold("Appearance", onBack) {
+        CardGroup {
+            item {
+                SRow(
+                    Icons.Default.Public, "Theme",
+                    when (settings.themeMode) { "dark" -> "Dark"; "light" -> "Light"; else -> "System default" },
+                    onClick = openTheme
+                ) { Chevron() }
+            }
+            item {
+                SRow(Icons.Default.Image, "Darken websites", "When the browser is dark, pages are darkened too. Photos and videos stay as they are.") {
+                    SSwitch(settings.darkWeb) { settings.putDarkWeb(it); onWebSettingsChanged() }
                 }
             }
         }
@@ -516,7 +603,7 @@ private fun LanguagesPage(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var downloaded by remember { mutableStateOf<Set<String>?>(null) }
-    val busy = remember { mutableStateMapOf<String, String>() }
+    val busy = TranslateEngine.busy
     var query by remember { mutableStateOf("") }
     var confirmDelete by remember { mutableStateOf<String?>(null) }
     val neverCount = remember {
@@ -524,8 +611,8 @@ private fun LanguagesPage(
             .getStringSet("never", emptySet()) ?: emptySet()).size
     }
 
-    LaunchedEffect(Unit) {
-        downloaded = runCatching { TranslateEngine.downloadedLanguages() }.getOrDefault(emptySet())
+    LaunchedEffect(TranslateEngine.doneTick) {
+        downloaded = runCatching { TranslateEngine.downloadedLanguages() }.getOrDefault(downloaded ?: emptySet())
     }
 
     // English is the built-in bridge language; it is not listed or deletable.
@@ -546,19 +633,9 @@ private fun LanguagesPage(
             toast("Wi-Fi only is on. Connect to Wi-Fi or turn it off in Languages settings.")
             return
         }
-        scope.launch {
-            busy[lang] = "download"
-            try {
-                TranslateEngine.downloadWithDependencies(context, lang, settings.translateTarget)
-                downloaded = runCatching { TranslateEngine.downloadedLanguages() }.getOrDefault((downloaded ?: emptySet()) + lang)
-                toast("${TranslateEngine.displayName(lang)} is ready offline")
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                toast(e.message ?: "Download failed")
-            } finally {
-                busy.remove(lang)
-            }
+        val app = context.applicationContext
+        TranslateEngine.launchDownload(context, lang, settings.translateTarget) { msg ->
+            Toast.makeText(app, msg, Toast.LENGTH_LONG).show()
         }
     }
 

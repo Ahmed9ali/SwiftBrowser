@@ -44,6 +44,37 @@ object TranslateEngine {
     /** Download progress (0..1) per language code while its pack is being downloaded. */
     val progress = mutableStateMapOf<String, Float>()
 
+    /** Languages being downloaded or deleted right now ("download" / "delete"). Lives here, not in a screen. */
+    val busy = mutableStateMapOf<String, String>()
+
+    /** Bumped whenever a download or delete finishes, so open screens reload the list. */
+    var doneTick by androidx.compose.runtime.mutableIntStateOf(0)
+
+    // Downloads must outlive the Languages screen: leaving it used to cancel the coroutine,
+    // which made the row show the download button again while the pack still downloaded.
+    private val appScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate
+    )
+
+    fun launchDownload(context: Context, lang: String, target: String, notify: (String) -> Unit) {
+        if (busy.containsKey(lang)) return
+        val app = context.applicationContext
+        busy[lang] = "download"
+        appScope.launch {
+            try {
+                downloadWithDependencies(app, lang, target)
+                notify(displayName(lang) + " is ready offline")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                notify(e.message ?: "Download failed")
+            } finally {
+                busy.remove(lang)
+                doneTick++
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- download progress
 
     /** ML Kit downloads its packs through Android's DownloadManager; read how far they are. */

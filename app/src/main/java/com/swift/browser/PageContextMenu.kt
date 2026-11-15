@@ -73,10 +73,10 @@ import java.net.URL
 /** What was under the finger: a link, an image, or an image that is also a link. */
 data class ContextTarget(val linkUrl: String?, val linkText: String?, val imageUrl: String?)
 
-private val MenuBg = Color(0xFF2F3135)
-private val MenuText = Color(0xFFF1F1F3)
-private val MenuMuted = Color(0xFFA9ACB3)
-private val MenuLine = Color(0xFF4A4D53)
+private val MenuBg get() = themed(0xFF2F3135, 0xFFFFFFFF)
+private val MenuText get() = themed(0xFFF1F1F3, 0xFF16181C)
+private val MenuMuted get() = themed(0xFFA9ACB3, 0xFF666B76)
+private val MenuLine get() = themed(0xFF4A4D53, 0xFFDDE0E7)
 
 // ------------------------------------------------------------------ helpers
 

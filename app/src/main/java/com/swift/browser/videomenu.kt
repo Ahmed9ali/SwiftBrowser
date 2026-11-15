@@ -23,10 +23,10 @@ import androidx.compose.ui.window.Dialog
 /** What was long-pressed: the video's direct file URL when the page exposes one. */
 data class VideoTarget(val src: String?, val filename: String)
 
-private val VSurface = Color(0xFF2E3138)
-private val VLine = Color(0xFF4A4E57)
-private val VText = Color(0xFFF1F2F4)
-private val VMuted = Color(0xFF8E929B)
+private val VSurface get() = themed(0xFF2E3138, 0xFFFFFFFF)
+private val VLine get() = themed(0xFF4A4E57, 0xFFDDE0E7)
+private val VText get() = themed(0xFFF1F2F4, 0xFF16181C)
+private val VMuted get() = themed(0xFF8E929B, 0xFF666B76)
 
 /** Brave-style menu for a long-pressed video. */
 @Composable

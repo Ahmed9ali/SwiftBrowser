@@ -126,6 +126,21 @@ object DownloadEngine {
         return id
     }
 
+    /** A file the page made itself (blob: / data: link): copy it into Downloads and list it as finished. */
+    fun addLocalFile(filename: String, mime: String?, file: File) {
+        val size = file.length()
+        main.post {
+            val id = System.currentTimeMillis()
+            val item = DownloadItem(
+                id = id, url = "local:$filename", filename = filename, mime = mime,
+                state = DlState.RUNNING, done = size, total = size
+            )
+            items.add(0, item)
+            onTick?.invoke()
+            Thread({ finish(id, file, item, size) }, "swift-local-save").start()
+        }
+    }
+
     /** Tap on a row while downloading. */
     fun pause(id: Long) {
         val i = indexOf(id)

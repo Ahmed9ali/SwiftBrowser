@@ -32,12 +32,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-private val DBg = Color(0xFF101114)
-private val DLine = Color(0xFF30343B)
-private val DText = Color(0xFFF4F4F5)
-private val DMuted = Color(0xFF9A9DA5)
+private val DBg get() = themed(0xFF101114, 0xFFF4F5F8)
+private val DLine get() = themed(0xFF30343B, 0xFFDDE0E7)
+private val DText get() = themed(0xFFF4F4F5, 0xFF16181C)
+private val DMuted get() = themed(0xFF9A9DA5, 0xFF666B76)
 private val DAccent = Color(0xFFFF6B35)
-private val DRing = Color(0xFFB9C3FF)
+private val DRing get() = themed(0xFFB9C3FF, 0xFF4B5BD6)
 
 private fun kindOf(d: DownloadItem): String {
     val m = d.mime ?: ""
@@ -170,7 +170,7 @@ fun DownloadsScreen(onClose: () -> Unit, onOpenSettings: () -> Unit) {
                 Row(
                     Modifier.clip(shape)
                         .border(1.dp, if (on) Color.Transparent else DLine, shape)
-                        .background(if (on) Color(0xFF343A6B) else Color.Transparent)
+                        .background(if (on) themed(0xFF343A6B, 0xFFDCE0FF) else Color.Transparent)
                         .clickable { filter = name }
                         .padding(horizontal = 14.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -209,7 +209,7 @@ fun DownloadsScreen(onClose: () -> Unit, onOpenSettings: () -> Unit) {
         modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(12.dp)
     ) { data ->
         Snackbar(
-            snackbarData = data, containerColor = Color(0xFF2B2E34),
+            snackbarData = data, containerColor = themed(0xFF2B2E34, 0xFF2B2E34),
             contentColor = DText, actionColor = DRing, shape = RoundedCornerShape(16.dp)
         )
     }
@@ -287,7 +287,7 @@ private fun DownloadRowItem(d: DownloadItem, fmt: (Long) -> String, onRemove: (D
                 )
             } else {
                 Box(
-                    Modifier.fillMaxSize().clip(CircleShape).background(Color(0xFF1B1D21)),
+                    Modifier.fillMaxSize().clip(CircleShape).background(themed(0xFF1B1D21, 0xFFE9EBF0)),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(

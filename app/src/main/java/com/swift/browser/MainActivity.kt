@@ -127,15 +127,17 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 
-private val Bg = Color(0xFF101114)
-private val Surface = Color(0xFF1A1C20)
-private val Surface2 = Color(0xFF25282E)
-private val Surface3 = Color(0xFF30343B)
+private val Bg get() = themed(0xFF101114, 0xFFF4F5F8)
+private val Surface get() = themed(0xFF1A1C20, 0xFFFFFFFF)
+private val Surface2 get() = themed(0xFF25282E, 0xFFE9EBF0)
+private val Surface3 get() = themed(0xFF30343B, 0xFFDDE0E7)
 private val Accent = Color(0xFFFF6B35)
 private val AccentSoft = Color(0x33FF6B35)
-private val TextMain = Color(0xFFF4F4F5)
-private val TextMuted = Color(0xFF9A9DA5)
-private val Green = Color(0xFF65C98A)
+private val TextMain get() = themed(0xFFF4F4F5, 0xFF16181C)
+private val TextMuted get() = themed(0xFF9A9DA5, 0xFF666B76)
+private val Green get() = themed(0xFF65C98A, 0xFF2E9E5B)
+private val LinkInk get() = themed(0xFFA9B4FF, 0xFF3F51D9)
+private val Panel get() = themed(0xFF2F3137, 0xFFFFFFFF)
 
 private class SavedSession(
     val tabs: List<BrowserTab>,
@@ -288,7 +290,16 @@ private const val VIDEO_PROBE_JS = """
   if(x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom&&r.width*r.height<area){v=e;area=r.width*r.height;}});
  if(!v) return '';
  var top=document.elementFromPoint(x,y);
- if(top&&top!==v&&!top.contains(v)&&!v.contains(top)&&(top.innerText||'').trim().length>0) return '';
+ if(top&&top!==v&&!top.contains(v)&&!v.contains(top)){
+  var tn=(top.tagName||'').toLowerCase();
+  if(tn==='textarea'||tn==='input'||tn==='select'||top.isContentEditable) return '';
+  if((top.innerText||'').trim().length>0) return '';
+  try{var cr=document.caretRangeFromPoint&&document.caretRangeFromPoint(x,y);
+   if(cr&&cr.startContainer&&cr.startContainer.nodeType===3&&cr.startContainer.nodeValue.trim().length>0){
+    var rr=document.createRange();rr.selectNodeContents(cr.startContainer);var bb=rr.getClientRects();
+    for(var q=0;q<bb.length;q++){if(x>=bb[q].left&&x<=bb[q].right&&y>=bb[q].top&&y<=bb[q].bottom)return '';}
+   }}catch(e){}
+ }
  window.__swiftLpVideo=v;
  var src=v.currentSrc||v.src||'';
  if(!src||src.indexOf('blob:')===0||/\.m3u8|\.mpd/i.test(src)){
@@ -581,8 +592,18 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
         ) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
-        window.statusBarColor = android.graphics.Color.rgb(16, 17, 20)
-        window.navigationBarColor = android.graphics.Color.rgb(16, 17, 20)
+        val startDark = AppSettings(this).isDark(
+            (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+                android.content.res.Configuration.UI_MODE_NIGHT_YES
+        )
+        SwiftPalette.dark = startDark
+        val startBar = if (startDark) android.graphics.Color.rgb(16, 17, 20) else android.graphics.Color.rgb(244, 245, 248)
+        window.statusBarColor = startBar
+        window.navigationBarColor = startBar
+        androidx.core.view.WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = !startDark
+            isAppearanceLightNavigationBars = !startDark
+        }
         setContent {
             val d = androidx.compose.ui.platform.LocalDensity.current
             androidx.compose.runtime.CompositionLocalProvider(
@@ -1466,7 +1487,18 @@ private fun SwiftBrowserApp() {
         downloadNoticeAt = System.currentTimeMillis()
     }
 
-    fun startDownload(url: String, userAgent: String?, disposition: String?, mime: String?, referer: String?) {
+    fun startDownload(url: String, userAgent: String?, disposition: String?, mime: String?, referer: String?, wv: WebView? = null) {
+        if (url.startsWith("blob:") && wv != null) {
+            BlobDownloads.startBlob(wv, url, URLUtil.guessFileName(url, disposition, mime), mime)
+            downloadNoticeAt = System.currentTimeMillis()
+            return
+        }
+        if (url.startsWith("data:")) {
+            if (BlobDownloads.saveDataUrl(context, url, URLUtil.guessFileName("download", disposition, mime), mime)) {
+                downloadNoticeAt = System.currentTimeMillis()
+                return
+            }
+        }
         if (!url.startsWith("http")) {
             Toast.makeText(context, "This link can't be downloaded", Toast.LENGTH_SHORT).show()
             return
@@ -1512,8 +1544,13 @@ private fun SwiftBrowserApp() {
         }, 300)
     }
 
+    // WebView only darkens pages when its theme is a dark one, so it always gets a dark theme
+    // wrapper; whether pages are actually darkened is switched per tab in AppSettings.applyWebTheme.
+    fun webCtx(ctx: Context): Context =
+        android.view.ContextThemeWrapper(ctx, android.R.style.Theme_Material_NoActionBar)
+
     fun createWebView(ctx: Context, tabId: Long): WebView {
-        return (adoptedViews.remove(tabId) ?: WebView(ctx)).apply {
+        return (adoptedViews.remove(tabId) ?: WebView(webCtx(ctx))).apply {
             setBackgroundColor(android.graphics.Color.rgb(16, 17, 20))
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
@@ -1556,6 +1593,13 @@ private fun SwiftBrowserApp() {
                     Toast.makeText(ctx, error, Toast.LENGTH_LONG).show()
                 }
             ), "SwiftTranslator")
+
+            addJavascriptInterface(BlobDownloads.Bridge(context.applicationContext), "SwiftBlob")
+            if (shieldsAtStart) {
+                runCatching {
+                    androidx.webkit.WebViewCompat.addDocumentStartJavaScript(this, BlobDownloads.HOOK_JS, setOf("*"))
+                }
+            }
 
             addJavascriptInterface(object {
                 @android.webkit.JavascriptInterface
@@ -1614,6 +1658,11 @@ private fun SwiftBrowserApp() {
                     type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
                 val isImage = type == WebView.HitTestResult.IMAGE_TYPE ||
                     type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
+                // A plain text link: select the text like anywhere else (the link menu is optional).
+                if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE && !appSettings.linkMenuOnLongPress) {
+                    probeTextAt(wv, lastTouch[0], lastTouch[1])
+                    return@setOnLongClickListener false
+                }
                 if ((!isLink && !isImage) || extra == null || extra.startsWith("javascript:")) {
                     if (!isLink && !isImage) {
                         probeVideoAt(wv, tabId, lastTouch[0], lastTouch[1])
@@ -1647,7 +1696,7 @@ private fun SwiftBrowserApp() {
                         return false
                     }
                     // Throwaway view: we only learn the destination after it starts loading.
-                    val child = WebView(ctx)
+                    val child = WebView(webCtx(ctx))
                     child.settings.javaScriptEnabled = true
                     child.settings.domStorageEnabled = true
                     val sourcePrivate = tabs.firstOrNull { it.id == tabId }?.isPrivate == true
@@ -1944,7 +1993,7 @@ private fun SwiftBrowserApp() {
             }
 
             setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, _ ->
-                startDownload(downloadUrl, userAgent, contentDisposition, mimeType, this.url)
+                startDownload(downloadUrl, userAgent, contentDisposition, mimeType, this.url, this)
             }
 
             webViews[tabId] = this
@@ -2154,8 +2203,31 @@ private fun SwiftBrowserApp() {
         }
     }
 
+    val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
+    val activeIsPrivateTab = tabs.firstOrNull { it.id == activeId }?.isPrivate == true
+    SideEffect {
+        // Private tabs always look dark; everything else follows the Theme setting.
+        val d = activeIsPrivateTab || appSettings.isDark(systemDark)
+        if (SwiftPalette.priv != activeIsPrivateTab) SwiftPalette.priv = activeIsPrivateTab
+        if (SwiftPalette.dark != d) SwiftPalette.dark = d
+        (context as? android.app.Activity)?.window?.let { w ->
+            val bar = if (d) android.graphics.Color.rgb(16, 17, 20) else android.graphics.Color.rgb(244, 245, 248)
+            w.statusBarColor = bar
+            w.navigationBarColor = bar
+            androidx.core.view.WindowCompat.getInsetsController(w, w.decorView).apply {
+                isAppearanceLightStatusBars = !d
+                isAppearanceLightNavigationBars = !d
+            }
+        }
+    }
+    LaunchedEffect(SwiftPalette.dark, appSettings.darkWeb) {
+        webViews.values.forEach { appSettings.applyTo(it) }
+    }
     MaterialTheme(
-        colorScheme = darkColorScheme(
+        colorScheme = if (SwiftPalette.dark) darkColorScheme(
+            primary = Accent, background = Bg, surface = Surface,
+            onBackground = TextMain, onSurface = TextMain
+        ) else androidx.compose.material3.lightColorScheme(
             primary = Accent, background = Bg, surface = Surface,
             onBackground = TextMain, onSurface = TextMain
         ),
@@ -2817,7 +2889,7 @@ private fun SwiftBrowserApp() {
                             )
                         }
                         TextButton(onClick = { downloadNoticeVisible = false; address = "swift://downloads" }) {
-                            Text("Details", color = Color(0xFFA9B4FF), fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                            Text("Details", color = LinkInk, fontSize = 15.sp, fontWeight = FontWeight.Medium)
                         }
                     }
                 }
@@ -2833,7 +2905,7 @@ private fun SwiftBrowserApp() {
                     val (dlName, dlFrac) = last[0] ?: ("" to 0f)
                     Column(
                         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)
-                            .clip(RoundedCornerShape(16.dp)).background(Color(0xFF2B2E34))
+                            .clip(RoundedCornerShape(16.dp)).background(themed(0xFF2B2E34, 0xFFE6E8EE))
                             .padding(horizontal = 16.dp, vertical = 12.dp)
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -3243,14 +3315,14 @@ private fun SwiftBrowserApp() {
                         Modifier
                             .align(Alignment.Center)
                             .clip(RoundedCornerShape(22.dp))
-                            .background(Color(0xFFE8E8EC))
+                            .background(themed(0xFFE8E8EC, 0xFF2A2D33))
                             .clickable {
                                 if (showTabs && tabSection == 1) newGroupWithTab() else newTab(private = showTabs && tabSection == 2)
                             }
                             .padding(horizontal = 14.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.Add, "New tab", tint = Color(0xFF16181C), modifier = Modifier.size(20.dp))
+                        Icon(Icons.Default.Add, "New tab", tint = themed(0xFF16181C, 0xFFF4F4F5), modifier = Modifier.size(20.dp))
                     }
                     Box(Modifier.align(Alignment.CenterEnd)) {
                         SettingsMenuBox(dots = true)
@@ -3353,7 +3425,7 @@ private fun SwiftBrowserApp() {
                         .widthIn(max = 340.dp)
                         .fillMaxWidth(0.9f)
                         .clip(RoundedCornerShape(26.dp))
-                        .background(Color(0xFF2F3137))
+                        .background(Panel)
                         .pointerInput(Unit) { detectTapGestures(onTap = {}) }
                         .padding(vertical = 8.dp)
                 ) {
@@ -3420,7 +3492,7 @@ private fun SwiftBrowserApp() {
                         .fillMaxWidth(0.84f)
                         .heightIn(max = maxMenuH)
                         .clip(RoundedCornerShape(26.dp))
-                        .background(Color(0xFF2F3137))
+                        .background(Panel)
                         .pointerInput(Unit) { detectTapGestures(onTap = {}) }
                 ) {
                     Column(
@@ -3678,8 +3750,11 @@ private fun GlassCard(modifier: Modifier = Modifier, content: @Composable Column
         modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(24.dp))
-            .background(Brush.verticalGradient(listOf(Color(0x2EFFFFFF), Color(0x14FFFFFF))))
-            .border(1.dp, Color(0x1FFFFFFF), RoundedCornerShape(24.dp))
+            .background(
+                if (SwiftPalette.dark) Brush.verticalGradient(listOf(Color(0x2EFFFFFF), Color(0x14FFFFFF)))
+                else Brush.verticalGradient(listOf(Color(0xE6FFFFFF), Color(0xB3FFFFFF)))
+            )
+            .border(1.dp, if (SwiftPalette.dark) Color(0x1FFFFFFF) else Color(0x14000000), RoundedCornerShape(24.dp))
             .padding(16.dp),
         content = content
     )
@@ -3756,7 +3831,8 @@ private fun HomeScreen(
         Box(
             Modifier.fillMaxSize().background(
                 Brush.verticalGradient(
-                    listOf(Color(0x22000000), Color(0x66000000))
+                    if (SwiftPalette.dark) listOf(Color(0x22000000), Color(0x66000000))
+                    else listOf(Color(0x00FFFFFF), Color(0x33FFFFFF))
                 )
             )
         )
@@ -3770,17 +3846,17 @@ private fun HomeScreen(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(
-                        greeting,
-                        color = Accent, fontSize = 11.sp,
+                        if (SwiftPalette.priv) "PRIVATE BROWSING" else greeting,
+                        color = if (SwiftPalette.priv) Color(0xFFB79CFF) else Accent, fontSize = 11.sp,
                         fontWeight = FontWeight.Medium, letterSpacing = 2.sp
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "Browse freely.",
+                        if (SwiftPalette.priv) "You're incognito." else "Browse freely.",
                         color = TextMain, fontSize = 29.sp, fontWeight = FontWeight.Medium
                     )
                     Text(
-                        "A faster, quieter web starts here.",
+                        if (SwiftPalette.priv) "History and cookies from these tabs aren't kept." else "A faster, quieter web starts here.",
                         color = TextMuted, fontSize = 13.sp
                     )
                 }
@@ -3865,6 +3941,32 @@ private fun HomeScreen(
 
 @Composable
 private fun WallpaperBackdrop(blurred: Boolean) {
+    val look = if (SwiftPalette.priv) 2 else if (SwiftPalette.dark) 0 else 1
+    if (look != 0) {
+        Canvas(Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+            val stops = if (look == 2) listOf(Color(0xFF2A1B4D), Color(0xFF181030), Color(0xFF0B0814))
+                        else listOf(Color(0xFFFFF1E8), Color(0xFFF1F3FA), Color(0xFFE6EAF4))
+            drawRect(Brush.verticalGradient(stops))
+            val glow = if (look == 2) Color(0x558E5BFF) else Color(0x44FF6B35)
+            drawCircle(
+                Brush.radialGradient(listOf(glow, glow.copy(alpha = 0f)), center = Offset(w * 0.85f, h * 0.10f), radius = w * 0.6f),
+                radius = w * 0.6f, center = Offset(w * 0.85f, h * 0.10f)
+            )
+            val glow2 = if (look == 2) Color(0x336B7BFF) else Color(0x335B8DEF)
+            drawCircle(
+                Brush.radialGradient(listOf(glow2, glow2.copy(alpha = 0f)), center = Offset(w * 0.12f, h * 0.38f), radius = w * 0.5f),
+                radius = w * 0.5f, center = Offset(w * 0.12f, h * 0.38f)
+            )
+            if (look == 2) {
+                // a few faint veils so the page reads as "anonymous", not just purple
+                for (i in 0 until 5) {
+                    drawCircle(Color(0x0DFFFFFF), radius = w * (0.18f + i * 0.07f), center = Offset(w * 0.5f, h * 0.72f))
+                }
+            }
+        }
+    } else
     Canvas(Modifier.fillMaxSize()) {
                 val w = size.width
                 val h = size.height
@@ -3912,7 +4014,7 @@ private fun WallpaperBackdrop(blurred: Boolean) {
         enter = fadeIn(tween(200)),
         exit = fadeOut(tween(160))
     ) {
-        val blurredBitmap = remember { renderWallpaperBitmap() }
+        val blurredBitmap = remember(look) { renderWallpaperBitmap(look) }
         Image(
             bitmap = blurredBitmap.asImageBitmap(),
             contentDescription = null,
@@ -3923,7 +4025,7 @@ private fun WallpaperBackdrop(blurred: Boolean) {
     }
 }
 
-private fun renderWallpaperBitmap(): Bitmap {
+private fun renderWallpaperBitmap(look: Int = 0): Bitmap {
     val w = 64
     val h = 144
     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -3931,10 +4033,12 @@ private fun renderWallpaperBitmap(): Bitmap {
     val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
     paint.shader = android.graphics.LinearGradient(
         0f, 0f, 0f, h.toFloat(),
-        0xFF1C2540.toInt(), 0xFF101114.toInt(),
+        when (look) { 2 -> 0xFF2A1B4D.toInt(); 1 -> 0xFFFFF1E8.toInt(); else -> 0xFF1C2540.toInt() },
+        when (look) { 2 -> 0xFF0B0814.toInt(); 1 -> 0xFFE6EAF4.toInt(); else -> 0xFF101114.toInt() },
         android.graphics.Shader.TileMode.CLAMP
     )
     canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
+    if (look != 0) return bmp
     paint.shader = android.graphics.RadialGradient(
         w * 0.85f, h * 0.10f, w * 0.55f,
         0x59FF6B35.toInt(), 0x00FF6B35.toInt(),
@@ -4131,7 +4235,7 @@ private fun SingleTabCard(
         modifier
             .fillMaxSize()
             .clip(RoundedCornerShape(16.dp))
-            .background(if (isActive) Color(0xFF2A2119) else Surface)
+            .background(if (isActive) themed(0xFF2A2119, 0xFFFFE9DC) else Surface)
             .border(
                 width = when {
                     hovered -> 2.dp
@@ -4252,7 +4356,7 @@ private fun GroupCard(
                         if (member != null && !overflow) {
                             PagePreview(
                                 member, Modifier.weight(1f).fillMaxHeight(),
-                                compact = true, tint = Color(0xFF23262C)
+                                compact = true, tint = themed(0xFF23262C, 0xFFE3E5EB)
                             )
                         } else {
                             Box(
@@ -5003,7 +5107,7 @@ private fun GroupPopupOverlay(
                     .padding(horizontal = 16.dp)
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(30.dp))
-                    .background(Color(0xFF202226))
+                    .background(themed(0xFF202226, 0xFFFFFFFF))
                     .pointerInput(Unit) { detectTapGestures(onTap = {}) }
                     .padding(top = 8.dp, bottom = 12.dp)
             ) {
@@ -5409,7 +5513,7 @@ private fun SearchResultRow(
             )
             if (subtitle != null) {
                 Text(
-                    subtitle, color = Color(0xFFA9B4FF), fontSize = 13.sp, maxLines = 1,
+                    subtitle, color = LinkInk, fontSize = 13.sp, maxLines = 1,
                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                 )
             }
@@ -5444,17 +5548,17 @@ private fun TabSearchScreen(
     }
     val groupMatches = if (term.isEmpty()) emptyList() else tabs.mapNotNull { groups[it.id] }.distinct()
         .filter { gid -> groupNames[gid]?.contains(term, true) == true }
-    val cardBg = Color(0xFF1B1D21)
+    val cardBg = themed(0xFF1B1D21, 0xFFFFFFFF)
 
     Column(
         Modifier.fillMaxSize()
-            .background(Color(0xFF25282E))
+            .background(themed(0xFF25282E, 0xFFE9EBF0))
             .pointerInput(Unit) { detectTapGestures(onTap = {}) }
             .padding(horizontal = 12.dp)
     ) {
         Row(
             Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 10.dp).height(52.dp)
-                .clip(RoundedCornerShape(26.dp)).background(Color(0xFF15171A)).padding(horizontal = 6.dp),
+                .clip(RoundedCornerShape(26.dp)).background(themed(0xFF15171A, 0xFFFFFFFF)).padding(horizontal = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Back", tint = TextMain) }
@@ -5635,7 +5739,7 @@ private data class Settle(val source: Long, val target: Long, val from: Offset, 
 private fun groupColorOf(key: Long): Color =
     GroupColors[(GroupColorStore[key] ?: (key % GroupColors.size).toInt()).coerceIn(0, GroupColors.size - 1)]
 
-private fun groupTint(c: Color): Color = lerp(Color(0xFF16181C), c, 0.34f)
+private fun groupTint(c: Color): Color = lerp(themed(0xFF16181C, 0xFFFFFFFF), c, if (SwiftPalette.dark) 0.34f else 0.22f)
 
 private fun groupLabel(names: Map<Long, String>, key: Long, count: Int): String =
     names[key]?.takeIf { it.isNotBlank() } ?: if (count == 1) "1 tab" else "$count tabs"
@@ -5829,7 +5933,7 @@ private fun PagePreview(
             if (compact) {
                 Box(
                     Modifier.align(Alignment.TopStart).padding(4.dp).size(22.dp)
-                        .clip(CircleShape).background(Color(0xCC1A1C20)),
+                        .clip(CircleShape).background(themed(0xCC1A1C20, 0xCCFFFFFF)),
                     contentAlignment = Alignment.Center
                 ) {
                     SiteBadge(tab, 15.dp)
