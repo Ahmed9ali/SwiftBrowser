@@ -2,7 +2,10 @@ package com.swift.browser
 
 import android.app.DownloadManager
 import android.content.Context
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.setValue
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -48,7 +51,7 @@ object TranslateEngine {
     val busy = mutableStateMapOf<String, String>()
 
     /** Bumped whenever a download or delete finishes, so open screens reload the list. */
-    var doneTick by androidx.compose.runtime.mutableIntStateOf(0)
+    var doneTick by mutableIntStateOf(0)
 
     // Downloads must outlive the Languages screen: leaving it used to cancel the coroutine,
     // which made the row show the download button again while the pack still downloaded.

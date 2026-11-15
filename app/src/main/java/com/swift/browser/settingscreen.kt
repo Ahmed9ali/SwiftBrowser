@@ -174,22 +174,10 @@ class AppSettings(context: Context) {
      * links and borders together and leaves photos and video alone; sites that ship their own
      * dark style keep it.
      */
-    @Suppress("DEPRECATION")
     fun applyWebTheme(wv: WebView, dark: Boolean) {
         try {
-            val f = androidx.webkit.WebViewFeature
-            if (f.isFeatureSupported(f.ALGORITHMIC_DARKENING)) {
+            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.ALGORITHMIC_DARKENING)) {
                 androidx.webkit.WebSettingsCompat.setAlgorithmicDarkeningAllowed(wv.settings, dark)
-            } else if (f.isFeatureSupported(f.FORCE_DARK)) {
-                androidx.webkit.WebSettingsCompat.setForceDark(
-                    wv.settings,
-                    if (dark) androidx.webkit.WebSettingsCompat.FORCE_DARK_ON else androidx.webkit.WebSettingsCompat.FORCE_DARK_OFF
-                )
-                if (f.isFeatureSupported(f.FORCE_DARK_STRATEGY)) {
-                    androidx.webkit.WebSettingsCompat.setForceDarkStrategy(
-                        wv.settings, androidx.webkit.WebSettingsCompat.DARK_STRATEGY_PREFER_WEB_THEME_OVER_USER_AGENT_DARKENING
-                    )
-                }
             }
         } catch (_: Exception) {}
         wv.setBackgroundColor(if (dark) 0xFF101114.toInt() else android.graphics.Color.WHITE)
