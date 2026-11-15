@@ -127,17 +127,17 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 
-private val Bg get() = themed(0xFF101114, 0xFFF4F5F8)
-private val Surface get() = themed(0xFF1A1C20, 0xFFFFFFFF)
-private val Surface2 get() = themed(0xFF25282E, 0xFFE9EBF0)
-private val Surface3 get() = themed(0xFF30343B, 0xFFDDE0E7)
+private val Bg get() = themed(0xFF101114, 0xFFF4F5F8, 0xFF1A1442)
+private val Surface get() = themed(0xFF1A1C20, 0xFFFFFFFF, 0xFF241C5A)
+private val Surface2 get() = themed(0xFF25282E, 0xFFE9EBF0, 0xFF2E2570)
+private val Surface3 get() = themed(0xFF30343B, 0xFFDDE0E7, 0xFF3B3189)
 private val Accent = Color(0xFFFF6B35)
 private val AccentSoft = Color(0x33FF6B35)
 private val TextMain get() = themed(0xFFF4F4F5, 0xFF16181C)
 private val TextMuted get() = themed(0xFF9A9DA5, 0xFF666B76)
 private val Green get() = themed(0xFF65C98A, 0xFF2E9E5B)
 private val LinkInk get() = themed(0xFFA9B4FF, 0xFF3F51D9)
-private val Panel get() = themed(0xFF2F3137, 0xFFFFFFFF)
+private val Panel get() = themed(0xFF2F3137, 0xFFFFFFFF, 0xFF2A2166)
 
 private class SavedSession(
     val tabs: List<BrowserTab>,
@@ -623,6 +623,12 @@ private fun SwiftBrowserApp() {
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val store = remember { BrowserStore(context) }
     val appSettings = remember { AppSettings(context) }
+    val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
+    appSettings.systemDark = systemDark
+    // Whether web pages get darkened. Decided when a WebView is created (its theme sets the
+    // page's colour scheme), so a change recreates the screen; see the effect further down.
+    val webDarkEff = appSettings.isDark(systemDark) && appSettings.darkWeb
+    val webDarkAtStart = remember { webDarkEff }
     val uiScope = rememberCoroutineScope()
     val blocker = remember { TrackerBlocker(context) }
     remember { FilterListManager(context) { eng -> blocker.engine = eng }.also { it.start() } }
@@ -1546,8 +1552,10 @@ private fun SwiftBrowserApp() {
 
     // WebView only darkens pages when its theme is a dark one, so it always gets a dark theme
     // wrapper; whether pages are actually darkened is switched per tab in AppSettings.applyWebTheme.
-    fun webCtx(ctx: Context): Context =
-        android.view.ContextThemeWrapper(ctx, android.R.style.Theme_Material_NoActionBar)
+    fun webCtx(ctx: Context): Context = android.view.ContextThemeWrapper(
+        ctx,
+        if (webDarkAtStart) android.R.style.Theme_Material_NoActionBar else android.R.style.Theme_Material_Light_NoActionBar
+    )
 
     fun createWebView(ctx: Context, tabId: Long): WebView {
         return (adoptedViews.remove(tabId) ?: WebView(webCtx(ctx))).apply {
@@ -1619,7 +1627,7 @@ private fun SwiftBrowserApp() {
             }, "SwiftFilter")
             addJavascriptInterface(object {
                 @android.webkit.JavascriptInterface
-                fun tap(href: String?) { navGuard.recordTap(tabId, href) }
+                fun tap(href: String?, control: Boolean) { navGuard.recordTap(tabId, href, control) }
 
                 @android.webkit.JavascriptInterface
                 fun route(url: String?) { if (url != null && url.startsWith("http")) firstParty[tabId] = url }
@@ -2203,7 +2211,6 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
     val activeIsPrivateTab = tabs.firstOrNull { it.id == activeId }?.isPrivate == true
     SideEffect {
         // Private tabs always look dark; everything else follows the Theme setting.
@@ -2211,7 +2218,8 @@ private fun SwiftBrowserApp() {
         if (SwiftPalette.priv != activeIsPrivateTab) SwiftPalette.priv = activeIsPrivateTab
         if (SwiftPalette.dark != d) SwiftPalette.dark = d
         (context as? android.app.Activity)?.window?.let { w ->
-            val bar = if (d) android.graphics.Color.rgb(16, 17, 20) else android.graphics.Color.rgb(244, 245, 248)
+            val bar = if (activeIsPrivateTab) android.graphics.Color.rgb(26, 20, 66)
+                else if (d) android.graphics.Color.rgb(16, 17, 20) else android.graphics.Color.rgb(244, 245, 248)
             w.statusBarColor = bar
             w.navigationBarColor = bar
             androidx.core.view.WindowCompat.getInsetsController(w, w.decorView).apply {
@@ -2220,8 +2228,8 @@ private fun SwiftBrowserApp() {
             }
         }
     }
-    LaunchedEffect(SwiftPalette.dark, appSettings.darkWeb) {
-        webViews.values.forEach { appSettings.applyTo(it) }
+    LaunchedEffect(webDarkEff) {
+        if (webDarkEff != webDarkAtStart) (context as? android.app.Activity)?.recreate()
     }
     MaterialTheme(
         colorScheme = if (SwiftPalette.dark) darkColorScheme(
@@ -3843,6 +3851,9 @@ private fun HomeScreen(
                 .padding(horizontal = 18.dp)
                 .padding(top = 26.dp, bottom = 20.dp)
         ) {
+          if (SwiftPalette.priv) {
+            PrivateHomeContent()
+          } else {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(
@@ -3935,8 +3946,53 @@ private fun HomeScreen(
                 }
             }
             Spacer(Modifier.height(16.dp))
+          }
         }
     }
+}
+
+@Composable
+private fun PrivateHomeContent() {
+    val ink = Color.White
+    val soft = Color(0xCCFFFFFF)
+    Spacer(Modifier.height(36.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier.size(54.dp).clip(RoundedCornerShape(18.dp))
+                .background(Brush.linearGradient(listOf(Accent, Color(0xFFB83F25)))),
+            contentAlignment = Alignment.Center
+        ) { Icon(Icons.Default.Shield, null, tint = Color.White, modifier = Modifier.size(29.dp)) }
+        Spacer(Modifier.width(16.dp))
+        Text("Private tab", color = ink, fontSize = 32.sp, fontWeight = FontWeight.Bold)
+    }
+    Spacer(Modifier.height(34.dp))
+    @Composable
+    fun Item(icon: ImageVector, title: String, body: String) {
+        Row(Modifier.fillMaxWidth().padding(bottom = 26.dp), verticalAlignment = Alignment.Top) {
+            Box(
+                Modifier.size(44.dp).clip(CircleShape).background(Color(0x33FFFFFF)),
+                contentAlignment = Alignment.Center
+            ) { Icon(icon, null, tint = ink, modifier = Modifier.size(22.dp)) }
+            Spacer(Modifier.width(16.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, color = ink, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text(body, color = soft, fontSize = 14.sp, lineHeight = 20.sp)
+            }
+        }
+    }
+    Item(
+        Icons.Default.VisibilityOff, "Leave no trace on your device",
+        "Sites you visit in private tabs won't appear in your history, and passwords and form data aren't saved."
+    )
+    Item(
+        Icons.Default.Wifi, "Browsing visibility",
+        "Even in private tabs, your activity may still be visible to your internet provider, network observers, or your employer if you're on a work network."
+    )
+    Item(
+        Icons.Default.Shield, "Swift Shields stay on",
+        "Ads, trackers and spam redirects are still blocked while you browse privately."
+    )
 }
 
 @Composable
@@ -3946,10 +4002,10 @@ private fun WallpaperBackdrop(blurred: Boolean) {
         Canvas(Modifier.fillMaxSize()) {
             val w = size.width
             val h = size.height
-            val stops = if (look == 2) listOf(Color(0xFF2A1B4D), Color(0xFF181030), Color(0xFF0B0814))
+            val stops = if (look == 2) listOf(Color(0xFF4E42BE), Color(0xFF30288C), Color(0xFF1A1442))
                         else listOf(Color(0xFFFFF1E8), Color(0xFFF1F3FA), Color(0xFFE6EAF4))
             drawRect(Brush.verticalGradient(stops))
-            val glow = if (look == 2) Color(0x558E5BFF) else Color(0x44FF6B35)
+            val glow = if (look == 2) Color(0x449C8CFF) else Color(0x44FF6B35)
             drawCircle(
                 Brush.radialGradient(listOf(glow, glow.copy(alpha = 0f)), center = Offset(w * 0.85f, h * 0.10f), radius = w * 0.6f),
                 radius = w * 0.6f, center = Offset(w * 0.85f, h * 0.10f)
@@ -3959,12 +4015,7 @@ private fun WallpaperBackdrop(blurred: Boolean) {
                 Brush.radialGradient(listOf(glow2, glow2.copy(alpha = 0f)), center = Offset(w * 0.12f, h * 0.38f), radius = w * 0.5f),
                 radius = w * 0.5f, center = Offset(w * 0.12f, h * 0.38f)
             )
-            if (look == 2) {
-                // a few faint veils so the page reads as "anonymous", not just purple
-                for (i in 0 until 5) {
-                    drawCircle(Color(0x0DFFFFFF), radius = w * (0.18f + i * 0.07f), center = Offset(w * 0.5f, h * 0.72f))
-                }
-            }
+
         }
     } else
     Canvas(Modifier.fillMaxSize()) {
@@ -4033,8 +4084,8 @@ private fun renderWallpaperBitmap(look: Int = 0): Bitmap {
     val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
     paint.shader = android.graphics.LinearGradient(
         0f, 0f, 0f, h.toFloat(),
-        when (look) { 2 -> 0xFF2A1B4D.toInt(); 1 -> 0xFFFFF1E8.toInt(); else -> 0xFF1C2540.toInt() },
-        when (look) { 2 -> 0xFF0B0814.toInt(); 1 -> 0xFFE6EAF4.toInt(); else -> 0xFF101114.toInt() },
+        when (look) { 2 -> 0xFF4E42BE.toInt(); 1 -> 0xFFFFF1E8.toInt(); else -> 0xFF1C2540.toInt() },
+        when (look) { 2 -> 0xFF1A1442.toInt(); 1 -> 0xFFE6EAF4.toInt(); else -> 0xFF101114.toInt() },
         android.graphics.Shader.TileMode.CLAMP
     )
     canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
@@ -5339,7 +5390,7 @@ private fun MenuCircleButton(
 ) {
     Box(
         Modifier.size(46.dp).clip(CircleShape)
-            .background(if (dark) Color(0xFF15171A) else Color(0xFF3F4249))
+            .background(if (dark) themed(0xFF15171A, 0xFFD5D8E0) else themed(0xFF3F4249, 0xFFE9EBF0))
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center
     ) {

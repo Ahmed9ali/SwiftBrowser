@@ -42,6 +42,22 @@ const val SHIELDS_JS = """
     }
     return null;
   }
+  function kindOf(el) {
+    var n = 0;
+    while (el && el.nodeType === 1 && n++ < 6) {
+      var t = el.tagName;
+      if (t === 'BUTTON' || t === 'INPUT' || t === 'SELECT' || t === 'LABEL' || t === 'SUMMARY') return true;
+      try {
+        var r = el.getAttribute('role');
+        if (r === 'button' || r === 'link' || r === 'menuitem' || r === 'tab') return true;
+        if (el.hasAttribute('onclick') || el.hasAttribute('data-href')) return true;
+        var tx = (el.innerText || '').trim();
+        if (tx.length > 0 && tx.length < 60 && getComputedStyle(el).cursor === 'pointer') return true;
+      } catch (e) {}
+      el = el.parentElement;
+    }
+    return false;
+  }
   function reportTap(e) {
     if (!e.isTrusted) return;
     lastTrusted = Date.now();
@@ -52,7 +68,7 @@ const val SHIELDS_JS = """
         var h = String(a.href);
         if (/^https?:/i.test(h) && h.split('#')[0] !== location.href.split('#')[0]) href = h;
       }
-      if (NAV && NAV.tap) NAV.tap(href);
+      if (NAV && NAV.tap) NAV.tap(href, kindOf(e.target));
     } catch (err) {}
   }
   ['pointerdown', 'touchstart', 'click'].forEach(function (t) {

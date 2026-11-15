@@ -15,4 +15,8 @@ object SwiftPalette {
     var priv by mutableStateOf(false)
 }
 
+/** Dark / light / private (deep indigo, like Brave's private tabs). */
+internal fun themed(dark: Long, light: Long, priv: Long): Color =
+    Color(if (SwiftPalette.priv) priv else if (SwiftPalette.dark) dark else light)
+
 internal fun themed(dark: Long, light: Long): Color = Color(if (SwiftPalette.dark) dark else light)

@@ -111,6 +111,8 @@ class AppSettings(context: Context) {
     var downloadNotifications by mutableStateOf(sp.getBoolean("dlNotify", true))
         private set
     /** "system", "light" or "dark". */
+    /** Set by the app: whether the phone itself is in dark mode. */
+    var systemDark = false
     var themeMode by mutableStateOf(sp.getString("theme", "system") ?: "system")
         private set
     /** Long-press on a text link: false = select the text, true = show the link menu. */
@@ -166,7 +168,7 @@ class AppSettings(context: Context) {
         s.mediaPlaybackRequiresUserGesture = blockAutoplay
         if (Build.VERSION.SDK_INT >= 26) s.safeBrowsingEnabled = safeBrowsing
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, !blockThirdPartyCookies)
-        applyWebTheme(wv, SwiftPalette.dark && darkWeb)
+        applyWebTheme(wv, isDark(systemDark) && darkWeb)
     }
 
     /**

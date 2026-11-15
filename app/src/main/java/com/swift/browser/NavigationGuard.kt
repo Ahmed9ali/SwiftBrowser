@@ -24,6 +24,7 @@ class NavigationGuard(
     private class Tab {
         var tapHref: String? = null
         var tapAt = 0L
+        var tapControl = false        // the tap landed on a button / clickable control with a label
         var commitAt = 0L
         var commitUrl: String = ""
         var tainted = false           // current redirect chain started from a blocked/ad-like hop
@@ -38,8 +39,9 @@ class NavigationGuard(
     // ---- events ----------------------------------------------------------------------------
 
     /** Page script reported a real finger tap. href = absolute URL of the closest <a>, or "". */
-    @Synchronized fun recordTap(tabId: Long, href: String?) {
+    @Synchronized fun recordTap(tabId: Long, href: String?, control: Boolean = false) {
         val t = tab(tabId)
+        t.tapControl = control
         t.tapHref = href?.takeIf { it.isNotBlank() }
         t.tapAt = now()
     }
@@ -91,8 +93,16 @@ class NavigationGuard(
             return Verdict(Kind.ALLOW, "same site")
         }
 
-        val adLike = isAdHost(h) || hasAdParams(url, pageUrl)
+        val hostAd = isAdHost(h)
+        val adLike = hostAd || hasAdParams(url, pageUrl)
         val tapFresh = t0 - t.tapAt in 0..TAP_WINDOW_MS
+        // "Download", "Continue", "Get app" ... : the user pressed a real, labelled control a moment ago.
+        // Its destination is theirs even when it goes through a tracking/redirect host.
+        if (t.tapControl && t0 - t.tapAt in 0..CONTROL_WINDOW_MS) {
+            t.chainAllowedByTap = true
+            t.tainted = false
+            return Verdict(Kind.ALLOW, "after tapping a button")
+        }
         val tapMatches = tapFresh && t.tapHref != null && sameDestination(t.tapHref!!, url)
 
         if (tapMatches) {
@@ -112,6 +122,9 @@ class NavigationGuard(
             else Verdict(Kind.ALLOW, "redirect, no ad signs")
         }
 
+        // The user has used this page since it loaded and only the URL pattern (not the host) looks ad-like:
+        // news sites and shops put tracking parameters on real article links.
+        if (!hostAd && t.tapAt > 0L && t.tapAt >= t.commitAt) return Verdict(Kind.ALLOW, "user interacted, link only has tracking parameters")
         if (adLike) { t.tainted = true; return Verdict(Kind.BLOCK, "ad destination") }
 
         // Cross-site, not an ad, no matching tap.
@@ -123,11 +136,11 @@ class NavigationGuard(
         }
         if (sinceCommit < AUTO_REDIRECT_MS) {
             // Fast automatic jump right after load, no tap: classic ad bounce unless the site is known.
-            return if (isVisited(h)) Verdict(Kind.ALLOW, "auto redirect to visited site")
+            return if (isVisited(h) || !suspicious(h)) Verdict(Kind.ALLOW, "auto redirect, host looks ordinary")
             else Verdict(Kind.BLOCK, "automatic redirect right after load")
         }
         // Long after load, no tap: scripted navigation (timer / ad script).
-        return if (isVisited(h)) Verdict(Kind.ALLOW, "scripted, visited site")
+        return if (isVisited(h) || !suspicious(h)) Verdict(Kind.ALLOW, "scripted, host looks ordinary")
         else Verdict(Kind.BLOCK, "scripted navigation without a tap")
     }
 
@@ -160,6 +173,14 @@ class NavigationGuard(
 
     // ---- helpers ---------------------------------------------------------------------------
 
+    /** Ad bounces go to throwaway domains: bare IPs, cheap TLDs, hyphen / digit soup. Ordinary names are left alone. */
+    private fun suspicious(h: String): Boolean {
+        if (h.split('.').size == 4 && h.split('.').all { p -> p.isNotEmpty() && p.all { it.isDigit() } }) return true
+        if (h.substringAfterLast('.') in CHEAP_TLDS) return true
+        val label = registrable(h).substringBefore('.')
+        return label.count { it == '-' } >= 2 || label.count { it.isDigit() } >= 5
+    }
+
     private fun isVisited(h: String) = registrable(h) in visited
 
     private fun key(url: String) = url.substringBefore('#')
@@ -169,12 +190,19 @@ class NavigationGuard(
         val a = host(href) ?: return false
         val b = host(url) ?: return false
         // Same registrable domain is enough: the link may 302 within its own site first.
-        return registrable(a) == registrable(b)
+        return sameSite(a, b)
     }
 
     companion object {
         const val TAP_WINDOW_MS = 1500L
         const val AUTO_REDIRECT_MS = 4000L
+        const val CONTROL_WINDOW_MS = 8000L
+
+        private val CHEAP_TLDS = setOf(
+            "xyz", "top", "click", "site", "online", "icu", "buzz", "monster", "fun", "cyou", "sbs", "cfd",
+            "rest", "quest", "gdn", "lol", "space", "website", "vip", "bid", "win", "loan", "download",
+            "stream", "trade", "review", "party", "men", "work", "link", "pw", "tk", "ml", "ga", "cf", "gq"
+        )
 
         /** Hosts that carry sign-in, payment and captcha flows: never interfere. */
         private val TRUSTED_SUFFIXES = listOf(
@@ -215,6 +243,12 @@ class NavigationGuard(
             else last2
         }
 
-        fun sameSite(a: String, b: String) = registrable(a) == registrable(b)
+        /** bbc.com / bbc.co.uk, amazon.in / amazon.com: same name under another country suffix is the same site. */
+        fun sameSite(a: String, b: String): Boolean {
+            val ra = registrable(a); val rb = registrable(b)
+            if (ra == rb) return true
+            val la = ra.substringBefore('.'); val lb = rb.substringBefore('.')
+            return la.length >= 3 && la == lb
+        }
     }
 }
