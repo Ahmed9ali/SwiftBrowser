@@ -488,7 +488,7 @@ const val SHIELDS_JS = """
       var realFetch = window.fetch;
       window.fetch = function (input) {
         var url = (typeof input === 'string') ? input : (input && input.url) || '';
-        if (url && isAdUrl(url)) return Promise.reject(new TypeError('Failed to fetch'));
+        if (url && isAdUrl(url)) return Promise.resolve(new Response('', { status: 200, statusText: 'OK' }));
         return realFetch.apply(this, arguments);
       };
     } catch (e) {}
@@ -505,9 +505,12 @@ const val SHIELDS_JS = """
           setTimeout(function () {
             try {
               Object.defineProperty(x, 'readyState', { value: 4, configurable: true });
-              Object.defineProperty(x, 'status', { value: 0, configurable: true });
+              Object.defineProperty(x, 'status', { value: 200, configurable: true });
+              Object.defineProperty(x, 'statusText', { value: 'OK', configurable: true });
+              try { Object.defineProperty(x, 'responseText', { value: '', configurable: true }); } catch (e1) {}
+              try { Object.defineProperty(x, 'response', { value: '', configurable: true }); } catch (e2) {}
               x.dispatchEvent(new Event('readystatechange'));
-              x.dispatchEvent(new ProgressEvent('error'));
+              x.dispatchEvent(new ProgressEvent('load'));
               x.dispatchEvent(new ProgressEvent('loadend'));
             } catch (e) {}
           }, 0);
@@ -516,6 +519,178 @@ const val SHIELDS_JS = """
         return xSend.apply(this, arguments);
       };
     } catch (e) {}
+  })();
+  // ---------- 8. anti-adblock countermeasures ----------
+  // Sites detect a blocker by (a) planting an empty "bait" element and checking whether it got hidden, and
+  // (b) showing a "please disable AdBlock" wall. Bait elements are answered as if they were visible (they stay hidden
+  // on screen), and walls are removed. Only empty, ad-named elements and ad-blocker-worded overlays are touched.
+  (function () {
+    if (EXEMPT) return;
+    var BAITCLS = /^(ads?|adsbox|adbox|ad[-_]?banner|banner[-_]?ads?|adsbygoogle|ad[-_]?slot|ad[-_]?unit|ad[-_]?placement|ad[-_]?container|ad[-_]?wrapper|ad[-_]?frame|ad[-_]?box|ad[-_]?test|adblock[-_]?test|text[-_]?ads?|text[-_]?ad[-_]?links?|textad|pub[-_]?\d+x\d+m?|advert(isement)?s?|google[-_]?ads?|banner[-_]?ad|sponsor(ed)?[-_]?ads?|ad[-_]?top|ad[-_]?bottom|ad[-_]?header|ad[-_]?footer|ad[-_]?sidebar|ad[-_]?leaderboard|ad[-_]?right|ad[-_]?left|bait)${'$'}/i;
+    function isBait(el) {
+      try {
+        if (!el || el.nodeType !== 1 || el.childElementCount > 0) return false;
+        if ((el.textContent || '').length > 0) return false;
+        if (el.id && BAITCLS.test(el.id)) return true;
+        var cl = el.classList;
+        if (cl) for (var i = 0; i < cl.length; i++) if (BAITCLS.test(cl[i])) return true;
+      } catch (e) {}
+      return false;
+    }
+    function declared(el, prop) { try { return Math.max(1, parseFloat(el.style[prop]) || 0); } catch (e) { return 1; } }
+    function wrapGetter(proto, name, fake) {
+      try {
+        var d = Object.getOwnPropertyDescriptor(proto, name);
+        if (!d || !d.get) return;
+        var g = d.get;
+        Object.defineProperty(proto, name, {
+          configurable: true, enumerable: d.enumerable,
+          get: function () {
+            var v = g.call(this);
+            if ((v === 0 || v === null) && isBait(this)) return fake(this);
+            return v;
+          }
+        });
+      } catch (e) {}
+    }
+    wrapGetter(HTMLElement.prototype, 'offsetHeight', function (el) { return declared(el, 'height'); });
+    wrapGetter(HTMLElement.prototype, 'offsetWidth', function (el) { return declared(el, 'width'); });
+    wrapGetter(Element.prototype, 'clientHeight', function (el) { return declared(el, 'height'); });
+    wrapGetter(Element.prototype, 'clientWidth', function (el) { return declared(el, 'width'); });
+    wrapGetter(HTMLElement.prototype, 'offsetParent', function () { return document.body; });
+    try {
+      var realRect = Element.prototype.getBoundingClientRect;
+      Element.prototype.getBoundingClientRect = function () {
+        var r = realRect.call(this);
+        if ((r.width === 0 || r.height === 0) && isBait(this)) return new DOMRect(r.x, r.y, r.width || declared(this, 'width'), r.height || declared(this, 'height'));
+        return r;
+      };
+    } catch (e) {}
+    try {
+      var realGCS = window.getComputedStyle;
+      window.getComputedStyle = function (el) {
+        var cs = realGCS.apply(window, arguments);
+        try {
+          if (el && el.nodeType === 1 && (cs.display === 'none' || cs.visibility === 'hidden') && isBait(el)) {
+            return new Proxy(cs, {
+              get: function (t, k) {
+                if (k === 'display') return 'block';
+                if (k === 'visibility') return 'visible';
+                if (k === 'getPropertyValue') {
+                  return function (n) {
+                    n = String(n).toLowerCase();
+                    if (n === 'display') return 'block';
+                    if (n === 'visibility') return 'visible';
+                    return t.getPropertyValue(n);
+                  };
+                }
+                var v = t[k];
+                return typeof v === 'function' ? v.bind(t) : v;
+              }
+            });
+          }
+        } catch (e) {}
+        return cs;
+      };
+    } catch (e) {}
+
+    // "Please disable your ad blocker" walls.
+    if (!TOP) return;
+    var STRONGWALL = /ad[\s-]?block|ads?[\s-]?blocker|anti[\s-]?adblock/i;
+    var WEAKWALL = /white-?list/i, ADWORD = /\bads?\b|advertis/i;
+    function wallText(n) {
+      var t = '';
+      try { t = (n.innerText || '') + ' ' + (n.shadowRoot ? n.shadowRoot.textContent : ''); } catch (x) {}
+      return t.slice(0, 1600);
+    }
+    function isWall(n) {
+      try {
+        if (!n || n.nodeType !== 1 || n === document.body || n === document.documentElement) return false;
+        var cs = getComputedStyle(n);
+        if (cs.position !== 'fixed' && cs.position !== 'absolute' && cs.position !== 'sticky') return false;
+        var r = n.getBoundingClientRect();
+        if (r.width < innerWidth * 0.5 || r.height < innerHeight * 0.2) return false;
+        if (n.querySelector('input,textarea,select,video,canvas')) return false;
+        var t = wallText(n);
+        if (t.length < 15 || t.length > 1500) return false;
+        return STRONGWALL.test(t) || (WEAKWALL.test(t) && ADWORD.test(t));
+      } catch (e) { return false; }
+    }
+    function coversScreen(n) {
+      try {
+        var cs = getComputedStyle(n);
+        if (cs.position !== 'fixed' && cs.position !== 'absolute') return false;
+        var r = n.getBoundingClientRect();
+        return r.width >= innerWidth * 0.9 && r.height >= innerHeight * 0.9;
+      } catch (e) { return false; }
+    }
+    function unlock() {
+      try {
+        [document.documentElement, document.body].forEach(function (el) {
+          if (!el) return;
+          var cs = getComputedStyle(el);
+          if (cs.overflow === 'hidden' || cs.overflowY === 'hidden') el.style.setProperty('overflow', 'auto', 'important');
+          if (cs.pointerEvents === 'none') el.style.setProperty('pointer-events', 'auto', 'important');
+        });
+        var kids = document.body ? document.body.children : [];
+        for (var i = 0; i < kids.length && i < 80; i++) {
+          var f = getComputedStyle(kids[i]).filter;
+          if (f && f.indexOf('blur') >= 0) kids[i].style.setProperty('filter', 'none', 'important');
+        }
+      } catch (e) {}
+    }
+    var wallRuns = 0, removedAny = false;
+    function wallPass() {
+      if (!document.body || wallRuns++ > 60) return;
+      try {
+        var pts = [[0.5, 0.5], [0.5, 0.3], [0.5, 0.7], [0.5, 0.15], [0.5, 0.85]];
+        var seen = [], found = null;
+        for (var i = 0; i < pts.length && !found; i++) {
+          var els = document.elementsFromPoint(innerWidth * pts[i][0], innerHeight * pts[i][1]);
+          for (var j = 0; j < els.length && j < 12; j++) {
+            var n = els[j];
+            while (n && n !== document.body && n !== document.documentElement) {
+              if (isWall(n)) { found = n; break; }
+              n = n.parentElement;
+            }
+            if (found) break;
+          }
+        }
+        if (!found) return;
+        // climb to the full-screen wrapper (backdrop) when the wall sits inside one
+        var top = found;
+        while (top.parentElement && top.parentElement !== document.body && top.parentElement !== document.documentElement &&
+               coversScreen(top.parentElement) && wallText(top.parentElement).length < 1600) top = top.parentElement;
+        try { top.remove(); } catch (x) { top.style.setProperty('display', 'none', 'important'); }
+        removedAny = true;
+        // leftover dimming layers: empty, screen-sized, fixed
+        var again = document.elementsFromPoint(innerWidth / 2, innerHeight / 2);
+        for (var k = 0; k < again.length && k < 4; k++) {
+          var b = again[k];
+          if (b !== document.body && b !== document.documentElement && coversScreen(b) &&
+              (b.innerText || '').trim().length < 5 && !b.querySelector('img,video,canvas,input,iframe')) {
+            try { b.remove(); } catch (x) { b.style.setProperty('display', 'none', 'important'); }
+          }
+        }
+        unlock();
+      } catch (e) {}
+    }
+    function startWalls() {
+      wallPass();
+      [400, 1200, 2500, 5000, 9000].forEach(function (ms) { setTimeout(wallPass, ms); });
+      try {
+        setInterval(function () { if (removedAny || wallRuns < 40) wallPass(); }, 3000);
+      } catch (e) {}
+      try {
+        var debounce = 0;
+        new MutationObserver(function () {
+          if (debounce || wallRuns > 60) return;
+          debounce = setTimeout(function () { debounce = 0; wallPass(); }, 350);
+        }).observe(document.body, { childList: true });
+      } catch (e) {}
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startWalls);
+    else startWalls();
   })();
 })();
 """

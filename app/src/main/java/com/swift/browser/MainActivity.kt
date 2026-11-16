@@ -399,15 +399,36 @@ private fun canAutoOpenMime(m: String?): Boolean {
         t.contains("officedocument") || t == "application/msword"
 }
 
+private val NEUTRAL_GIF = byteArrayOf(
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80.toByte(), 0x00, 0x00, 0xff.toByte(), 0xff.toByte(),
+    0xff.toByte(), 0x00, 0x00, 0x00, 0x21, 0xf9.toByte(), 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b
+)
+
+/**
+ * What a blocked request gets back. Scripts and images are answered with an empty 200 (like uBlock's "noop" resources)
+ * so pages that probe "did my ad script load?" do not conclude an ad blocker is running; everything else fails.
+ */
 private fun blockedResponse(url: String): WebResourceResponse {
+    val path = url.substringBefore('#').substringBefore('?').lowercase()
+    val cors = mapOf(
+        "X-Swift-Blocked" to "1", "Cache-Control" to "no-store",
+        "Access-Control-Allow-Origin" to "*"
+    )
+    when {
+        path.endsWith(".js") || path.endsWith(".mjs") ->
+            return WebResourceResponse(
+                "application/javascript", "utf-8", 200, "OK", cors,
+                java.io.ByteArrayInputStream("/* blocked by Swift Shields */".toByteArray())
+            )
+        path.endsWith(".png") || path.endsWith(".jpg") || path.endsWith(".jpeg") || path.endsWith(".gif") ||
+            path.endsWith(".webp") || path.endsWith(".ico") || path.endsWith(".svg") ->
+            return WebResourceResponse("image/gif", null, 200, "OK", cors, java.io.ByteArrayInputStream(NEUTRAL_GIF))
+    }
     val mime = when {
-        url.contains(".js", true) -> "application/javascript"
-        url.contains(".css", true) -> "text/css"
-        url.contains(".png", true) || url.contains(".jpg", true) || url.contains(".jpeg", true) ||
-            url.contains(".gif", true) || url.contains(".webp", true) ||
-            url.contains(".svg", true) || url.contains(".ico", true) -> "image/png"
-        url.contains(".html", true) -> "text/html"
-        url.contains(".json", true) -> "application/json"
+        path.endsWith(".css") -> "text/css"
+        path.endsWith(".html") || path.endsWith(".htm") -> "text/html"
+        path.endsWith(".json") -> "application/json"
         else -> "text/plain"
     }
     val body = object : java.io.InputStream() {
@@ -416,11 +437,7 @@ private fun blockedResponse(url: String): WebResourceResponse {
             throw java.io.IOException("Blocked by Swift Shields")
         override fun available(): Int = 0
     }
-    return WebResourceResponse(
-        mime, "utf-8", 403, "Blocked",
-        mapOf("X-Swift-Blocked" to "1", "Cache-Control" to "no-store"),
-        body
-    )
+    return WebResourceResponse(mime, "utf-8", 403, "Blocked", cors, body)
 }
 
 private val FaviconStore = mutableStateMapOf<Long, Bitmap>()
@@ -772,7 +789,7 @@ private fun SwiftBrowserApp() {
     val savedHome = remember { arrayOfNulls<Bitmap>(1) }
     remember {
         FaviconStore.clear(); ThumbStore.clear(); GroupColorStore.clear()
-        HomeThumbStore = BitmapFactory.decodeFile(File(context.filesDir, "home_thumb.jpg").path)
+        HomeThumbStore = BitmapFactory.decodeFile(File(context.filesDir, "home_thumb2.jpg").path)
         savedHome[0] = HomeThumbStore
         session?.colors?.forEach { (k, v) -> GroupColorStore[k] = v }
         session?.tabs?.forEach { t ->
@@ -831,7 +848,9 @@ private fun SwiftBrowserApp() {
                         val h = (src.height() * w / src.width().toFloat()).toInt().coerceAtLeast(1)
                         val scaled = Bitmap.createScaledBitmap(full, w, h, true)
                         ThumbStore[id] = scaled
-                        HomeThumbStore = scaled
+                        // Only a normal home page may become the shared fallback preview;
+                        // a private home page (purple) must never leak into normal tabs.
+                        if (tabs.firstOrNull { it.id == id }?.isPrivate != true) HomeThumbStore = scaled
                     }
                 },
                 Handler(Looper.getMainLooper())
@@ -943,7 +962,7 @@ private fun SwiftBrowserApp() {
             }
             HomeThumbStore?.let { bmp ->
                 if (savedHome[0] !== bmp) {
-                    java.io.FileOutputStream(File(dir, "home_thumb.jpg")).use {
+                    java.io.FileOutputStream(File(dir, "home_thumb2.jpg")).use {
                         bmp.compress(Bitmap.CompressFormat.JPEG, 70, it)
                     }
                     savedHome[0] = bmp
@@ -4982,7 +5001,7 @@ private fun TabSwitcher(
 
                     val moveAnim = remember { Animatable(Offset.Zero, Offset.VectorConverter) }
                     Box(
-                        Modifier.fillMaxWidth().height(196.dp)
+                        Modifier.fillMaxWidth().height(268.dp)
                             .onGloballyPositioned { c ->
                                 val r = c.boundsInRoot()
                                 cardBounds[entry.key] = r
@@ -5299,10 +5318,6 @@ private fun GroupPopupOverlay(
                             onDismissRequest = { popupMenu = false },
                             modifier = Modifier.background(Surface)
                         ) {
-                            BrowserMenuItem("Edit group", Icons.Default.Edit) {
-                                popupMenu = false
-                                onEdit()
-                            }
                             BrowserMenuItem("Ungroup", Icons.Default.FolderOff) {
                                 popupMenu = false
                                 onUngroup()
@@ -5365,7 +5380,7 @@ private fun GroupPopupOverlay(
                         val held = dragId == tab.id
                         DisposableEffect(tab.id) { onDispose { popupBounds.remove(tab.id) } }
                         Box(
-                            Modifier.fillMaxWidth().height(176.dp)
+                            Modifier.fillMaxWidth().height(232.dp)
                                 .then(if (held) Modifier else Modifier.animateItem())
                                 .onGloballyPositioned { popupBounds[tab.id] = it.boundsInRoot() }
                                 .zIndex(if (held) 1f else 0f)
@@ -5389,6 +5404,8 @@ private fun GroupPopupOverlay(
         heldTab?.let { ht ->
             val dens = androidx.compose.ui.platform.LocalDensity.current
             val gb = gridBounds
+            val pickUp = remember { androidx.compose.animation.core.Animatable(1f) }
+            LaunchedEffect(Unit) { pickUp.animateTo(0.88f, tween(140)) }
             Box(
                 Modifier.align(Alignment.TopStart)
                     .offset { androidx.compose.ui.unit.IntOffset(
@@ -5401,7 +5418,11 @@ private fun GroupPopupOverlay(
                         .graphicsLayer {
                             translationX = finger.x - grab.x - gb.left
                             translationY = finger.y - grab.y - gb.top
-                            scaleX = 1.04f; scaleY = 1.04f
+                            transformOrigin = androidx.compose.ui.graphics.TransformOrigin(
+                                (grab.x / heldSize.width.coerceAtLeast(1f)).coerceIn(0f, 1f),
+                                (grab.y / heldSize.height.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                            )
+                            scaleX = pickUp.value; scaleY = pickUp.value
                         }
                 ) {
                     SingleTabCard(
@@ -6061,7 +6082,7 @@ private fun PagePreview(
     tint: Color = Surface2
 ) {
     val host = hostOf(tab.url)
-    val thumb = ThumbStore[tab.id] ?: if (tab.url == "swift://home") HomeThumbStore else null
+    val thumb = ThumbStore[tab.id] ?: if (tab.url == "swift://home" && !tab.isPrivate) HomeThumbStore else null
     Box(
         modifier.clip(RoundedCornerShape(if (compact) 10.dp else 12.dp)).background(tint),
         contentAlignment = Alignment.Center
@@ -6142,7 +6163,7 @@ private fun sharePage(context: Context, url: String) {
 
 @Composable
 private fun SwipeTabPreview(tab: BrowserTab?) {
-    val bmp = tab?.let { if (it.url == "swift://home") HomeThumbStore ?: ThumbStore[it.id] else ThumbStore[it.id] }
+    val bmp = tab?.let { if (it.url == "swift://home" && !it.isPrivate) HomeThumbStore ?: ThumbStore[it.id] else ThumbStore[it.id] }
     if (bmp != null) {
         Image(
             bitmap = bmp.asImageBitmap(), contentDescription = null,
