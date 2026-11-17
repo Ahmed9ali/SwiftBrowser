@@ -488,7 +488,7 @@ const val SHIELDS_JS = """
       var realFetch = window.fetch;
       window.fetch = function (input) {
         var url = (typeof input === 'string') ? input : (input && input.url) || '';
-        if (url && isAdUrl(url)) return Promise.resolve(new Response('', { status: 200, statusText: 'OK' }));
+        if (url && isAdUrl(url)) return Promise.reject(new TypeError('Failed to fetch'));
         return realFetch.apply(this, arguments);
       };
     } catch (e) {}
@@ -505,12 +505,9 @@ const val SHIELDS_JS = """
           setTimeout(function () {
             try {
               Object.defineProperty(x, 'readyState', { value: 4, configurable: true });
-              Object.defineProperty(x, 'status', { value: 200, configurable: true });
-              Object.defineProperty(x, 'statusText', { value: 'OK', configurable: true });
-              try { Object.defineProperty(x, 'responseText', { value: '', configurable: true }); } catch (e1) {}
-              try { Object.defineProperty(x, 'response', { value: '', configurable: true }); } catch (e2) {}
+              Object.defineProperty(x, 'status', { value: 0, configurable: true });
               x.dispatchEvent(new Event('readystatechange'));
-              x.dispatchEvent(new ProgressEvent('load'));
+              x.dispatchEvent(new ProgressEvent('error'));
               x.dispatchEvent(new ProgressEvent('loadend'));
             } catch (e) {}
           }, 0);
@@ -595,7 +592,7 @@ const val SHIELDS_JS = """
     } catch (e) {}
 
     // "Please disable your ad blocker" walls.
-    if (!TOP) return;
+    if (!TOP || IS_YT) return;
     var STRONGWALL = /ad[\s-]?block|ads?[\s-]?blocker|anti[\s-]?adblock/i;
     var WEAKWALL = /white-?list/i, ADWORD = /\bads?\b|advertis/i;
     function wallText(n) {
@@ -607,12 +604,14 @@ const val SHIELDS_JS = """
       try {
         if (!n || n.nodeType !== 1 || n === document.body || n === document.documentElement) return false;
         var cs = getComputedStyle(n);
-        if (cs.position !== 'fixed' && cs.position !== 'absolute' && cs.position !== 'sticky') return false;
+        if (cs.position !== 'fixed' && cs.position !== 'absolute') return false;
+        if (cs.position === 'absolute' && !(parseInt(cs.zIndex, 10) > 50)) return false;
         var r = n.getBoundingClientRect();
         if (r.width < innerWidth * 0.5 || r.height < innerHeight * 0.2) return false;
-        if (n.querySelector('input,textarea,select,video,canvas')) return false;
+        if (n.scrollHeight > n.clientHeight * 1.6 + 40) return false;
+        if (n.querySelector('input,textarea,select,video,canvas,article,main,form,nav,header')) return false;
         var t = wallText(n);
-        if (t.length < 15 || t.length > 1500) return false;
+        if (t.length < 15 || t.length > 900) return false;
         return STRONGWALL.test(t) || (WEAKWALL.test(t) && ADWORD.test(t));
       } catch (e) { return false; }
     }

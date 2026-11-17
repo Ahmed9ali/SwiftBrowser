@@ -75,6 +75,14 @@ class FilterListManager(private val context: Context, private val onReady: (Filt
         val b = FilterEngine.Builder()
         // Always-on basics, so blocking works even before the first list download finishes (or offline).
         b.addLines(BASELINE.lineSequence())
+        // Domain-level ad/tracker/telemetry hosts, third-party sub-resources only (never page loads or popups).
+        try {
+            val opts = "${'$'}third-party,script,image,xmlhttprequest,subdocument,ping,other,websocket,media,font,stylesheet"
+            val hosts = context.assets.open("baseline_hosts.txt").bufferedReader().use { it.readLines() }
+            b.addLines(hosts.asSequence().map { it.trim() }.filter { it.isNotEmpty() }.map { "||$it^$opts" })
+        } catch (e: Exception) {
+            Log.w(TAG, "baseline hosts missing", e)
+        }
         for (f in files) f.bufferedReader().use { r -> b.addLines(r.lineSequence()) }
         val e = b.build()
         Log.d(TAG, "engine ready: ${e.networkRuleCount} network, ${e.cosmeticRuleCount} cosmetic rules in ${System.currentTimeMillis() - t0} ms")

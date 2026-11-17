@@ -171,9 +171,21 @@ class PasswordStore(context: Context) {
  */
 class PasswordBridge(
     private val webView: WebView,
-    private val onLogin: (host: String, username: String, password: String) -> Unit
+    private val onLogin: (host: String, username: String, password: String) -> Unit,
+    private val onFieldTapped: (host: String) -> Unit = {}
 ) {
     private val main = Handler(Looper.getMainLooper())
+
+    /** The person tapped an empty login field: the app may offer a saved login. */
+    @JavascriptInterface
+    fun onField() {
+        main.post {
+            val url = webView.url ?: return@post
+            if (!url.startsWith("http")) return@post
+            val host = PasswordStore.hostKey(url)
+            if (host.isNotEmpty()) onFieldTapped(host)
+        }
+    }
 
     @JavascriptInterface
     fun onSubmit(username: String?, password: String?) {
@@ -212,6 +224,25 @@ const val PASSWORD_CAPTURE_JS = """
     last = now;
     try { SwiftPasswords.onSubmit(user, pw.value); } catch (e) {}
   }
+  var lastOffer = 0;
+  document.addEventListener('focusin', function (e) {
+    try {
+      var t = e.target;
+      if (!t || t.tagName !== 'INPUT') return;
+      var pw = document.querySelector('input[type=password]');
+      if (!pw) return;
+      var ty = (t.type || 'text').toLowerCase();
+      if (t !== pw && USER_TYPES.indexOf(ty) < 0) return;
+      if (t !== pw && t.form !== pw.form) return;
+      if (pw.value || t.value) return;
+      var r = pw.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return;
+      var now = Date.now();
+      if (now - lastOffer < 20000) return;
+      lastOffer = now;
+      SwiftPasswords.onField();
+    } catch (err) {}
+  }, true);
   document.addEventListener('submit', function (e) { grab(e.target); }, true);
   document.addEventListener('click', function (e) {
     var b = e.target && e.target.closest && e.target.closest('button,input[type=submit],input[type=button],[role=button],a');

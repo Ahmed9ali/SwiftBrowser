@@ -742,6 +742,8 @@ private fun SwiftBrowserApp() {
     val swipeGen = remember { IntArray(1) }
     val homeForward = remember { mutableStateMapOf<Long, String>() }
     var pendingLogin by remember { mutableStateOf<PendingLogin?>(null) }
+    /** Saved logins to offer for the login form the person just tapped (tab id, logins). */
+    var fillOffer by remember { mutableStateOf<Pair<Long, List<SavedLogin>>?>(null) }
     val passwordStore = remember { PasswordStore(context) }
     var settingsEntry by remember { mutableStateOf("main") }
     var downloadNoticeAt by remember { mutableLongStateOf(0L) }
@@ -1068,9 +1070,16 @@ private fun SwiftBrowserApp() {
         focusManager.clearFocus()
     }
 
-    fun newTab(private: Boolean = false) {
+    /** [nextTo]: place the new tab right after that tab (and in its group), like a link opened from it. */
+    fun newTab(private: Boolean = false, nextTo: Long? = null) {
         val tab = BrowserTab(idCounter.getAndIncrement(), isPrivate = private)
-        tabs.add(tab)
+        val at = if (nextTo != null) tabs.indexOfFirst { it.id == nextTo } else -1
+        if (at >= 0 && tabs[at].isPrivate == private) {
+            tabs.add(at + 1, tab)
+            tabGroups[nextTo!!]?.let { g -> tabGroups[tab.id] = g; groupUpdated[g] = System.currentTimeMillis() }
+        } else {
+            tabs.add(tab)
+        }
         activeId = tab.id
         pageUrl = "swift://home"
         address = ""
@@ -1688,14 +1697,17 @@ private fun SwiftBrowserApp() {
                 settings.saveFormData = false
             }
 
-            addJavascriptInterface(PasswordBridge(this) { host, user, pass ->
+            addJavascriptInterface(PasswordBridge(this, { host, user, pass ->
                 if (host.isNotEmpty() && passwordStore.offerToSave && !currentPrivateMode && tabs.firstOrNull { it.id == tabId }?.isPrivate != true && !passwordStore.isNever(host)) {
                     val existing = passwordStore.find(host, user)
                     if (existing == null || existing.password != pass) {
                         pendingLogin = PendingLogin(host, user, pass, existing != null)
                     }
                 }
-            }, "SwiftPasswords")
+            }, { host ->
+                val logins = passwordStore.loginsFor(host).sortedByDescending { it.updated }
+                if (logins.isNotEmpty() && tabId == activeId && !showTabs) fillOffer = tabId to logins
+            }), "SwiftPasswords")
 
             val lastTouch = FloatArray(2)
             setOnTouchListener { _, ev ->
@@ -1772,7 +1784,7 @@ private fun SwiftBrowserApp() {
                                 child.destroy()
                                 view.loadUrl(url)
                             } else if (decidedAllowed) {
-                                newTab(sourcePrivate)
+                                newTab(sourcePrivate, nextTo = tabId)
                                 val nid = activeId
                                 adoptedViews[nid] = child
                                 popupTabs.add(nid)
@@ -2030,7 +2042,8 @@ private fun SwiftBrowserApp() {
                     Handler(Looper.getMainLooper()).postDelayed({ captureThumb(tabId) }, 700)
                     if (tabId == activeId && url.startsWith("http")) offerTranslateIfNeeded(view, tabId, url)
                     if (url.startsWith("http")) {
-                        if (passwordStore.offerToSave) view?.evaluateJavascript(PASSWORD_CAPTURE_JS, null)
+                        if (passwordStore.offerToSave || passwordStore.loginsFor(PasswordStore.hostKey(url)).isNotEmpty())
+                            view?.evaluateJavascript(PASSWORD_CAPTURE_JS, null)
                         if (passwordStore.autoFill && url.startsWith("https://")) {
                             val saved = passwordStore.loginsFor(PasswordStore.hostKey(url)).maxByOrNull { it.updated }
                             if (saved != null) {
@@ -2128,15 +2141,15 @@ private fun SwiftBrowserApp() {
         }
     }
 
-    fun openUrlInNewTab(u: String) {
-        newTab()
+    fun openUrlInNewTab(u: String, nextToActive: Boolean = true) {
+        newTab(nextTo = if (nextToActive) activeId else null)
         pendingLoads[activeId] = u
         load(u)
     }
 
     fun openUrlInNewTabInGroup(u: String) {
         val source = activeId
-        openUrlInNewTab(u)
+        openUrlInNewTab(u, nextToActive = false)
         handleGroupDrop(activeId, source)
     }
 
@@ -2153,7 +2166,7 @@ private fun SwiftBrowserApp() {
     LaunchedEffect(MainActivity.pendingUrl) {
         val u = MainActivity.pendingUrl
         if (u != null) {
-            openUrlInNewTab(u)
+            openUrlInNewTab(u, nextToActive = false)
             MainActivity.pendingUrl = null
         }
     }
@@ -2854,6 +2867,37 @@ private fun SwiftBrowserApp() {
                         onPictureInPicture = { startPictureInPicture() }
                     )
                 }
+                fillOffer?.let { (offerTab, offered) ->
+                    AlertDialog(
+                        onDismissRequest = { fillOffer = null },
+                        containerColor = Surface,
+                        title = { Text("Use a saved login?", color = TextMain) },
+                        text = {
+                            Column {
+                                offered.take(5).forEach { l ->
+                                    Row(
+                                        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                                            .clickable {
+                                                webViews[offerTab]?.evaluateJavascript(passwordFillJs(l.username, l.password), null)
+                                                fillOffer = null
+                                            }
+                                            .padding(horizontal = 8.dp, vertical = 12.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Default.Key, null, tint = Accent, modifier = Modifier.size(22.dp))
+                                        Spacer(Modifier.width(12.dp))
+                                        Column {
+                                            Text(l.username.ifBlank { "(no username)" }, color = TextMain, fontSize = 15.sp, maxLines = 1)
+                                            Text(l.host + "  \u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", color = TextMuted, fontSize = 12.sp, maxLines = 1)
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        confirmButton = {},
+                        dismissButton = { TextButton(onClick = { fillOffer = null }) { Text("Not now", color = TextMain) } }
+                    )
+                }
                 pendingLogin?.let { pending ->
                     SavePasswordDialog(
                         pending = pending,
@@ -3306,7 +3350,7 @@ private fun SwiftBrowserApp() {
             }
 
             val activeGid = tabGroups[activeId]
-            if (!showTabs && activeGid != null) {
+            if (!showTabs && activeGid != null && address != "swift://bookmarks" && address != "swift://history") {
                 val members = tabs.filter { tabGroups[it.id] == activeGid }
                 val gColor = groupColorOf(activeGid)
                 Row(
@@ -5001,7 +5045,7 @@ private fun TabSwitcher(
 
                     val moveAnim = remember { Animatable(Offset.Zero, Offset.VectorConverter) }
                     Box(
-                        Modifier.fillMaxWidth().height(268.dp)
+                        Modifier.fillMaxWidth().height(220.dp)
                             .onGloballyPositioned { c ->
                                 val r = c.boundsInRoot()
                                 cardBounds[entry.key] = r
@@ -5380,7 +5424,7 @@ private fun GroupPopupOverlay(
                         val held = dragId == tab.id
                         DisposableEffect(tab.id) { onDispose { popupBounds.remove(tab.id) } }
                         Box(
-                            Modifier.fillMaxWidth().height(232.dp)
+                            Modifier.fillMaxWidth().height(210.dp)
                                 .then(if (held) Modifier else Modifier.animateItem())
                                 .onGloballyPositioned { popupBounds[tab.id] = it.boundsInRoot() }
                                 .zIndex(if (held) 1f else 0f)
