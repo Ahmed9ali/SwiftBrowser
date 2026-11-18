@@ -5,8 +5,64 @@ package com.swift.browser
 // NOTE: Kotlin raw string — never write a bare dollar sign in here, use ${'$'}.
 const val SHIELDS_JS = """
 (function () {
+  // Captcha / bot-check frames inspect the browser's own functions for tampering: leave them completely untouched.
+  try {
+    var HN = (location.hostname || '').toLowerCase();
+    if (/(^|\.)(challenges\.cloudflare\.com|hcaptcha\.com|recaptcha\.net|turnstile\.com)${'$'}/.test(HN) ||
+        (HN === 'www.google.com' && location.pathname.indexOf('/recaptcha') === 0)) return;
+  } catch (e) {}
   if (window.__swiftShields) return;
   window.__swiftShields = true;
+  // Our patches must not be visible to bot checks (Cloudflare, Turnstile ...): every function we replace keeps the
+  // original's name/length and prints as "[native code]". Natives are recorded here, masked once all patches exist.
+  var NATIVEMAP = new WeakMap(), NATIVELIST = [];
+  try {
+    var origFnToString = Function.prototype.toString;
+    var fakeFnToString = function toString() { var o = NATIVEMAP.get(this); return origFnToString.call(o || this); };
+    NATIVEMAP.set(fakeFnToString, origFnToString);
+    Function.prototype.toString = fakeFnToString;
+  } catch (e) {}
+  function snap(obj, names) {
+    names.forEach(function (n) {
+      try {
+        var d = Object.getOwnPropertyDescriptor(obj, n);
+        if (!d) return;
+        if (d.get) NATIVELIST.push([obj, n, d.get, 'g']);
+        else if (typeof d.value === 'function') NATIVELIST.push([obj, n, d.value, 'v']);
+      } catch (e) {}
+    });
+  }
+  function maskOne(fake, real) {
+    try {
+      if (typeof fake !== 'function' || fake === real) return;
+      NATIVEMAP.set(fake, real);
+      Object.defineProperty(fake, 'name', { value: real.name, configurable: true });
+      Object.defineProperty(fake, 'length', { value: real.length, configurable: true });
+    } catch (e) {}
+  }
+  function maskAll() {
+    NATIVELIST.forEach(function (r) {
+      try {
+        var d = Object.getOwnPropertyDescriptor(r[0], r[1]);
+        if (d) maskOne(r[3] === 'g' ? d.get : d.value, r[2]);
+      } catch (e) {}
+    });
+    try { maskOne(performance.now, Performance.prototype.now); } catch (e) {}
+  }
+  try {
+    snap(window, ['open', 'alert', 'confirm', 'prompt', 'fetch', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'getComputedStyle']);
+    snap(History.prototype, ['pushState', 'replaceState']);
+    snap(XMLHttpRequest.prototype, ['open', 'send']);
+    snap(Element.prototype, ['getBoundingClientRect', 'clientHeight', 'clientWidth']);
+    snap(HTMLElement.prototype, ['offsetHeight', 'offsetWidth', 'offsetParent']);
+    snap(Date, ['now']);
+    snap(JSON, ['parse']);
+    snap(Response.prototype, ['json']);
+  } catch (e) {}
+  // Privacy surface (what Brave reports): opt-out signal on, no battery API, no Private State Tokens.
+  try { Object.defineProperty(Navigator.prototype, 'globalPrivacyControl', { get: function () { return true; }, configurable: true }); } catch (e) {}
+  try { if ('getBattery' in Navigator.prototype) delete Navigator.prototype.getBattery; } catch (e) {}
+  try { if ('hasPrivateToken' in Document.prototype) delete Document.prototype.hasPrivateToken; } catch (e) {}
   var H = (location.hostname || '').toLowerCase();
   var IS_YT = /(^|\.)youtube(-nocookie)?\.com${'$'}/.test(H);
   var NAV = window.SwiftNav;
@@ -691,32 +747,125 @@ const val SHIELDS_JS = """
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startWalls);
     else startWalls();
   })();
-  // ---------- 9. link-shortener steps ("click an image, come back, wait for your link") ----------
-  // The ad task is the price of the link: on these pages the ads must load and stay visible, and the taps that open
-  // the task must reach their destination. Native side: NAV.flow() lets tap-started steps through the navigation guard,
-  // NAV.gate() stops network/cosmetic blocking for this site (this session only) and reloads once so the ads can load.
+  // ---------- 9. link-shortener pages: ads stay blocked, countdowns are skipped, "next" buttons are shown ----------
+  // NAV.flow() still lets tap-started steps through the navigation guard. Sites that confirm the ad task or the wait on
+  // their own server cannot be skipped from the browser.
   (function () {
     if (!TOP || IS_YT) return;
     var FLOW = /(click\s+(on\s+)?(any|an|the|one)\b[^.]{0,25}\b(images?|ads?|banners?)|then\s+(go\s+)?back\s+and\s+wait|wait\s+for\s+(the\s+)?(link|timer)|get\s+link\b|generate\s+link|your\s+link\s+is\s+(ready|being)|(click|tap)\s+(here\s+)?to\s+continue\s+(to\s+)?(link|download)|scroll\s+down\s+(to\s+)?(continue|get))/i;
     var STRONGFLOW = /(then\s+(go\s+)?back\s+and\s+wait|wait\s+for\s+(the\s+)?(link|timer)|get\s+link\b|generate\s+link|your\s+link\s+is\s+(ready|being)|click\s+(on\s+)?(any|an|the)\b[^.]{0,25}\b(images?|ads?|banners?)\b[^.]{0,40}\b(link|continue|wait|back))/i;
     var SHORTENERS = /(^|\.)(ouo\.io|ouo\.press|adf\.ly|linkvertise\.com|shrinkme\.io|shrinkearn\.com|exe\.io|exey\.io|fc\.lc|cuty\.io|droplink\.co|gplinks\.co|gplinks\.in|shareus\.io|tpi\.li|tnlink\.in|linkshortify\.com|shrtfly\.com|ez4short\.com|arolinks\.com|urlspay\.in|kingurl\.in|indianshortner\.com|clk\.sh|clicksfly\.com|adrinolinks\.in|bc\.vc|shorte\.st|za\.gl|cpmlink\.net|link1s\.com|xpshort\.com|linksly\.co|lksfy\.com|shortingly\.in|vplink\.in|krownlinks\.me|adshrink\.it|ouo\.today|short2url\.in|mdiskshortner\.link|earnow\.online|urlsfly\.com|shrinke\.me|linkpays\.in|tglink\.in)${'$'}/i;
-    var sent = 0, gated = false;
+    var SPEED = 25, active = false, t0real = 0, t0warp = 0;
+
+    // ---- clock + timers: recorded from page start, only sped up once the page is known to be a link gate ----
+    var rSI = window.setInterval, rCI = window.clearInterval, rST = window.setTimeout, rCT = window.clearTimeout;
+    var rNow = Date.now, rPerf = performance.now.bind(performance);
+    var live = {}, alias = {};
+    function fast(d) { return Math.max(30, Math.round((+d || 0) / SPEED)); }
+    try {
+      window.setInterval = function (fn, d) {
+        var args = [].slice.call(arguments, 2), id;
+        var delay = active && d >= 400 ? fast(d) : d;
+        id = rSI.apply(window, [fn, delay].concat(args));
+        if (d >= 400) live[id] = { t: 'i', fn: fn, d: d, a: args };
+        return id;
+      };
+      window.setTimeout = function (fn, d) {
+        var args = [].slice.call(arguments, 2), id;
+        var delay = active && d >= 400 ? fast(d) : d;
+        var wrapped = fn;
+        if (d >= 400 && typeof fn === 'function') wrapped = function () { delete live[id]; return fn.apply(this, arguments); };
+        id = rST.apply(window, [wrapped, delay].concat(args));
+        if (d >= 400) live[id] = { t: 't', fn: wrapped, d: d, a: args };
+        return id;
+      };
+      window.clearInterval = function (id) { var r = alias[id]; delete live[id]; if (r != null) { delete live[r]; return rCI.call(window, r); } return rCI.call(window, id); };
+      window.clearTimeout = function (id) { var r = alias[id]; delete live[id]; if (r != null) { delete live[r]; return rCT.call(window, r); } return rCT.call(window, id); };
+    } catch (e) {}
+    // Gate pages start their countdown when the person comes back to the tab after clicking an ad (blur/focus,
+    // visibilitychange). Ads stay blocked and nothing is opened or clicked: only those page events are sent.
+    function returnFromAd() {
+      try {
+        var hid = false;
+        Object.defineProperty(document, 'hidden', { configurable: true, get: function () { return hid; } });
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: function () { return hid ? 'hidden' : 'visible'; } });
+        var swap = function (h) {
+          hid = h;
+          try { document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new Event(h ? 'blur' : 'focus')); } catch (x) {}
+        };
+        [1500, 6000, 14000].forEach(function (ms) {
+          rST.call(window, function () { swap(true); rST.call(window, function () { swap(false); }, 700); }, ms);
+        });
+      } catch (e) {}
+    }
+    var t0perf = 0, t0perfReal = 0;
+    function speedUp() {
+      if (active) return;
+      t0real = rNow.call(Date); t0warp = t0real; t0perfReal = rPerf(); t0perf = t0perfReal;
+      active = true;
+      try {
+        Date.now = function () { return t0warp + (rNow.call(Date) - t0real) * SPEED; };
+        performance.now = function () { return t0perf + (rPerf() - t0perfReal) * SPEED; };
+        maskAll();
+      } catch (e) {}
+      returnFromAd();
+      Object.keys(live).forEach(function (k) {
+        var o = live[k]; if (!o) return;
+        try {
+          if (o.t === 'i') { rCI.call(window, +k); alias[k] = rSI.apply(window, [o.fn, fast(o.d)].concat(o.a)); }
+          else { rCT.call(window, +k); alias[k] = rST.apply(window, [o.fn, fast(o.d)].concat(o.a)); }
+        } catch (e) {}
+      });
+    }
+
+    // ---- buttons that the countdown would unlock ----
+    var WANT = /^(get\s*(the\s+)?(download\s+)?link|continue(\s+to\s+(link|download|website))?|next(\s+step|\s+page)?|download(\s+now)?|proceed|click\s+here(\s+to\s+continue)?|go\s+to\s+link|open\s+link|unlock\s+link|skip\s+ad|create\s+link)\b/i;
+    var HIDEOK = /^(get\s*(the\s+)?(download\s+)?link|continue|next|download|proceed|go\s+to\s+link|open\s+link)/i;
+    function reveal() {
+      try {
+        var els = document.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]');
+        for (var i = 0; i < els.length && i < 400; i++) {
+          var e = els[i], txt = ((e.innerText || e.value || '') + '').trim();
+          if (!txt || txt.length > 40 || !WANT.test(txt)) continue;
+          if (e.disabled) e.disabled = false;
+          e.removeAttribute('disabled');
+          if (e.classList) e.classList.remove('disabled');
+          if (e.getAttribute('aria-disabled') === 'true') e.setAttribute('aria-disabled', 'false');
+          if (HIDEOK.test(txt)) {
+            var n = e, k = 0;
+            while (n && n !== document.body && k++ < 4) {
+              var cs = getComputedStyle(n);
+              if (cs.display === 'none') n.style.setProperty('display', n.tagName === 'A' || n.tagName === 'BUTTON' ? 'inline-block' : 'block', 'important');
+              if (n.hidden) n.hidden = false;
+              n = n.parentElement;
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    var sent = 0, gated = false, revealUntil = 0;
     function look() {
-      if (sent > 8) return;
+      if (sent > 12) return;
       try {
         var b = document.body;
         if (!b) return;
         var t = (b.innerText || '').slice(0, 4000);
         var short = SHORTENERS.test(H);
         if (FLOW.test(t) || short) { sent++; if (NAV && NAV.flow) NAV.flow(); }
-        if (!gated && (STRONGFLOW.test(t) || short)) { gated = true; if (NAV && NAV.gate) NAV.gate(); }
+        if (!gated && (STRONGFLOW.test(t) || short)) { gated = true; speedUp(); revealUntil = Date.now() + 90000 * SPEED; }
       } catch (e) {}
     }
-    [300, 900, 2500, 6000, 12000, 25000].forEach(function (ms) { setTimeout(look, ms); });
-    try { document.addEventListener('DOMContentLoaded', function () { setTimeout(look, 50); }); } catch (e) {}
+    [300, 900, 2500, 6000, 12000, 25000].forEach(function (ms) { rST.call(window, look, ms); });
+    try { document.addEventListener('DOMContentLoaded', function () { rST.call(window, look, 50); }); } catch (e) {}
+    rSI.call(window, function () { if (gated && Date.now() < revealUntil) reveal(); }, 600);
   })();
+  maskAll();
 })();
 """
+
+/** Prefix for document-start scripts that must not run inside captcha / bot-check frames. */
+const val CAPTCHA_GUARD = "if(/(^|\\.)(challenges\\.cloudflare\\.com|hcaptcha\\.com|recaptcha\\.net)$/.test(location.hostname)||(location.hostname==='www.google.com'&&location.pathname.indexOf('/recaptcha')===0))return;"
 
 /** Makes the WebView look like Chrome to bot checks: a real Chrome has window.chrome, a WebView does not. */
 const val COMPAT_JS = """

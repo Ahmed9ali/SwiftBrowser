@@ -267,6 +267,9 @@ private fun applyUserAgentMetadata(settings: android.webkit.WebSettings, context
             .setPlatform(if (desktop) "Linux" else "Android")
             .setPlatformVersion(if (desktop) "6.5.0" else androidVer)
             .setMobile(!desktop)
+            .setArchitecture(if (desktop) "x86" else "")
+            .setBitness(64)
+            .setModel(if (desktop) "" else android.os.Build.MODEL)
             .build()
         androidx.webkit.WebSettingsCompat.setUserAgentMetadata(settings, md)
     }
@@ -840,13 +843,10 @@ private fun SwiftBrowserApp() {
     var canGoForward by remember { mutableStateOf(false) }
     val currentBlockingEnabled by rememberUpdatedState(blockingEnabled)
     /** Shields are on globally and not switched off for the site this tab is showing. */
-    /** Sites that refused the page while Shields were on: Shields stay relaxed for them until the app restarts. */
+    /** Sites that refused the page while Shields were on: network blocking and hiding stay relaxed for them until restart. */
     val relaxedSites = remember { java.util.concurrent.ConcurrentHashMap.newKeySet<String>() }
-    /** Link-gate pages ("click an ad, wait for your link"): no network or cosmetic blocking, navigation guard stays on. */
-    val gateSites = remember { java.util.concurrent.ConcurrentHashMap.newKeySet<String>() }
-    fun blockingFor(tabId: Long): Boolean =
-        currentBlockingEnabled && !siteShields.isOff(firstParty[tabId]) && SiteShields.key(firstParty[tabId]) !in relaxedSites
-    fun networkOn(tabId: Long): Boolean = blockingFor(tabId) && SiteShields.key(firstParty[tabId]) !in gateSites
+    fun blockingFor(tabId: Long): Boolean = currentBlockingEnabled && !siteShields.isOff(firstParty[tabId])
+    fun networkOn(tabId: Long): Boolean = blockingFor(tabId) && SiteShields.key(firstParty[tabId]) !in relaxedSites
     /** "Block scripts" is a per-site choice; JavaScript is switched before the page loads. */
     fun applyScriptPolicy(wv: WebView?, url: String?) {
         if (wv == null || url == null || !url.startsWith("http")) return
@@ -1700,7 +1700,7 @@ private fun SwiftBrowserApp() {
             runCatching { androidx.webkit.WebViewCompat.addDocumentStartJavaScript(this, COMPAT_JS, setOf("*")) }
             if (shieldsAtStart) {
                 runCatching {
-                    androidx.webkit.WebViewCompat.addDocumentStartJavaScript(this, BlobDownloads.HOOK_JS, setOf("*"))
+                    androidx.webkit.WebViewCompat.addDocumentStartJavaScript(this, "(function(){" + CAPTCHA_GUARD + BlobDownloads.HOOK_JS + "})();", setOf("*"))
                 }
             }
 
@@ -1711,7 +1711,7 @@ private fun SwiftBrowserApp() {
 
                 @android.webkit.JavascriptInterface
                 fun exempt(host: String?): Boolean = blocker.isExemptPage(host) || siteShields.isOff(host) ||
-                    SiteShields.key(host) in relaxedSites || SiteShields.key(host) in gateSites
+                    SiteShields.key(host) in relaxedSites
 
                 @android.webkit.JavascriptInterface
                 fun cosmeticStartup(host: String?): String =
@@ -1733,14 +1733,6 @@ private fun SwiftBrowserApp() {
 
                 @android.webkit.JavascriptInterface
                 fun flow() { navGuard.markFlow(tabId) }
-
-                @android.webkit.JavascriptInterface
-                fun gate() {
-                    val k = SiteShields.key(firstParty[tabId] ?: webViews[tabId]?.url)
-                    if (k.isNotEmpty() && k !in relaxedSites && gateSites.add(k)) {
-                        Handler(Looper.getMainLooper()).post { webViews[tabId]?.reload() }
-                    }
-                }
             }, "SwiftNav")
 
             appSettings.applyTo(this)
@@ -2004,7 +1996,25 @@ private fun SwiftBrowserApp() {
                     super.onReceivedError(view, request, error)
                     if (request?.isForMainFrame != true || view == null) return
                     val code = error?.errorCode ?: return
-                    
+
+                    // net::ERR_CACHE_MISS (going back to a page the server marked uncacheable): fetch it fresh, once.
+                    if (error.description?.contains("ERR_CACHE_MISS") == true) {
+                        val failedUrl = request.url.toString()
+                        val tries = retryCounts["cm:$failedUrl"] ?: 0
+                        if (tries < 1) {
+                            retryCounts["cm:$failedUrl"] = tries + 1
+                            val priv = tabs.firstOrNull { it.id == tabId }?.isPrivate == true
+                            view.post {
+                                view.settings.cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
+                                view.loadUrl(failedUrl)
+                                view.postDelayed({
+                                    if (!priv) view.settings.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+                                }, 4000)
+                            }
+                            return
+                        }
+                    }
+
                     if (view.progress >= 100) return
 
                     val retryable = code == WebViewClient.ERROR_HOST_LOOKUP || code == WebViewClient.ERROR_CONNECT ||

@@ -97,6 +97,7 @@ class TrackerBlocker(context: Context) {
         if (requestHost.endsWith("google.com") && requestUrl.contains("recaptcha")) return false
         if (requestHost == "challenges.cloudflare.com") return false
         if (requestHost.endsWith("hcaptcha.com")) return false
+        if (requestHost.startsWith("imasdk.")) return true // Google's video-ad SDK; players fall back to the plain video
         if (requestHost.endsWith("jsdelivr.net") || requestHost.endsWith("googleapis.com") || requestHost.endsWith("gstatic.com")) return false
         
         // YouTube needs its APIs to load Shorts and Videos
@@ -126,7 +127,7 @@ class TrackerBlocker(context: Context) {
 
     private fun engineWhitelisted(host: String, url: String): Boolean =
         (host.endsWith("google.com") && url.contains("recaptcha")) || host == "challenges.cloudflare.com" ||
-            host.endsWith("hcaptcha.com") || host.endsWith("jsdelivr.net") || host.endsWith("googleapis.com") ||
+            host.endsWith("hcaptcha.com") || host.endsWith("jsdelivr.net") || (host.endsWith("googleapis.com") && !host.startsWith("imasdk.")) ||
             host.endsWith("gstatic.com") || host.endsWith("ytimg.com") || host.endsWith("ggpht.com") ||
             host.endsWith("googleusercontent.com")
 
