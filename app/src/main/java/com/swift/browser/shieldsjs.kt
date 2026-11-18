@@ -691,5 +691,54 @@ const val SHIELDS_JS = """
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startWalls);
     else startWalls();
   })();
+  // ---------- 9. link-shortener steps ("click an image, come back, wait for your link") ----------
+  // The ad task is the price of the link: on these pages the ads must load and stay visible, and the taps that open
+  // the task must reach their destination. Native side: NAV.flow() lets tap-started steps through the navigation guard,
+  // NAV.gate() stops network/cosmetic blocking for this site (this session only) and reloads once so the ads can load.
+  (function () {
+    if (!TOP || IS_YT) return;
+    var FLOW = /(click\s+(on\s+)?(any|an|the|one)\b[^.]{0,25}\b(images?|ads?|banners?)|then\s+(go\s+)?back\s+and\s+wait|wait\s+for\s+(the\s+)?(link|timer)|get\s+link\b|generate\s+link|your\s+link\s+is\s+(ready|being)|(click|tap)\s+(here\s+)?to\s+continue\s+(to\s+)?(link|download)|scroll\s+down\s+(to\s+)?(continue|get))/i;
+    var STRONGFLOW = /(then\s+(go\s+)?back\s+and\s+wait|wait\s+for\s+(the\s+)?(link|timer)|get\s+link\b|generate\s+link|your\s+link\s+is\s+(ready|being)|click\s+(on\s+)?(any|an|the)\b[^.]{0,25}\b(images?|ads?|banners?)\b[^.]{0,40}\b(link|continue|wait|back))/i;
+    var SHORTENERS = /(^|\.)(ouo\.io|ouo\.press|adf\.ly|linkvertise\.com|shrinkme\.io|shrinkearn\.com|exe\.io|exey\.io|fc\.lc|cuty\.io|droplink\.co|gplinks\.co|gplinks\.in|shareus\.io|tpi\.li|tnlink\.in|linkshortify\.com|shrtfly\.com|ez4short\.com|arolinks\.com|urlspay\.in|kingurl\.in|indianshortner\.com|clk\.sh|clicksfly\.com|adrinolinks\.in|bc\.vc|shorte\.st|za\.gl|cpmlink\.net|link1s\.com|xpshort\.com|linksly\.co|lksfy\.com|shortingly\.in|vplink\.in|krownlinks\.me|adshrink\.it|ouo\.today|short2url\.in|mdiskshortner\.link|earnow\.online|urlsfly\.com|shrinke\.me|linkpays\.in|tglink\.in)${'$'}/i;
+    var sent = 0, gated = false;
+    function look() {
+      if (sent > 8) return;
+      try {
+        var b = document.body;
+        if (!b) return;
+        var t = (b.innerText || '').slice(0, 4000);
+        var short = SHORTENERS.test(H);
+        if (FLOW.test(t) || short) { sent++; if (NAV && NAV.flow) NAV.flow(); }
+        if (!gated && (STRONGFLOW.test(t) || short)) { gated = true; if (NAV && NAV.gate) NAV.gate(); }
+      } catch (e) {}
+    }
+    [300, 900, 2500, 6000, 12000, 25000].forEach(function (ms) { setTimeout(look, ms); });
+    try { document.addEventListener('DOMContentLoaded', function () { setTimeout(look, 50); }); } catch (e) {}
+  })();
+})();
+"""
+
+/** Makes the WebView look like Chrome to bot checks: a real Chrome has window.chrome, a WebView does not. */
+const val COMPAT_JS = """
+(function () {
+  try {
+    if (!window.chrome) {
+      Object.defineProperty(window, 'chrome', {
+        value: { app: { isInstalled: false }, loadTimes: function () { return {}; }, csi: function () { return {}; } },
+        configurable: true, writable: true
+      });
+    }
+  } catch (e) {}
+})();
+"""
+
+/** True when the page is just a short "Blocked / Access denied" notice (the site refused this browser). */
+const val REFUSAL_PROBE_JS = """
+(function () {
+  try {
+    var t = ((document.body && document.body.innerText) || '').trim();
+    return t.length > 0 && t.length < 80 &&
+      /^(request\s+)?(blocked|access\s+denied|forbidden|you\s+(have\s+been|are)\s+blocked|error\s*403|403)\b/i.test(t);
+  } catch (e) { return false; }
 })();
 """

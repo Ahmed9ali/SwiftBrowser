@@ -244,6 +244,34 @@ private class BookmarkStore(context: Context, legacy: () -> List<Pair<String, St
 
 private var HomeThumbStore by mutableStateOf<Bitmap?>(null)
 
+/** Same shape as Chrome's own phone user agent: no "wv" / "Version/4.0" marks that make some sites refuse WebViews. */
+private fun mobileUserAgent(context: Context): String {
+    val def = android.webkit.WebSettings.getDefaultUserAgent(context)
+    val major = Regex("Chrome/(\\d+)").find(def)?.groupValues?.get(1) ?: "124"
+    val androidVer = Regex("Android ([\\d.]+)").find(def)?.groupValues?.get(1) ?: "10"
+    return "Mozilla/5.0 (Linux; Android $androidVer; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$major.0.0.0 Mobile Safari/537.36"
+}
+
+/** Client hints (Sec-CH-UA, navigator.userAgentData) must agree with the Chrome user agent, not say "Android WebView". */
+private fun applyUserAgentMetadata(settings: android.webkit.WebSettings, context: Context, desktop: Boolean) {
+    if (!androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.USER_AGENT_METADATA)) return
+    runCatching {
+        val def = android.webkit.WebSettings.getDefaultUserAgent(context)
+        val major = Regex("Chrome/(\\d+)").find(def)?.groupValues?.get(1) ?: "124"
+        val androidVer = Regex("Android ([\\d.]+)").find(def)?.groupValues?.get(1) ?: "10"
+        fun bv(brand: String, v: String) = androidx.webkit.UserAgentMetadata.BrandVersion.Builder()
+            .setBrand(brand).setMajorVersion(v).setFullVersion("$v.0.0.0").build()
+        val md = androidx.webkit.UserAgentMetadata.Builder()
+            .setBrandVersionList(listOf(bv("Chromium", major), bv("Google Chrome", major), bv("Not=A?Brand", "24")))
+            .setFullVersion("$major.0.0.0")
+            .setPlatform(if (desktop) "Linux" else "Android")
+            .setPlatformVersion(if (desktop) "6.5.0" else androidVer)
+            .setMobile(!desktop)
+            .build()
+        androidx.webkit.WebSettingsCompat.setUserAgentMetadata(settings, md)
+    }
+}
+
 private fun desktopUserAgent(context: Context): String {
     val def = android.webkit.WebSettings.getDefaultUserAgent(context)
     val major = Regex("Chrome/(\\d+)").find(def)?.groupValues?.get(1) ?: "124"
@@ -812,7 +840,13 @@ private fun SwiftBrowserApp() {
     var canGoForward by remember { mutableStateOf(false) }
     val currentBlockingEnabled by rememberUpdatedState(blockingEnabled)
     /** Shields are on globally and not switched off for the site this tab is showing. */
-    fun blockingFor(tabId: Long): Boolean = currentBlockingEnabled && !siteShields.isOff(firstParty[tabId])
+    /** Sites that refused the page while Shields were on: Shields stay relaxed for them until the app restarts. */
+    val relaxedSites = remember { java.util.concurrent.ConcurrentHashMap.newKeySet<String>() }
+    /** Link-gate pages ("click an ad, wait for your link"): no network or cosmetic blocking, navigation guard stays on. */
+    val gateSites = remember { java.util.concurrent.ConcurrentHashMap.newKeySet<String>() }
+    fun blockingFor(tabId: Long): Boolean =
+        currentBlockingEnabled && !siteShields.isOff(firstParty[tabId]) && SiteShields.key(firstParty[tabId]) !in relaxedSites
+    fun networkOn(tabId: Long): Boolean = blockingFor(tabId) && SiteShields.key(firstParty[tabId]) !in gateSites
     /** "Block scripts" is a per-site choice; JavaScript is switched before the page loads. */
     fun applyScriptPolicy(wv: WebView?, url: String?) {
         if (wv == null || url == null || !url.startsWith("http")) return
@@ -1620,12 +1654,17 @@ private fun SwiftBrowserApp() {
             settings.loadsImagesAutomatically = true
             settings.javaScriptCanOpenWindowsAutomatically = true
             settings.setSupportMultipleWindows(true)
-            settings.userAgentString = android.webkit.WebSettings.getDefaultUserAgent(ctx)
+            settings.userAgentString = mobileUserAgent(ctx)
+            // Chrome does not announce the app's package name; some sites refuse requests that do.
+            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+                runCatching { androidx.webkit.WebSettingsCompat.setRequestedWithHeaderOriginAllowList(settings, emptySet()) }
+            }
             if (desktopSites[tabId] == true) {
                 settings.userAgentString = desktopUserAgent(ctx)
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
             }
+            applyUserAgentMetadata(settings, ctx, desktopSites[tabId] == true)
             if (currentBlockingEnabled) installShields(this, tabId)
             settings.allowFileAccess = false
             settings.allowContentAccess = false
@@ -1658,6 +1697,7 @@ private fun SwiftBrowserApp() {
             ), "SwiftTranslator")
 
             addJavascriptInterface(BlobDownloads.Bridge(context.applicationContext), "SwiftBlob")
+            runCatching { androidx.webkit.WebViewCompat.addDocumentStartJavaScript(this, COMPAT_JS, setOf("*")) }
             if (shieldsAtStart) {
                 runCatching {
                     androidx.webkit.WebViewCompat.addDocumentStartJavaScript(this, BlobDownloads.HOOK_JS, setOf("*"))
@@ -1670,7 +1710,8 @@ private fun SwiftBrowserApp() {
                     try { blocker.blockedHostsJson() } catch (e: Exception) { "{}" }
 
                 @android.webkit.JavascriptInterface
-                fun exempt(host: String?): Boolean = blocker.isExemptPage(host) || siteShields.isOff(host)
+                fun exempt(host: String?): Boolean = blocker.isExemptPage(host) || siteShields.isOff(host) ||
+                    SiteShields.key(host) in relaxedSites || SiteShields.key(host) in gateSites
 
                 @android.webkit.JavascriptInterface
                 fun cosmeticStartup(host: String?): String =
@@ -1689,6 +1730,17 @@ private fun SwiftBrowserApp() {
 
                 @android.webkit.JavascriptInterface
                 fun scrollState(innerNotAtTop: Boolean) { innerScroll[tabId] = innerNotAtTop }
+
+                @android.webkit.JavascriptInterface
+                fun flow() { navGuard.markFlow(tabId) }
+
+                @android.webkit.JavascriptInterface
+                fun gate() {
+                    val k = SiteShields.key(firstParty[tabId] ?: webViews[tabId]?.url)
+                    if (k.isNotEmpty() && k !in relaxedSites && gateSites.add(k)) {
+                        Handler(Looper.getMainLooper()).post { webViews[tabId]?.reload() }
+                    }
+                }
             }, "SwiftNav")
 
             appSettings.applyTo(this)
@@ -1936,7 +1988,7 @@ private fun SwiftBrowserApp() {
                     // Main-frame navigations are judged by NavigationGuard (shouldOverrideUrlLoading), not here.
                     if (req.isForMainFrame) return null
 
-                    if (blockingFor(tabId) && (blocker.shouldBlock(url, firstParty[tabId] ?: "", false) ||
+                    if (networkOn(tabId) && (blocker.shouldBlock(url, firstParty[tabId] ?: "", false) ||
                             blocker.engineBlocks(url, firstParty[tabId], req.requestHeaders?.get("Accept")))) {
                         countBlocked(tabId)
                         return blockedResponse(url)
@@ -2041,6 +2093,23 @@ private fun SwiftBrowserApp() {
                     if (!currentPrivateMode && tabs.firstOrNull { it.id == tabId }?.isPrivate != true) store.addHistory(title, url)
                     Handler(Looper.getMainLooper()).postDelayed({ captureThumb(tabId) }, 700)
                     if (tabId == activeId && url.startsWith("http")) offerTranslateIfNeeded(view, tabId, url)
+                    if (url.startsWith("http") && blockingFor(tabId)) {
+                        val probeView = view
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            if (probeView != null && webViews[tabId] === probeView && probeView.url == url) {
+                                probeView.evaluateJavascript(REFUSAL_PROBE_JS) { r ->
+                                    val k = SiteShields.key(url)
+                                    if (r == "true" && k.isNotEmpty() && relaxedSites.add(k)) {
+                                        Toast.makeText(
+                                            context, "$k refused the page with Shields on. Reloading with Shields relaxed for this site.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                        probeView.reload()
+                                    }
+                                }
+                            }
+                        }, 1500)
+                    }
                     if (url.startsWith("http")) {
                         if (passwordStore.offerToSave || passwordStore.loginsFor(PasswordStore.hostKey(url)).isNotEmpty())
                             view?.evaluateJavascript(PASSWORD_CAPTURE_JS, null)
@@ -2181,7 +2250,8 @@ private fun SwiftBrowserApp() {
         val on = !(desktopSites[activeId] ?: false)
         desktopSites[activeId] = on
         wv.settings.userAgentString =
-            if (on) desktopUserAgent(context) else android.webkit.WebSettings.getDefaultUserAgent(context)
+            if (on) desktopUserAgent(context) else mobileUserAgent(context)
+        applyUserAgentMetadata(wv.settings, context, on)
         wv.settings.useWideViewPort = on
         wv.settings.loadWithOverviewMode = on
         wv.settings.setSupportZoom(true)

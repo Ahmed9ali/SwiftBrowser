@@ -29,6 +29,7 @@ class NavigationGuard(
         var commitUrl: String = ""
         var tainted = false           // current redirect chain started from a blocked/ad-like hop
         var chainAllowedByTap = false // current chain began with a matching user tap
+        var flowUntil = 0L            // page looks like a link-shortener / "click an ad, wait for your link" step
         val allowOnce = HashSet<String>()
     }
 
@@ -61,9 +62,16 @@ class NavigationGuard(
         val t = tab(tabId)
         t.tainted = false
         t.chainAllowedByTap = false
+        t.flowUntil = 0L
         t.allowOnce.add(key(url))
         host(url)?.let { visited.add(registrable(it)) }
     }
+
+    /**
+     * The page asks for an ad click / waiting before it hands over a link (link shorteners). While this is on, taps
+     * on the page may open the ad task and the following steps, but ad hosts still cannot navigate on their own.
+     */
+    @Synchronized fun markFlow(tabId: Long) { tab(tabId).flowUntil = now() + FLOW_MS }
 
     /** "Allow" chip. */
     @Synchronized fun allowOnce(tabId: Long, url: String) {
@@ -95,6 +103,13 @@ class NavigationGuard(
 
         val hostAd = isAdHost(h)
         val adLike = hostAd || hasAdParams(url, pageUrl)
+        if (t0 < t.flowUntil) {
+            if (t0 - t.tapAt in 0..FLOW_TAP_MS) {
+                t.chainAllowedByTap = true; t.tainted = false
+                return Verdict(Kind.ALLOW, "shortlink step after a tap")
+            }
+            if (!hostAd) return Verdict(Kind.ALLOW, "shortlink step, not a listed ad host")
+        }
         val tapFresh = t0 - t.tapAt in 0..TAP_WINDOW_MS
         // "Download", "Continue", "Get app" ... : the user pressed a real, labelled control a moment ago.
         // Its destination is theirs even when it goes through a tracking/redirect host.
@@ -151,7 +166,8 @@ class NavigationGuard(
     @Synchronized fun decidePopup(tabId: Long, url: String?, pageUrl: String?, hasGesture: Boolean): Verdict {
         val t = tab(tabId)
         val t0 = now()
-        val tapFresh = t0 - t.tapAt in 0..TAP_WINDOW_MS
+        val inFlow = t0 < t.flowUntil
+        val tapFresh = t0 - t.tapAt in 0..(if (inFlow) FLOW_TAP_MS else TAP_WINDOW_MS)
         if (!hasGesture && !tapFresh) return Verdict(Kind.BLOCK, "popup without a tap")
         if (url == null || url.isBlank() || url == "about:blank") {
             return Verdict(Kind.ALLOW, "popup pending url")
@@ -164,6 +180,7 @@ class NavigationGuard(
         if (t.tapHref != null && tapFresh && sameDestination(t.tapHref!!, url)) {
             return Verdict(Kind.ALLOW, "popup from tapped link")
         }
+        if (inFlow && tapFresh) return Verdict(Kind.ALLOW, "shortlink task opened by a tap")
         if (isAdHost(h) || hasAdParams(url, pageUrl)) return Verdict(Kind.BLOCK, "ad popup")
         // A real link was tapped (e.g. a search result opening in a new tab) and the target is not ad-like.
         if (tapFresh && t.tapHref != null) return Verdict(Kind.ALLOW, "popup from tapped link, not ad-like")
@@ -197,6 +214,8 @@ class NavigationGuard(
         const val TAP_WINDOW_MS = 1500L
         const val AUTO_REDIRECT_MS = 4000L
         const val CONTROL_WINDOW_MS = 8000L
+        const val FLOW_MS = 300_000L
+        const val FLOW_TAP_MS = 4000L
 
         private val CHEAP_TLDS = setOf(
             "xyz", "top", "click", "site", "online", "icu", "buzz", "monster", "fun", "cyou", "sbs", "cfd",
